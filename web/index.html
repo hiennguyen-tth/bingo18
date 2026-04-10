@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="google-adsense-account" content="{{ADSENSE_PUBLISHER_ID}}" />
+  <title>Bingo18 AI Predictor</title>
+
+  <!-- React 18 UMD (development) -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <!-- Babel Standalone — transforms JSX in the browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+
+    code {
+      font-family: 'Menlo', 'Consolas', monospace;
+      font-size: 0.85em;
+      background: rgba(99, 102, 241, 0.15);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    #app {
+      min-height: 100vh;
+    }
+
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 3px;
+    }
+
+    @keyframes fadeIn {
+      from {
+        opacity: 0;
+        transform: translateY(-10px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    /* ── Responsive helpers ── */
+    .grid2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+
+    .grid3 {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 10px;
+    }
+
+    .grid-overdue {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 24px;
+    }
+
+    .header-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .hide-mobile {}
+
+    @media (max-width: 640px) {
+      .grid2 {
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }
+
+      .grid3 {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 8px;
+      }
+
+      .grid-overdue {
+        grid-template-columns: 1fr;
+        gap: 16px;
+      }
+
+      .hide-mobile {
+        display: none !important;
+      }
+
+      .header-actions {
+        gap: 6px;
+      }
+
+      /* Tighten cards on mobile */
+      table {
+        font-size: 12px;
+      }
+
+      td,
+      th {
+        padding: 6px 8px !important;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div id="app">
+    <div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#6366f1;font-size:18px">
+      Loading…
+    </div>
+  </div>
+
+  <!--
+    heatmap.jsx is loaded FIRST so Heatmap is available when app.jsx runs.
+    Both files are compiled by Babel Standalone; they share the global window scope.
+  -->
+  <script type="text/babel" data-presets="react" src="heatmap.jsx"></script>
+  <script type="text/babel" data-presets="react" src="app.jsx"></script>
+</body>
+
+</html>

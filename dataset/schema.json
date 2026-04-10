@@ -1,0 +1,13 @@
+{
+  "$schema": "Bingo18 dataset schema v1.0",
+  "description": "Each record is one Bingo18 draw result.",
+  "fields": {
+    "id":        { "type": "string",  "description": "SHA-1 derived unique id (16 hex chars)" },
+    "n1":        { "type": "integer", "range": "1–6", "description": "First ball" },
+    "n2":        { "type": "integer", "range": "1–6", "description": "Second ball" },
+    "n3":        { "type": "integer", "range": "1–6", "description": "Third ball" },
+    "sum":       { "type": "integer", "range": "3–18", "description": "n1 + n2 + n3" },
+    "pattern":   { "type": "string",  "enum": ["triple", "pair", "normal"], "description": "Draw classification" },
+    "crawledAt": { "type": "string",  "format": "ISO 8601", "description": "Crawl timestamp" }
+  }
+}

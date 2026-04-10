@@ -1,0 +1,45 @@
+# ── Node ──────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+
+# ── Dataset (large / generated) ───────────────
+# Remove the next line if you want to track seed data
+# dataset/history.json
+
+# ── Python ────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+python/__pycache__/
+python/model.pkl
+python/model.joblib
+python/prediction.json
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# ── Backtest reports ──────────────────────────
+backtest/report.json
+
+# ── Environment ───────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── OS ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Logs ──────────────────────────────────────
+*.log
+logs/
+
+# ── PM2 ───────────────────────────────────────
+ecosystem.config.js
+.pm2/

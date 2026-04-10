@@ -1,0 +1,471 @@
+'use strict'
+require('dotenv').config({ path: require('path').join(__dirname, '../.env') })
+/**
+ * api/server.js
+ * Express REST API + Server-Sent Events for real-time push.
+ *
+ * Crawler runs inside this process every CRAWL_INTERVAL ms.
+ * When new draws arrive, all SSE clients get a "new-draw" event
+ * and the React dashboard reloads its data automatically.
+ *
+ * Routes:
+ *   GET /         → index.html (with ADSENSE_PUBLISHER_ID injected)
+ *   GET /events   → SSE stream
+ *   GET /predict  → top-10 combo scores + sum distribution
+ *   GET /history  → last N records  (?limit=50)
+ *   GET /overdue  → overdue stats for triples/pairs/sums
+ *   GET /stats    → walk-forward backtest accuracy
+ *   POST /crawl   → manual crawl trigger
+ *   GET /health   → liveness probe
+ *
+ * Usage: node api/server.js
+ */
+const express = require('express')
+const cors = require('cors')
+const path = require('path')
+const fs = require('fs-extra')
+const compression = require('compression')
+
+const predict = require('../predictor/ensemble')
+const frequency = require('../predictor/frequency')
+const features = require('../predictor/features')
+const { run: crawlRun } = require('../crawler/crawl')
+
+const app = express()
+const PORT = parseInt(process.env.PORT) || 3000
+const ADSENSE_PUBLISHER_ID = process.env.ADSENSE_PUBLISHER_ID || ''
+const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
+
+// Read index.html once at startup; inject ADSENSE_PUBLISHER_ID per request
+const INDEX_TPL = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8')
+
+// ── SSE client registry ───────────────────────────────────────────────────
+const sseClients = new Set()
+
+function broadcast(eventName, data) {
+  const msg = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`
+  for (const res of sseClients) {
+    try { res.write(msg) } catch (_) { sseClients.delete(res) }
+  }
+}
+
+// ── In-memory cache (invalidated when crawl finds new data) ───────────────
+const apiCache = new Map()  // key → { data, ts }
+
+function invalidateCache() {
+  apiCache.clear()
+}
+
+/**
+ * Wraps an async handler with a simple in-memory cache.
+ * @param {string}   key    - cache key
+ * @param {number}   ttlMs  - hard TTL (safety net); 0 = rely on invalidation only
+ * @param {Function} fn     - async (req) => data to cache
+ */
+function withCache(key, ttlMs, fn) {
+  return async (req, res) => {
+    const now = Date.now()
+    const hit = apiCache.get(key)
+    if (hit && (ttlMs === 0 || now - hit.ts < ttlMs)) {
+      res.set('X-Cache', 'HIT')
+      return res.json(hit.data)
+    }
+    try {
+      const data = await fn(req)
+      apiCache.set(key, { data, ts: now })
+      res.set('X-Cache', 'MISS')
+      res.json(data)
+    } catch (err) {
+      console.error(`[${key}]`, err.message)
+      res.status(500).json({ error: err.message })
+    }
+  }
+}
+
+// ── Middleware ─────────────────────────────────────────────────────────────
+// Skip compression for SSE — gzip buffering breaks real-time streaming
+app.use(compression({
+  filter: (req, res) => {
+    if (req.path === '/events') return false
+    return compression.filter(req, res)
+  }
+}))
+app.use(cors())
+app.use(express.json())
+
+// Serve index.html with ADSENSE_PUBLISHER_ID injected (must be before static)
+app.get('/', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8')
+  res.send(INDEX_TPL.replace('{{ADSENSE_PUBLISHER_ID}}', ADSENSE_PUBLISHER_ID))
+})
+
+app.use(express.static(path.join(__dirname, '../web')))
+
+// ── Helper ─────────────────────────────────────────────────────────────────
+async function loadHistory() {
+  return fs.readJSON(HISTORY_FILE).catch(() => [])
+}
+
+// ── Routes ─────────────────────────────────────────────────────────────────
+
+/** GET /predict — ensemble prediction scores + sum distribution */
+app.get('/predict', withCache('predict', 5 * 60_000, async () => {
+  const data = await loadHistory()
+
+  if (data.length < 2) {
+    return {
+      next: [],
+      sumStats: [],
+      total: data.length,
+      message: 'Not enough data — run: node crawler/crawl.js',
+    }
+  }
+
+  // Ranked predictions with full breakdown
+  const ranked = predict.ranked(data)
+  const top10 = ranked.slice(0, 10)
+
+  // pct = share within top-10 so they sum to 100%
+  const top10Total = top10.reduce((s, r) => s + r.score, 0) || 1
+  const maxScore = top10[0]?.score || 1
+
+  const next = top10.map(r => ({
+    combo: r.combo,
+    score: +r.score.toFixed(3),
+    pct: +(r.score / top10Total * 100).toFixed(1),
+    overdueRatio: +r.overdueRatio.toFixed(2),
+    comboGap: r.comboGap,
+    sumOD: +r.sumOD.toFixed(2),
+  }))
+
+  // Sum distribution
+  const sumBucket = {}
+  for (const d of data) sumBucket[d.sum] = (sumBucket[d.sum] || 0) + 1
+  const sumStats = Object.entries(sumBucket)
+    .map(([sum, cnt]) => ({ sum: +sum, pct: +(cnt / data.length * 100).toFixed(2) }))
+    .sort((a, b) => b.pct - a.pct)
+
+  return { next, sumStats, total: data.length, maxScore: +maxScore.toFixed(3) }
+}))
+
+/** GET /history — raw records (?limit=50), newest first */
+app.get('/history', async (req, res) => {
+  try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate')
+    res.set('Pragma', 'no-cache')
+    const data = await loadHistory()
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 500)
+    res.json({ records: data.slice(0, limit), total: data.length })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/** GET /frequency — sorted combo hit-count table */
+app.get('/frequency', withCache('frequency', 5 * 60_000, async () => {
+  const data = await loadHistory()
+  if (data.length === 0) return { freq: {}, total: 0 }
+
+  const freq = frequency(data)
+  const sorted = Object.entries(freq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 30)
+
+  return { freq: Object.fromEntries(sorted), total: data.length }
+}))
+
+/**
+ * GET /stats — walk-forward backtest accuracy (cached, expensive O(N²) operation)
+ */
+app.get('/stats', withCache('stats', 5 * 60_000, async () => {
+  const data = await loadHistory()
+  const WINDOW = 10
+  if (data.length < WINDOW + 2) {
+    return { message: 'Need more data', total: data.length, needed: WINDOW + 2 }
+  }
+
+  // Data is newest-first in file; reverse for chronological order
+  const chron = [...data].reverse()
+
+  let top1 = 0, top3 = 0, top10 = 0, tested = 0
+
+  for (let i = WINDOW; i < chron.length; i++) {
+    const slice = chron.slice(0, i)
+    const scores = predict(slice)
+    if (!scores || Object.keys(scores).length === 0) continue
+
+    const actual = `${chron[i].n1}-${chron[i].n2}-${chron[i].n3}`
+    const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1])
+
+    if (sorted[0]?.[0] === actual) top1++
+    if (sorted.slice(0, 3).some(([k]) => k === actual)) top3++
+    if (sorted.slice(0, 10).some(([k]) => k === actual)) top10++
+    tested++
+  }
+
+  const baseline = { top1: +(1 / 216 * 100).toFixed(2), top3: +(3 / 216 * 100).toFixed(2), top10: +(10 / 216 * 100).toFixed(2) }
+
+  return {
+    tested,
+    total: data.length,
+    accuracy: {
+      top1: tested ? +(top1 / tested * 100).toFixed(2) : 0,
+      top3: tested ? +(top3 / tested * 100).toFixed(2) : 0,
+      top10: tested ? +(top10 / tested * 100).toFixed(2) : 0,
+    },
+    hits: { top1, top3, top10 },
+    baseline,
+  }
+}))
+
+/** GET /features — last 20 feature vectors */
+app.get('/features', async (req, res) => {
+  try {
+    const data = await loadHistory()
+    const feat = features(data)
+    res.json({ features: feat.slice(-20), total: feat.length })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * GET /overdue — overdue statistics for triples, pairs, and sums (cached)
+ */
+app.get('/overdue', withCache('overdue', 5 * 60_000, async () => {
+  const data = await loadHistory()
+  if (data.length === 0) return { triples: [], pairs: [], sums: [] }
+
+  // Data is newest-first; reverse to get chronological order for interval calc
+  const chron = [...data].reverse()
+  const N = chron.length
+
+  // ── Helper: compute stats for an arbitrary key function ───────────────
+  function computeStats(keyFn, labelFn) {
+    const lastSeen = {}  // key → index of last appearance (chronological)
+    const counts = {}
+    const gaps = {}  // key → array of intervals between appearances
+
+    chron.forEach((r, i) => {
+      const k = keyFn(r)
+      if (!Array.isArray(k)) {
+        const ks = [k]
+        ks.forEach(key => {
+          counts[key] = (counts[key] || 0) + 1
+          if (lastSeen[key] !== undefined) {
+            if (!gaps[key]) gaps[key] = []
+            gaps[key].push(i - lastSeen[key])
+          }
+          lastSeen[key] = i
+        })
+      } else {
+        k.forEach(key => {
+          counts[key] = (counts[key] || 0) + 1
+          if (lastSeen[key] !== undefined) {
+            if (!gaps[key]) gaps[key] = []
+            gaps[key].push(i - lastSeen[key])
+          }
+          lastSeen[key] = i
+        })
+      }
+    })
+
+    return Object.keys(counts).map(key => {
+      const appeared = counts[key]
+      const kySince = lastSeen[key] !== undefined ? (N - 1 - lastSeen[key]) : N
+      const avgGap = gaps[key]?.length
+        ? +(gaps[key].reduce((a, b) => a + b, 0) / gaps[key].length).toFixed(1)
+        : N   // never repeated → use full history as avg
+      const overdueScore = kySince / (avgGap || 1)   // > 1 means overdue
+      return {
+        key,
+        label: labelFn ? labelFn(key) : key,
+        appeared,
+        kySinceLast: kySince,
+        avgInterval: avgGap,
+        overdueScore: +overdueScore.toFixed(2),
+      }
+    }).sort((a, b) => b.overdueScore - a.overdueScore)
+  }
+
+  // ── Triples: 1-1-1 … 6-6-6 ───────────────────────────────────────────
+  const TRIPLES = ['1-1-1', '2-2-2', '3-3-3', '4-4-4', '5-5-5', '6-6-6']
+  const tripleStats = computeStats(
+    r => {
+      const k = `${r.n1}-${r.n2}-${r.n3}`
+      return TRIPLES.includes(k) ? [k] : []
+    },
+    k => k.replace(/-/g, '')
+  )
+  // Ensure all 6 triples appear even if never seen
+  const tripleKeys = new Set(tripleStats.map(t => t.key))
+  const tripleResult = [
+    ...tripleStats,
+    ...TRIPLES.filter(k => !tripleKeys.has(k)).map(k => ({
+      key: k, label: k.replace(/-/g, ''), appeared: 0,
+      kySinceLast: N, avgInterval: N, overdueScore: 1,
+    }))
+  ].sort((a, b) => b.overdueScore - a.overdueScore)
+
+  // ── Pairs: 11, 22, 33, 44, 55, 66 ────────────────────────────────────
+  // A draw contributes to pair "VV" if at least two of its numbers equal V.
+  // Triples (1-1-1) also count as pair 11.
+  const PAIR_VALS = [1, 2, 3, 4, 5, 6]
+  const pairStats = computeStats(
+    r => {
+      if (r.n1 === r.n2 || r.n1 === r.n3) return [`pair-${r.n1}`]
+      if (r.n2 === r.n3) return [`pair-${r.n2}`]
+      return []
+    },
+    k => {
+      const v = k.replace('pair-', '')
+      return `${v}${v}`
+    }
+  )
+  // Ensure all 6 pairs appear
+  const pairKeys = new Set(pairStats.map(p => p.key))
+  const pairResult = [
+    ...pairStats,
+    ...PAIR_VALS.filter(v => !pairKeys.has(`pair-${v}`)).map(v => ({
+      key: `pair-${v}`, label: `${v}${v}`, appeared: 0,
+      kySinceLast: N, avgInterval: N, overdueScore: 1,
+    }))
+  ].sort((a, b) => b.overdueScore - a.overdueScore)
+
+  // ── Sums 3-18 ─────────────────────────────────────────────────────────
+  const sumStats = computeStats(r => [`sum-${r.sum}`], k => k.replace('sum-', ''))
+  // Ensure all sums appear
+  const sumKeys = new Set(sumStats.map(s => s.key))
+  const sumResult = [
+    ...sumStats,
+    ...Array.from({ length: 16 }, (_, i) => `sum-${i + 3}`)
+      .filter(k => !sumKeys.has(k))
+      .map(k => ({
+        key: k, label: k.replace('sum-', ''), appeared: 0,
+        kySinceLast: N, avgInterval: N, overdueScore: 1,
+      }))
+  ].sort((a, b) => b.overdueScore - a.overdueScore)
+
+  return {
+    total: N,
+    triples: tripleResult,
+    pairs: pairResult,
+    sums: sumResult,
+  }
+}))
+
+/** GET /events — SSE stream */
+app.get('/events', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+    'Pragma': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Access-Control-Allow-Origin': '*',
+  })
+  res.flushHeaders()
+
+  // Heartbeat to keep connection alive through proxies (every 15s)
+  const hb = setInterval(() => {
+    try { res.write(': heartbeat\n\n') } catch (_) { clearInterval(hb) }
+  }, 15_000)
+
+  sseClients.add(res)
+  console.log(`[SSE] +1 client (total: ${sseClients.size})`)
+
+  req.on('close', () => {
+    clearInterval(hb)
+    sseClients.delete(res)
+    console.log(`[SSE] -1 client (total: ${sseClients.size})`)
+  })
+})
+
+/** GET /health */
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() })
+})
+
+/** POST /crawl — trigger manual crawl immediately */
+let crawling = false
+app.post('/crawl', async (_req, res) => {
+  if (crawling) return res.json({ ok: false, message: 'Đang crawl, vui lòng đợi…' })
+  crawling = true
+  try {
+    await crawlTick()
+    res.json({ ok: true, message: 'Crawl xong' })
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message })
+  } finally {
+    crawling = false
+  }
+})
+
+// ── Integrated crawler loop ────────────────────────────────────────────────
+// Track last known total so we can detect file changes even if crawler returns +0
+let lastKnownTotal = 0
+
+async function crawlTick() {
+  const ts = new Date().toLocaleTimeString('vi-VN')
+  console.log(`[crawler] ${ts} — crawling…`)
+  try {
+    const { total, added, newRecords } = await crawlRun()
+    // Always invalidate cache if total changed (covers external file mutations)
+    if (added > 0 || total !== lastKnownTotal) {
+      const latestKy = newRecords[0]?.ky || '?'
+      if (added > 0) {
+        console.log(`[crawler] ${added} kỳ mới (latest: #${latestKy}) — push SSE → ${sseClients.size} client(s)`)
+        invalidateCache()
+        broadcast('new-draw', {
+          added,
+          latestKy,
+          total,
+          ts: new Date().toISOString(),
+        })
+      } else {
+        console.log(`[crawler] total changed ${lastKnownTotal}→${total} — invalidating cache`)
+        invalidateCache()
+      }
+      lastKnownTotal = total
+    }
+  } catch (err) {
+    console.error('[crawler] ERROR:', err.message)
+  }
+}
+
+// ── Start ──────────────────────────────────────────────────────────────────
+
+/**
+ * Bingo18 draws open at minute marks: :00, :06, :12, :18, :24, :30, :36, :42, :48, :54
+ * We crawl ~30s after each draw minute to give the site time to post results.
+ */
+const DRAW_CYCLE_MS = 6 * 60 * 1_000   // 6-minute draw cycle
+const CRAWL_OFFSET_MS = 30_000          // crawl 30s after the draw minute
+
+function msToNextCrawl() {
+  const now = new Date()
+  const posInCycle = ((now.getMinutes() % 6) * 60 + now.getSeconds()) * 1_000 + now.getMilliseconds()
+  if (posInCycle < CRAWL_OFFSET_MS) {
+    return CRAWL_OFFSET_MS - posInCycle
+  }
+  return DRAW_CYCLE_MS - posInCycle + CRAWL_OFFSET_MS
+}
+
+function scheduleNextCrawl() {
+  const ms = msToNextCrawl()
+  const nextTime = new Date(Date.now() + ms).toLocaleTimeString('vi-VN')
+  console.log(`[crawler] next scheduled at ${nextTime} (+${Math.round(ms / 1_000)}s)`)
+  setTimeout(async () => {
+    await crawlTick()
+    scheduleNextCrawl()
+  }, ms)
+}
+
+app.listen(PORT, async () => {
+  console.log(`Bingo AI API  →  http://localhost:${PORT}`)
+  console.log(`Dashboard     →  http://localhost:${PORT}/index.html`)
+  console.log(`SSE stream    →  http://localhost:${PORT}/events`)
+  console.log(`Crawl schedule: 30s after each draw minute (:00,:06,:12,...,:54)`)
+  await crawlTick()    // crawl once on startup
+  scheduleNextCrawl()  // schedule on draw-minute alignment
+})
