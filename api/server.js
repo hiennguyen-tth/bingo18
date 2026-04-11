@@ -32,7 +32,7 @@ const features = require('../predictor/features')
 const { run: crawlRun } = require('../crawler/crawl')
 
 const app = express()
-const PORT = parseInt(process.env.PORT) || 3000
+const PORT = parseInt(process.env.PORT) || 8080
 const ADSENSE_PUBLISHER_ID = process.env.ADSENSE_PUBLISHER_ID || ''
 const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
 
@@ -490,7 +490,7 @@ function scheduleNextCrawl() {
   }, ms)
 }
 
-app.listen(PORT, async () => {
+app.listen(PORT, "0.0.0.0", async () => {
   console.log(`Bingo AI API  →  http://localhost:${PORT}`)
   console.log(`Dashboard     →  http://localhost:${PORT}/index.html`)
   console.log(`SSE stream    →  http://localhost:${PORT}/events`)

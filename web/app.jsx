@@ -462,17 +462,15 @@ function App() {
           <span style={{ ...C.pill, color: '#94a3b8' }}>
             ⟳ {updated}
           </span>
-          <button style={{ ...C.btn, opacity: crawling ? 0.6 : 1, background: 'rgba(52,211,153,0.15)', borderColor: 'rgba(52,211,153,0.4)', color: '#34d399' }}
+          <button style={{ ...C.btn, opacity: (crawling || loading) ? 0.6 : 1, background: 'rgba(52,211,153,0.15)', borderColor: 'rgba(52,211,153,0.4)', color: '#34d399' }}
             onClick={async () => {
               setCrawling(true)
               await fetch('/crawl', { method: 'POST' }).catch(() => { })
               setCrawling(false)
+              load()
             }}
-            disabled={crawling}>
-            {crawling ? 'Đang tải…' : '⬇ Tải mới'}
-          </button>
-          <button style={{ ...C.btn, opacity: loading ? 0.6 : 1 }} onClick={() => load()} disabled={loading}>
-            {loading ? 'Loading…' : '↺ Refresh'}
+            disabled={crawling || loading}>
+            {crawling ? 'Đang tải…' : loading ? 'Loading…' : '⬇ Cập nhật'}
           </button>
         </div>
       </div>
