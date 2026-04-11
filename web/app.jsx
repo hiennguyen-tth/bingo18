@@ -38,42 +38,95 @@ const C = {
 }
 
 /* ─────────────────────────── PredCard ─────────────────────────────────── */
-const PredCard = memo(function PredCard({ combo, pct, rank, maxPct }) {
+function getRankingBadge(normScore) {
+  if (normScore >= 85) return { label: '🔥 HOT', color: '#FF6B3D', bg: 'rgba(255,107,61,0.18)', border: 'rgba(255,107,61,0.5)' }
+  if (normScore >= 70) return { label: '⭐ STRONG', color: '#FFC857', bg: 'rgba(255,200,87,0.15)', border: 'rgba(255,200,87,0.45)' }
+  if (normScore >= 55) return { label: '👍 GOOD', color: '#4CC9F0', bg: 'rgba(76,201,240,0.13)', border: 'rgba(76,201,240,0.4)' }
+  if (normScore >= 40) return { label: '⚠️ WEAK', color: '#9D8DF1', bg: 'rgba(157,141,241,0.13)', border: 'rgba(157,141,241,0.4)' }
+  return { label: '❄️ COLD', color: '#6B7280', bg: 'rgba(107,114,128,0.12)', border: 'rgba(107,114,128,0.35)' }
+}
+
+const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability }) {
   const nums = combo.split('-')
-  const isTriple = nums[0] === nums[1] && nums[1] === nums[2]
-  const isPair = !isTriple && (nums[0] === nums[1] || nums[1] === nums[2] || nums[0] === nums[2])
-  const pat = isTriple ? 'triple' : isPair ? 'pair' : 'normal'
+  const normScore = maxScore > 0 ? Math.round((score / maxScore) * 100) : 0
+  const badge = getRankingBadge(normScore)
+  // Cap at 75% — this is a relative model score, not a true probability
+  const confidence = Math.min(75, Math.round(1 / (1 + Math.exp(-0.05 * (normScore - 50))) * 100))
+
+  const patLabel = { triple: '♦ Triple', pair: '◆ Pair', normal: '◇ Normal' }[pat] || pat || '◇ Normal'
+  const patColor = { triple: '#c4b5fd', pair: '#7dd3fc', normal: '#94a3b8' }[pat] || '#94a3b8'
+  const patBg = { triple: 'rgba(139,92,246,0.15)', pair: 'rgba(59,130,246,0.12)', normal: 'rgba(255,255,255,0.03)' }[pat] || 'rgba(255,255,255,0.03)'
+  const numColor = { triple: '#c4b5fd', pair: '#7dd3fc', normal: '#f1f5f9' }[pat] || '#f1f5f9'
 
   const rankColor = ['#fbbf24', '#94a3b8', '#cd7c3a']
-  const patBg = { triple: 'rgba(139,92,246,0.22)', pair: 'rgba(59,130,246,0.15)', normal: 'rgba(255,255,255,0.02)' }
-  const tagStyle = {
-    triple: { bg: 'rgba(139,92,246,0.4)', color: '#c4b5fd' },
-    pair: { bg: 'rgba(59,130,246,0.3)', color: '#7dd3fc' },
-    normal: null,
-  }[pat]
-
   const barW = maxPct > 0 ? (pct / maxPct) * 100 : 0
 
   return (
-    <div style={{ background: patBg[pat], border: '1px solid rgba(255,255,255,0.07)', borderRadius: 10, padding: '12px 16px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-        <div style={{ fontSize: 16, fontWeight: 900, color: rank < 3 ? rankColor[rank] : '#475569', minWidth: 20, textAlign: 'center' }}>
-          {rank + 1}
+    <div style={{
+      background: patBg,
+      border: `1px solid ${badge.border}`,
+      borderRadius: 12,
+      padding: '14px 16px',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 10,
+    }}>
+      {/* Row 1: badge + rank */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span style={{
+          fontSize: 11, fontWeight: 800, letterSpacing: '0.04em',
+          color: badge.color, background: badge.bg,
+          padding: '3px 10px', borderRadius: 20,
+          border: `1px solid ${badge.border}`,
+        }}>{badge.label}</span>
+        <span style={{ fontSize: 15, fontWeight: 900, color: rank < 3 ? rankColor[rank] : '#475569' }}>
+          #{rank + 1}
+        </span>
+      </div>
+
+      {/* Row 2: combo digits */}
+      <div style={{
+        fontSize: 28, fontWeight: 900, letterSpacing: 6,
+        color: numColor, textAlign: 'center',
+        fontVariantNumeric: 'tabular-nums',
+        lineHeight: 1,
+      }}>
+        {nums.join(' ')}
+      </div>
+
+      {/* Row 3: stats grid */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 8px', fontSize: 11 }}>
+        <span style={{ color: '#64748b' }}>overdue</span>
+        <span style={{ color: '#e2e8f0', textAlign: 'right', fontWeight: 700 }}>{overdueRatio?.toFixed(2)}×</span>
+        <span style={{ color: '#64748b' }}>pattern</span>
+        <span style={{ color: patColor, textAlign: 'right', fontWeight: 600 }}>{patLabel}</span>
+        <span style={{ color: '#64748b' }}>stability</span>
+        <span style={{ color: '#e2e8f0', textAlign: 'right', fontWeight: 700 }}>{stability?.toFixed(2)}</span>
+        <span style={{ color: '#64748b' }}>share</span>
+        <span style={{ color: '#a5b4fc', textAlign: 'right', fontWeight: 700 }}>{pct}%</span>
+      </div>
+
+      {/* Row 4: confidence bar */}
+      <div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#64748b', marginBottom: 4 }}>
+          <span>confidence</span>
+          <span style={{ color: badge.color, fontWeight: 700 }}>{confidence}%</span>
         </div>
-        <div style={{ fontSize: 22, fontWeight: 800, letterSpacing: 4, color: '#f1f5f9', fontVariantNumeric: 'tabular-nums', flex: 1 }}>
-          {nums.join(' ')}
-        </div>
-        <div style={{ textAlign: 'right' }}>
-          <div style={{ fontSize: 16, fontWeight: 800, color: '#a5b4fc' }}>{pct}%</div>
-          {tagStyle && <span style={{ ...C.tag, background: tagStyle.bg, color: tagStyle.color, fontSize: 9 }}>{pat}</span>}
+        <div style={{ height: 5, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden' }}>
+          <div style={{
+            width: `${confidence}%`, height: '100%',
+            background: `linear-gradient(90deg,${badge.color}88,${badge.color})`,
+            borderRadius: 3, transition: 'width 0.6s ease',
+          }} />
         </div>
       </div>
-      {/* probability bar */}
-      <div style={{ height: 4, background: 'rgba(255,255,255,0.06)', borderRadius: 2, overflow: 'hidden' }}>
+
+      {/* Row 5: probability bar */}
+      <div style={{ height: 3, background: 'rgba(255,255,255,0.05)', borderRadius: 2, overflow: 'hidden' }}>
         <div style={{
           width: `${barW}%`, height: '100%',
-          background: isTriple ? 'linear-gradient(90deg,#7c3aed,#a78bfa)'
-            : isPair ? 'linear-gradient(90deg,#1d4ed8,#60a5fa)'
+          background: pat === 'triple' ? 'linear-gradient(90deg,#7c3aed,#a78bfa)'
+            : pat === 'pair' ? 'linear-gradient(90deg,#1d4ed8,#60a5fa)'
               : 'linear-gradient(90deg,#4f46e5,#818cf8)',
           borderRadius: 2, transition: 'width 0.6s ease',
         }} />
@@ -384,7 +437,7 @@ function App() {
       clearInterval(tFast)
       clearInterval(tSlow)
     }
-  }, [load, loadOverdue])
+  }, [load, loadStats, loadOverdue])
 
   return (
     <div style={C.app}>
@@ -394,7 +447,7 @@ function App() {
       <div style={C.header}>
         <div>
           <div style={C.logo}>🎰 Bingo18 AI</div>
-          <div style={C.sub} className="hide-mobile">Ensemble Predictor · Frequency + Markov Chain · Live SSE</div>
+          <div style={C.sub} className="hide-mobile">AI Ensemble 7 Tín Hiệu · Realtime SSE · Walk-forward Backtest</div>
         </div>
         <div className="header-actions">
           <span style={C.pill}>{total} records</span>
@@ -441,7 +494,12 @@ function App() {
         {/* ── Top-10 Predictions ── */}
         <div style={C.sec}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 14, flexWrap: 'wrap', gap: 6 }}>
-            <div style={C.label}>Top 10 Combo dự đoán</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div style={C.label}>Top 10 Combo dự đoán</div>
+              {updated !== '—' && (
+                <span style={{ fontSize: 10, color: '#475569' }}>⟳ {updated}</span>
+              )}
+            </div>
             <div style={{ fontSize: 11, color: '#475569' }} className="hide-mobile">
               % = tỷ lệ trong top-10 · X.Xx = số lần quá hạn so với kỳ vọng (1x = bình thường, &gt;1x = lâu chưa về)
             </div>
@@ -453,7 +511,8 @@ function App() {
             {preds.map((p, i) => (
               <PredCard key={p.combo} combo={p.combo} pct={p.pct} rank={i}
                 score={p.score} maxScore={maxScore}
-                overdueRatio={p.overdueRatio ?? 0} comboGap={p.comboGap ?? 0} />
+                overdueRatio={p.overdueRatio ?? 0} comboGap={p.comboGap ?? 0}
+                pat={p.pat} stability={p.stability ?? 1} />
             ))}
           </div>
         </div>

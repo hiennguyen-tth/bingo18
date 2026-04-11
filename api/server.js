@@ -93,13 +93,25 @@ app.use(compression({
 app.use(cors())
 app.use(express.json())
 
-// Serve index.html with ADSENSE_PUBLISHER_ID injected (must be before static)
-app.get('/', (_req, res) => {
+// Inject ADSENSE placeholders and return the processed HTML
+function renderIndex() {
+  const adScript = ADSENSE_PUBLISHER_ID
+    ? `<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${ADSENSE_PUBLISHER_ID}" crossorigin="anonymous"></script>`
+    : ''
+  return INDEX_TPL
+    .replace('{{ADSENSE_PUBLISHER_ID}}', ADSENSE_PUBLISHER_ID)
+    .replace('{{ADSENSE_SCRIPT}}', adScript)
+}
+
+// Serve index.html with placeholders injected — covers both / and /index.html
+// Must come BEFORE express.static so static never serves the raw template
+app.get(['/', '/index.html'], (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8')
-  res.send(INDEX_TPL.replace('{{ADSENSE_PUBLISHER_ID}}', ADSENSE_PUBLISHER_ID))
+  res.send(renderIndex())
 })
 
-app.use(express.static(path.join(__dirname, '../web')))
+// Static assets (app.jsx, heatmap.jsx, css…) — index.html excluded above
+app.use(express.static(path.join(__dirname, '../web'), { index: false }))
 
 // ── Helper ─────────────────────────────────────────────────────────────────
 async function loadHistory() {
@@ -136,6 +148,8 @@ app.get('/predict', withCache('predict', 5 * 60_000, async () => {
     overdueRatio: +r.overdueRatio.toFixed(2),
     comboGap: r.comboGap,
     sumOD: +r.sumOD.toFixed(2),
+    pat: r.pat,
+    stability: +r.stability.toFixed(2),
   }))
 
   // Sum distribution
@@ -381,9 +395,22 @@ app.get('/events', (req, res) => {
   })
 })
 
-/** GET /health */
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() })
+/** GET /health — detailed liveness probe */
+app.get('/health', async (_req, res) => {
+  try {
+    const data = await loadHistory()
+    const newest = data[0]  // history is stored newest-first
+    res.json({
+      status: 'ok',
+      historySize: data.length,
+      lastDrawAt: newest?.drawTime ?? newest?.draw_time ?? null,
+      uptime: Math.floor(process.uptime()),
+      sseClients: sseClients.size,
+      cacheKeys: [...apiCache.keys()],
+    })
+  } catch (err) {
+    res.status(500).json({ status: 'error', error: err.message, uptime: Math.floor(process.uptime()) })
+  }
 })
 
 /** POST /crawl — trigger manual crawl immediately */
@@ -404,8 +431,10 @@ app.post('/crawl', async (_req, res) => {
 // ── Integrated crawler loop ────────────────────────────────────────────────
 // Track last known total so we can detect file changes even if crawler returns +0
 let lastKnownTotal = 0
+let lastCrawlAttempt = 0
 
 async function crawlTick() {
+  lastCrawlAttempt = Date.now()
   const ts = new Date().toLocaleTimeString('vi-VN')
   console.log(`[crawler] ${ts} — crawling…`)
   try {
@@ -468,4 +497,11 @@ app.listen(PORT, async () => {
   console.log(`Crawl schedule: 30s after each draw minute (:00,:06,:12,...,:54)`)
   await crawlTick()    // crawl once on startup
   scheduleNextCrawl()  // schedule on draw-minute alignment
+  // Fallback safety net: if scheduled crawler stalls for 7+ min, force a crawl
+  setInterval(async () => {
+    if (Date.now() - lastCrawlAttempt > 7 * 60_000) {
+      console.log('[crawler] fallback cron triggered — scheduled loop may have stalled')
+      await crawlTick()
+    }
+  }, 6 * 60_000)
 })
