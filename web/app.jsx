@@ -46,7 +46,7 @@ function getRankingBadge(normScore) {
   return { label: '❄️ COLD', color: '#6B7280', bg: 'rgba(107,114,128,0.12)', border: 'rgba(107,114,128,0.35)' }
 }
 
-const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability }) {
+const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability, zScore, statNorm, mk2Norm, sessNorm }) {
   const nums = combo.split('-')
   const normScore = maxScore > 0 ? Math.round((score / maxScore) * 100) : 0
   const badge = getRankingBadge(normScore)
@@ -60,6 +60,18 @@ const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxSc
 
   const rankColor = ['#fbbf24', '#94a3b8', '#cd7c3a']
   const barW = maxPct > 0 ? (pct / maxPct) * 100 : 0
+
+  // z-score display (gap-based z — positive = overdue = interesting)
+  const zColor = (zScore == null) ? '#64748b' : zScore > 2.0 ? '#FF6B3D' : zScore > 1.0 ? '#FFC857' : '#94a3b8'
+  const zLabel = zScore != null ? zScore.toFixed(2) : 'N/A'
+
+  // 3-model breakdown bar (v4: stat / mk2 / sess)
+  const breakdownModels = [
+    { label: 'stat', val: statNorm ?? 0, color: '#818cf8' },
+    { label: 'mk2', val: mk2Norm ?? 0, color: '#34d399' },
+    { label: 'sess', val: sessNorm ?? 0, color: '#fb923c' },
+  ]
+  const breakTotal = breakdownModels.reduce((s, m) => s + m.val, 0) || 1
 
   return (
     <div style={{
@@ -96,17 +108,35 @@ const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxSc
 
       {/* Row 3: stats grid */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 8px', fontSize: 11 }}>
-        <span style={{ color: '#64748b' }}>overdue</span>
-        <span style={{ color: '#e2e8f0', textAlign: 'right', fontWeight: 700 }}>{overdueRatio?.toFixed(2)}×</span>
+        <span style={{ color: '#64748b' }}>z-score</span>
+        <span style={{ color: zColor, textAlign: 'right', fontWeight: 700 }}>{zLabel}</span>
         <span style={{ color: '#64748b' }}>pattern</span>
         <span style={{ color: patColor, textAlign: 'right', fontWeight: 600 }}>{patLabel}</span>
         <span style={{ color: '#64748b' }}>stability</span>
-        <span style={{ color: '#e2e8f0', textAlign: 'right', fontWeight: 700 }}>{stability?.toFixed(2)}</span>
+        <span style={{ color: '#e2e8f0', textAlign: 'right', fontWeight: 700 }}>{stability != null ? stability.toFixed(2) : '—'}</span>
         <span style={{ color: '#64748b' }}>share</span>
         <span style={{ color: '#a5b4fc', textAlign: 'right', fontWeight: 700 }}>{pct}%</span>
       </div>
 
-      {/* Row 4: confidence bar */}
+      {/* Row 4: 4-model breakdown */}
+      <div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#475569', marginBottom: 3 }}>
+          {breakdownModels.map(m => (
+            <span key={m.label} style={{ color: m.color }}>{m.label} {(m.val / breakTotal * 100).toFixed(0)}%</span>
+          ))}
+        </div>
+        <div style={{ height: 4, background: 'rgba(255,255,255,0.05)', borderRadius: 2, display: 'flex', overflow: 'hidden' }}>
+          {breakdownModels.map(m => (
+            <div key={m.label} style={{
+              width: `${m.val / breakTotal * 100}%`, height: '100%',
+              background: m.color, opacity: 0.85,
+              transition: 'width 0.6s ease',
+            }} />
+          ))}
+        </div>
+      </div>
+
+      {/* Row 5: confidence bar */}
       <div>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#64748b', marginBottom: 4 }}>
           <span>confidence</span>
@@ -439,6 +469,8 @@ function App() {
     }
   }, [load, loadStats, loadOverdue])
 
+  const maxPct = Math.max(...preds.map(p => p.pct || 0), 1)
+
   return (
     <div style={C.app}>
       <NewDrawToast info={toast} onDismiss={() => setToast(null)} />
@@ -508,9 +540,11 @@ function App() {
             )}
             {preds.map((p, i) => (
               <PredCard key={p.combo} combo={p.combo} pct={p.pct} rank={i}
-                score={p.score} maxScore={maxScore}
-                overdueRatio={p.overdueRatio ?? 0} comboGap={p.comboGap ?? 0}
-                pat={p.pat} stability={p.stability ?? 1} />
+                maxPct={maxPct} score={p.score} maxScore={maxScore}
+                overdueRatio={p.overdueRatio} comboGap={p.comboGap ?? 0}
+                pat={p.pat} stability={p.stability}
+                zScore={p.zScore} statNorm={p.statNorm ?? p.coreNorm}
+                mk2Norm={p.mk2Norm} sessNorm={p.sessNorm} />
             ))}
           </div>
         </div>

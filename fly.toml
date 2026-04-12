@@ -1,25 +1,37 @@
-# fly.toml app configuration file generated for xs-bingo on 2026-04-11T11:02:10+07:00
+# fly.toml app configuration file generated for xs-bingo18 on 2026-04-11T12:11:48+07:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'xs-bingo'
+app = 'xs-bingo18'
 primary_region = 'sin'
 
-[http_service]
-  [env]
-PORT = "8080"
+[build]
 
-[[services]]
-internal_port = 8080
-protocol = "tcp"
+[http_service]
+  internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ['app']
+
+  [[http_service.checks]]
+    grace_period = "20s"
+    interval = "15s"
+    method = "GET"
+    path = "/health"
+    timeout = "5s"
+
+[[mounts]]
+  source = "bingo_data"
+  destination = "/app/dataset"
 
 [[vm]]
   memory = '1gb'
   cpus = 1
   memory_mb = 1024
+
+[[restart]]
+  policy = 'always'
+  max_retries = 10

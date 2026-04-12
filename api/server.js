@@ -1,4 +1,16 @@
 'use strict'
+
+// ── Global safeguards — MUST be first, before any require that could throw ──────
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] uncaughtException:', err.message, err.stack)
+  process.exit(1)  // exit(1) so Fly/PM2 restarts the container
+})
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] unhandledRejection:', reason)
+  process.exit(1)
+})
+
+console.log('[startup] loading modules...')
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') })
 /**
  * api/server.js
@@ -144,12 +156,21 @@ app.get('/predict', withCache('predict', 5 * 60_000, async () => {
   const next = top10.map(r => ({
     combo: r.combo,
     score: +r.score.toFixed(3),
-    pct: +(r.score / top10Total * 100).toFixed(1),
-    overdueRatio: +r.overdueRatio.toFixed(2),
+    // pct = share of top-10 total score, hard-capped at 75% to avoid misleading display
+    pct: Math.min(75, +(r.score / top10Total * 100).toFixed(1)),
+    overdueRatio: r.overdueRatio != null ? +r.overdueRatio.toFixed(2) : null,
     comboGap: r.comboGap,
-    sumOD: +r.sumOD.toFixed(2),
+    sumOD: +(r.sumOD ?? 0).toFixed(2),
     pat: r.pat,
-    stability: +r.stability.toFixed(2),
+    stability: r.stability != null ? +r.stability.toFixed(2) : null,
+    // 3-model breakdown (v4)
+    zScore: r.zScore != null ? +r.zScore.toFixed(2) : null,
+    statNorm: r.statNorm ?? 0,
+    mk2Norm: r.mk2Norm ?? 0,
+    sessNorm: r.sessNorm ?? 0,
+    // legacy compat
+    coreNorm: r.coreNorm ?? 0,
+    chiNorm: 0,
   }))
 
   // Sum distribution
@@ -464,44 +485,18 @@ async function crawlTick() {
 
 // ── Start ──────────────────────────────────────────────────────────────────
 
-/**
- * Bingo18 draws open at minute marks: :00, :06, :12, :18, :24, :30, :36, :42, :48, :54
- * We crawl ~30s after each draw minute to give the site time to post results.
- */
-const DRAW_CYCLE_MS = 6 * 60 * 1_000   // 6-minute draw cycle
-const CRAWL_OFFSET_MS = 30_000          // crawl 30s after the draw minute
+// Poll every 90 seconds — Bingo18 publish times are irregular (not a fixed :00/:06
+// schedule), so phase-synced crawls miss results by up to one full cycle.
+// 90s polling guarantees we're at most 90s behind the site, regardless of schedule.
+const CRAWL_INTERVAL_MS = 90_000
 
-function msToNextCrawl() {
-  const now = new Date()
-  const posInCycle = ((now.getMinutes() % 6) * 60 + now.getSeconds()) * 1_000 + now.getMilliseconds()
-  if (posInCycle < CRAWL_OFFSET_MS) {
-    return CRAWL_OFFSET_MS - posInCycle
-  }
-  return DRAW_CYCLE_MS - posInCycle + CRAWL_OFFSET_MS
-}
-
-function scheduleNextCrawl() {
-  const ms = msToNextCrawl()
-  const nextTime = new Date(Date.now() + ms).toLocaleTimeString('vi-VN')
-  console.log(`[crawler] next scheduled at ${nextTime} (+${Math.round(ms / 1_000)}s)`)
-  setTimeout(async () => {
-    await crawlTick()
-    scheduleNextCrawl()
-  }, ms)
-}
-
-app.listen(PORT, "0.0.0.0", async () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Bingo AI API  →  http://localhost:${PORT}`)
-  console.log(`Dashboard     →  http://localhost:${PORT}/index.html`)
+  console.log(`Dashboard     →  http://localhost:${PORT}/`)
   console.log(`SSE stream    →  http://localhost:${PORT}/events`)
-  console.log(`Crawl schedule: 30s after each draw minute (:00,:06,:12,...,:54)`)
-  await crawlTick()    // crawl once on startup
-  scheduleNextCrawl()  // schedule on draw-minute alignment
-  // Fallback safety net: if scheduled crawler stalls for 7+ min, force a crawl
-  setInterval(async () => {
-    if (Date.now() - lastCrawlAttempt > 7 * 60_000) {
-      console.log('[crawler] fallback cron triggered — scheduled loop may have stalled')
-      await crawlTick()
-    }
-  }, 6 * 60_000)
+  console.log(`Crawl interval: every ${CRAWL_INTERVAL_MS / 1000}s`)
+
+  // Startup crawl immediately, then poll every 90s
+  crawlTick().catch(err => console.error('[crawler] startup error:', err.message))
+  setInterval(crawlTick, CRAWL_INTERVAL_MS)
 })

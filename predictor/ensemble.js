@@ -1,20 +1,36 @@
 'use strict'
 /**
- * predictor/ensemble.js — v2
- * Enhanced 7-signal overdue scoring:
- *   1. Pattern rarity weight   (triple 1.5x, pair 1.0x, normal 0.7x)
- *   2. Stability factor        (mean_gap / std_gap — rewards regular cycles)
- *   3. Momentum penalty        (< 0.3x avgGap since last → x0.7)
- *   4. Pre-triple signal       (no triple in last 3 draws → x1.15; recent triple → x0.6)
- *   5. Combo diversity         (max 2 triple, 4 pair, 4 normal in top-10)
- *   6. Family filter           (max 2 combos sharing any digit in top-10)
- *   7. Log(mean_gap) factor    (rewards combos with inherently longer expected gaps)
+ * predictor/ensemble.js — v4
  *
- * Weights:  C1=0.30 combo · C2=0.25 sum · C3=0.20 pattern · C4=0.15 cold · C5=0.10 markov
+ * 3-model ensemble — normalize each to [0,1] then combine equally:
+ *
+ *   MODEL A — Statistical gap z-score (overdueness measure)     [50%]
+ *     z = (currentGap – avgGap) / stdGap; clamped score = max(0, min(4, z))
+ *     Overdue (z > 0) → boosted; recently appeared (z ≤ 0) → score=0
+ *     Augmented by S3 (sum deviation) + S4 (digit momentum)
+ *     Raw z exported as `zScore`; bypass cap when z > 2.5
+ *
+ *   MODEL B — Markov order-2 (transition probability)           [30%]
+ *     P(next | prev-2, prev-1); fallback to order-1; then 1/216
+ *     Fallback chain: never crashes on undefined key
+ *
+ *   MODEL C — Time-of-day session model (frequency ratio)       [20%]
+ *     morning 6–12h / afternoon 12–18h / evening 18–6h
+ *     When < 20 draws in current session → weight=0 → 60% A + 40% B
+ *
+ * Triple boost (S2) applied AFTER ensemble — not inside any model:
+ *   sinceTriple = draws since last triple appeared
+ *   mult = min(3.0, 1 + (1 – (210/216)^sinceTriple) * 2)
+ *
+ * Diversity cap bypass:
+ *   Combos with z > 2.5 (severely overdue) → forced into top-10
+ *   sorted by z DESC (most overdue first) — max 3 bypass slots
+ *
+ * Confidence display cap: 75% — enforced in server.js on the pct field
  */
+
 const path = require('path')
 const fs = require('fs')
-const markovModule = require('./markov')
 
 const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
 
@@ -23,8 +39,8 @@ const SUM_COUNT = {
   9: 25, 10: 27, 11: 27, 12: 25, 13: 21, 14: 15,
   15: 10, 16: 6, 17: 3, 18: 1,
 }
-const PAT_COUNT = { triple: 6, pair: 90, normal: 120 }
-const PAT_WEIGHT = { triple: 1.2, pair: 1.0, normal: 0.7 }
+
+function key(n1, n2, n3) { return `${n1}-${n2}-${n3}` }
 
 function classify(a, b, c) {
   if (a === b && b === c) return 'triple'
@@ -32,206 +48,443 @@ function classify(a, b, c) {
   return 'normal'
 }
 
-function buildComboStats(chron) {
+const ALL_COMBOS = []
+for (let a = 1; a <= 6; a++)
+  for (let b = 1; b <= 6; b++)
+    for (let c = 1; c <= 6; c++)
+      ALL_COMBOS.push([a, b, c])
+
+/**
+ * Min-max normalize a score map {key: number} → {key: [0,1]}.
+ * All-equal values → 0.5 (signal is uniform / uninformative).
+ */
+function minMaxNorm(scoreMap) {
+  const keys = Object.keys(scoreMap)
+  if (!keys.length) return scoreMap
+  const vals = keys.map(k => scoreMap[k]).filter(v => isFinite(v))
+  const min = Math.min(...vals)
+  const max = Math.max(...vals)
+  const range = max - min
+  const out = {}
+  for (const k of keys) {
+    out[k] = range > 0 ? (scoreMap[k] - min) / range : 0.5
+  }
+  return out
+}
+
+// ── MODEL A: Statistical z-score ──────────────────────────────────────────
+
+function sig3SumDeviation(chron) {
+  const window = chron.slice(-200)
+  const W = window.length
+  const countMap = {}
+  for (const r of window) countMap[r.sum] = (countMap[r.sum] || 0) + 1
+  const dev = {}
+  for (let s = 3; s <= 18; s++) {
+    const expected = W * (SUM_COUNT[s] / 216)
+    const actual = countMap[s] || 0
+    dev[s] = expected > 0 ? Math.max(0, expected - actual) / expected : 0
+  }
+  return dev
+}
+
+function sig4DigitMomentum(chron) {
+  const window = chron.slice(-30)
+  const W = window.length
+  const expected = W * 3 / 6
+  const count = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 }
+  for (const r of window) { count[r.n1]++; count[r.n2]++; count[r.n3]++ }
+  const hot = {}
+  for (let d = 1; d <= 6; d++) {
+    hot[d] = expected > 0 ? Math.max(0, count[d] - expected) / expected : 0
+  }
+  return hot
+}
+
+/**
+ * Model A: gap-based z-score — how many std deviations overdue is each combo?
+ *
+ *   z = (currentGap – avgGap) / stdGap
+ *
+ *   z > 0  → overdue (waited longer than average) → gets score boost
+ *   z ≤ 0  → recently appeared → score = 0 (floor, no negative penalty)
+ *   z is clamped to [0, 4] to prevent outlier combos with tiny stdGap from
+ *   dominating (e.g., a combo with stdGap=3 and curGap=500 → z=126 → capped to 4)
+ *
+ * Special cases:
+ *   - Only 1 historical gap (no stdGap): use ratio (curGap – avgGap) / avgGap, cap ±2
+ *   - Never seen: z = 2.0  (moderately overdue default)
+ *
+ * Augmented by S3 (sum deviation) and S4 (digit momentum) as tie-breakers.
+ */
+function modelA(chron) {
+  const N = chron.length
+
+  // Build gap history for every combo
   const lastIdx = {}
   const gapLists = {}
   chron.forEach((r, i) => {
-    const k = r.n1 + '-' + r.n2 + '-' + r.n3
+    const k = key(r.n1, r.n2, r.n3)
     if (lastIdx[k] !== undefined) {
       if (!gapLists[k]) gapLists[k] = []
       gapLists[k].push(i - lastIdx[k])
     }
     lastIdx[k] = i
   })
-  const stats = {}
-  for (const k of Object.keys(lastIdx)) {
+
+  const sumDev = sig3SumDeviation(chron)
+  const digitHot = sig4DigitMomentum(chron)
+
+  const scores = {}
+  const zMap = {}
+
+  for (const [a, b, c] of ALL_COMBOS) {
+    const k = key(a, b, c)
     const gaps = gapLists[k] || []
-    const avg = gaps.length ? gaps.reduce((a, b) => a + b, 0) / gaps.length : null
-    const std = (gaps.length > 1 && avg !== null)
-      ? Math.sqrt(gaps.map(g => (g - avg) * (g - avg)).reduce((a, b) => a + b, 0) / gaps.length)
+    const curGap = lastIdx[k] !== undefined ? N - 1 - lastIdx[k] : N
+
+    const avg = gaps.length ? gaps.reduce((s, v) => s + v, 0) / gaps.length : null
+    const variance = gaps.length > 1
+      ? gaps.reduce((acc, g) => acc + (g - avg) ** 2, 0) / gaps.length
       : null
-    stats[k] = {
-      appeared: gaps.length + 1,
-      avgGap: avg,
-      stdGap: std,
-      stability: (avg !== null && std !== null && std > 0) ? avg / std : null,
-      lastIdx: lastIdx[k],
+    const std = variance !== null ? Math.sqrt(variance) : null
+
+    let z
+    if (avg !== null && std !== null && std >= 1) {
+      // ≥2 historical gaps: full gap z-score
+      z = (curGap - avg) / std
+    } else if (avg !== null) {
+      // exactly 1 historical gap: ratio-based, capped to [-2, 2]
+      z = Math.max(-2, Math.min(2, (curGap - avg) / avg))
+    } else {
+      // never seen before
+      z = 2.0
     }
+
+    zMap[k] = z
+
+    // Score: clamp to [0, 4] — only overdue combos get a boost
+    const baseScore = Math.max(0, Math.min(4, z))
+
+    const s3 = 1 + sumDev[a + b + c] * 0.30
+    const digits = [...new Set([a, b, c])]
+    const avgHot = digits.reduce((acc, d) => acc + digitHot[d], 0) / digits.length
+    const s4 = 1 + avgHot * 0.15
+
+    scores[k] = baseScore * s3 * s4
   }
-  return stats
+  return { scores, zMap }
 }
 
-function preTripleSignal(chron) {
-  const N = chron.length
-  if (N < 3) return 1.0
-  const last3 = [chron[N - 1], chron[N - 2], chron[N - 3]]
-  const hasRecentTriple = last3.some(r => (r.pattern || classify(r.n1, r.n2, r.n3)) === 'triple')
-  return hasRecentTriple ? 0.6 : 1.30
-}
+// ── MODEL B: Markov order-2 ───────────────────────────────────────────────
 
-function scoreCombo(a, b, c, N, comboStats, sumLast, patLast, numCount, expectedNumFreq, mkRaw, mkTotal, tripleBoost) {
-  const k = a + '-' + b + '-' + c
-  const sum = a + b + c
-  const pat = classify(a, b, c)
-  const st = comboStats[k]
-
-  const comboGapRaw = st ? (N - 1 - st.lastIdx) : N
-  const c1 = Math.min(comboGapRaw, 2 * 216) / 216
-
-  const sumExpected = 216 / (SUM_COUNT[sum] || 1)
-  const sumGapRaw = sumLast[sum] !== undefined ? (N - 1 - sumLast[sum]) : N
-  const c2 = Math.min(sumGapRaw, 3 * sumExpected) / sumExpected
-
-  const patExpected = 216 / PAT_COUNT[pat]
-  const patGapRaw = patLast[pat] >= 0 ? (N - 1 - patLast[pat]) : patExpected
-  const c3 = Math.min(patGapRaw, 3 * patExpected) / patExpected
-
-  const cold = [a, b, c].reduce((s, n) => s + Math.max(0, expectedNumFreq - numCount[n]), 0) / (3 * expectedNumFreq)
-  const c4 = 1 + cold
-  const c5 = mkRaw[k] ? mkRaw[k] / mkTotal : 0
-
-  const overdueRatio = c1 * 0.30 + c2 * 0.25 + c3 * 0.20 + c4 * 0.15 + c5 * 0.10
-
-  let stability = 0.8  // default: limited/no appearance history
-  if (st && st.avgGap !== null && st.stability !== null) {
-    stability = Math.max(0.6, Math.min(3.0, st.stability))
+function buildMarkov2(chron) {
+  const map = {}
+  for (let i = 2; i < chron.length; i++) {
+    const p2 = key(chron[i - 2].n1, chron[i - 2].n2, chron[i - 2].n3)
+    const p1 = key(chron[i - 1].n1, chron[i - 1].n2, chron[i - 1].n3)
+    const cur = key(chron[i].n1, chron[i].n2, chron[i].n3)
+    const sk = `${p2}|${p1}`
+    if (!map[sk]) map[sk] = {}
+    map[sk][cur] = (map[sk][cur] || 0) + 1
   }
-
-  const avgGap = (st && st.avgGap !== null) ? st.avgGap : (pat === 'triple' ? 216 : 36)
-  const logFactor = Math.log(Math.max(avgGap, 2)) / Math.log(216)
-  const momentum = (comboGapRaw < 0.3 * avgGap) ? 0.7 : 1.0
-  const tripleSignal = (pat === 'triple') ? tripleBoost : 1.0
-
-  const rawScore = overdueRatio * PAT_WEIGHT[pat] * stability * logFactor * momentum * tripleSignal
-
-  return { k, sum, pat, comboGapRaw, c1, c2, sumGapRaw, rawScore, overdueRatio, stability }
+  return map
 }
 
-function buildState(chron) {
+/**
+ * Model B: Markov order-2 with fallback chain:
+ *   order-2 (≥5 observations) → order-1 → uniform 1/216
+ */
+function modelB(chron) {
   const N = chron.length
-  const comboStats = buildComboStats(chron)
-  const sumLast = {}
-  const patLast = { triple: -1, pair: -1, normal: -1 }
-  const numCount = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 }
-  chron.forEach((r, i) => {
-    sumLast[r.sum] = i
-    const pat = r.pattern || classify(r.n1, r.n2, r.n3)
-    patLast[pat] = i
-    numCount[r.n1]++; numCount[r.n2]++; numCount[r.n3]++
-  })
-  const expectedNumFreq = N * 3 / 6
-  const mkMap = markovModule(chron)
-  const last = chron[N - 1]
-  const mkRaw = mkMap[last.n1 + '-' + last.n2 + '-' + last.n3] || {}
-  const mkTotal = Object.values(mkRaw).reduce((s, v) => s + v, 0) || 1
-  const tripleBoost = preTripleSignal(chron)
-  return { N, comboStats, sumLast, patLast, numCount, expectedNumFreq, mkRaw, mkTotal, tripleBoost }
-}
+  const uniform = () => {
+    const u = {}
+    for (const [a, b, c] of ALL_COMBOS) u[key(a, b, c)] = 1 / 216
+    return u
+  }
+  if (N < 1) return uniform()
 
-function scoreAll(state) {
-  const all = []
-  for (let a = 1; a <= 6; a++) {
-    for (let b = 1; b <= 6; b++) {
-      for (let c = 1; c <= 6; c++) {
-        all.push(scoreCombo(a, b, c, state.N, state.comboStats, state.sumLast, state.patLast, state.numCount, state.expectedNumFreq, state.mkRaw, state.mkTotal, state.tripleBoost))
+  const p1k = key(chron[N - 1].n1, chron[N - 1].n2, chron[N - 1].n3)
+
+  // Try order-2
+  if (N >= 3) {
+    const p2k = key(chron[N - 2].n1, chron[N - 2].n2, chron[N - 2].n3)
+    const mk2 = buildMarkov2(chron)
+    const trans2 = mk2[`${p2k}|${p1k}`]
+    if (trans2) {
+      const total2 = Object.values(trans2).reduce((s, v) => s + v, 0)
+      if (total2 >= 5) {
+        const sc = {}
+        for (const [a, b, c] of ALL_COMBOS) {
+          const k = key(a, b, c)
+          sc[k] = (trans2[k] || 0) / total2
+        }
+        return sc
       }
     }
   }
-  all.sort((a, b) => b.rawScore - a.rawScore)
-  return all
+
+  // Fallback to order-1
+  const mk1 = {}
+  for (let i = 1; i < N; i++) {
+    const prev = key(chron[i - 1].n1, chron[i - 1].n2, chron[i - 1].n3)
+    const cur = key(chron[i].n1, chron[i].n2, chron[i].n3)
+    if (!mk1[prev]) mk1[prev] = {}
+    mk1[prev][cur] = (mk1[prev][cur] || 0) + 1
+  }
+  const trans1 = mk1[p1k]
+  if (trans1) {
+    const total1 = Object.values(trans1).reduce((s, v) => s + v, 0)
+    if (total1 > 0) {
+      const sc = {}
+      for (const [a, b, c] of ALL_COMBOS) {
+        const k = key(a, b, c)
+        sc[k] = (trans1[k] || 0) / total1
+      }
+      return sc
+    }
+  }
+
+  // Final fallback: uniform
+  return uniform()
 }
 
-function predictRanked(data) {
-  if (!data) data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'))
-  if (!data || data.length < 2) return []
-  const chron = data.every(r => r.ky != null)
-    ? [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
-    : [...data]
-  const state = buildState(chron)
-  const all = scoreAll(state)
+// ── MODEL C: Time-of-day session frequency ratio ──────────────────────────
 
-  // Pass 0: force-include combos with extreme combo overdue > 2.0× (max 3 forced slots)
-  // This prevents high-overdue combos from being excluded by pattern diversity cap
-  const OVERDUE_OVERRIDE = 2.0
+function getSession(hoursOrDateStr) {
+  const h = typeof hoursOrDateStr === 'number'
+    ? hoursOrDateStr
+    : new Date(hoursOrDateStr).getHours()
+  if (h >= 6 && h < 12) return 'morning'
+  if (h >= 12 && h < 18) return 'afternoon'
+  return 'evening'
+}
+
+/**
+ * Model C: frequency ratio for the current day-part session.
+ * Returns {} when < 20 draws in session (caller redistributes weight to A+B).
+ */
+function modelC(chron, now) {
+  const cur = getSession(now.getHours())
+  const sessData = chron.filter(r => r.drawTime && getSession(r.drawTime) === cur)
+  if (sessData.length < 20) return {}
+
+  const W = sessData.length
+  const expected = W / 216
+  const countMap = {}
+  for (const r of sessData) {
+    const k = key(r.n1, r.n2, r.n3)
+    countMap[k] = (countMap[k] || 0) + 1
+  }
+  const sc = {}
+  for (const [a, b, c] of ALL_COMBOS) {
+    const k = key(a, b, c)
+    sc[k] = (countMap[k] || 0) / expected
+  }
+  return sc
+}
+
+// ── S2: Triple streak boost (applied AFTER ensemble) ─────────────────────
+
+/**
+ * Returns a multiplier for triple combos — but ONLY when the drought is
+ * longer than the expected average gap (36 draws = 1/36 chance per draw).
+ *
+ *   ratio = sinceTriple / 36
+ *   ratio ≤ 1.0 → no boost (drought is ordinary)
+ *   ratio = 1.5 → boost ≈ 1.25×
+ *   ratio ≥ 2.0 → max boost 1.5×
+ *
+ * Previous formula (210/216)^N fired immediately (1.65× after just 14 draws),
+ * causing 2 triples to dominate top positions even during a normal no-triple run.
+ */
+function tripleBoostMult(chron) {
+  let sinceTriple = 0
+  for (let i = chron.length - 1; i >= 0; i--) {
+    const pat = chron[i].pattern || classify(chron[i].n1, chron[i].n2, chron[i].n3)
+    if (pat === 'triple') break
+    sinceTriple++
+  }
+  const EXPECTED_GAP = 36     // 1-in-36 draws is a triple
+  const ratio = sinceTriple / EXPECTED_GAP
+  if (ratio <= 1) return 1.0  // within normal range → no boost
+  return Math.min(1.5, 1 + (ratio - 1) * 0.5)
+}
+
+// ── Gap / stability metadata (display only, not for scoring) ─────────────
+
+function buildGapMeta(chron) {
+  const N = chron.length
+  const lastIdx = {}
+  const gapLists = {}
+  chron.forEach((r, i) => {
+    const k = key(r.n1, r.n2, r.n3)
+    if (lastIdx[k] !== undefined) {
+      if (!gapLists[k]) gapLists[k] = []
+      gapLists[k].push(i - lastIdx[k])
+    }
+    lastIdx[k] = i
+  })
+  const meta = {}
+  for (const [a, b, c] of ALL_COMBOS) {
+    const k = key(a, b, c)
+    const gaps = gapLists[k] || []
+    const avg = gaps.length ? gaps.reduce((s, v) => s + v, 0) / gaps.length : null
+    const variance = gaps.length > 1 && avg !== null
+      ? gaps.reduce((acc, g) => acc + (g - avg) ** 2, 0) / gaps.length
+      : null
+    const std = variance !== null ? Math.sqrt(variance) : null
+    meta[k] = {
+      currentGap: lastIdx[k] !== undefined ? N - 1 - lastIdx[k] : N,
+      avgGap: avg,
+      stability: avg !== null && std !== null && std > 0 ? avg / std : null,
+    }
+  }
+  return meta
+}
+
+// ── ENSEMBLE ──────────────────────────────────────────────────────────────
+
+function ensembleAll(chron, now) {
+  const { scores: rawA, zMap } = modelA(chron)
+  const rawB = modelB(chron)
+  const rawC = modelC(chron, now)
+  const gapMeta = buildGapMeta(chron)
+
+  const A = minMaxNorm(rawA)
+  const B = minMaxNorm(rawB)
+  const hasC = Object.keys(rawC).length > 0
+  const C = hasC ? minMaxNorm(rawC) : {}
+
+  // Weights: stat=50% (overdueness dominates), mk2=30%, sess=20%
+  // When session has < 20 draws: shift fully to 60% stat / 40% Markov
+  const wA = hasC ? 0.50 : 0.60
+  const wB = hasC ? 0.30 : 0.40
+  const wC = hasC ? 0.20 : 0
+
+  const tripleBoost = tripleBoostMult(chron)
+
+  const results = {}
+  for (const [a, b, c] of ALL_COMBOS) {
+    const k = key(a, b, c)
+    const pat = classify(a, b, c)
+    const sA = A[k] ?? 0.5
+    const sB = B[k] ?? 0.5
+    const sC = hasC ? (C[k] ?? 0.5) : 0
+
+    // Weighted sum of normalized model scores
+    let score = wA * sA + wB * sB + wC * sC
+
+    // Apply triple streak boost AFTER ensemble combination
+    if (pat === 'triple') score *= tripleBoost
+
+    results[k] = {
+      combo: k,
+      pat,
+      sum: a + b + c,
+      score,
+      z: zMap[k],
+      currentGap: gapMeta[k].currentGap,
+      avgGap: gapMeta[k].avgGap,
+      stability: gapMeta[k].stability,
+      statNorm: +sA.toFixed(4),
+      mk2Norm: +sB.toFixed(4),
+      sessNorm: +(hasC ? (C[k] ?? 0) : 0).toFixed(4),
+    }
+  }
+  return results
+}
+
+// ── Diversity cap + top-10 selection ─────────────────────────────────────
+
+function selectTop10(results) {
+  const sorted = Object.values(results).sort((a, b) => b.score - a.score)
   const capPat = { triple: 2, pair: 4, normal: 4 }
   const countPat = { triple: 0, pair: 0, normal: 0 }
   const digitCnt = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 }
   const top10 = []
   const chosen = new Set()
 
-  const overrideSlots = all
-    .filter(r => r.comboGapRaw / 216 > OVERDUE_OVERRIDE)
-    .sort((a, b) => b.comboGapRaw - a.comboGapRaw)
-    .slice(0, 3)
-  for (const r of overrideSlots) {
-    top10.push(r)
-    chosen.add(r.k)
-    countPat[r.pat]++
-    const digits = [...new Set(r.k.split('-').map(Number))]
-    digits.forEach(d => { digitCnt[d]++ })
+  // Pass 0: bypass — force top-3 MOST OVERDUE combos (z > 2.5) into top-10
+  // Sort by z-score DESC so the truly most-overdue always get the slots,
+  // not just the highest-scoring ones (which Markov might dominate).
+  // Require at least comboGap data to trust the z-score (min 3 gaps = 4 appearances).
+  const overdueByZ = sorted
+    .filter(r => r.z !== null && r.z > 2.5 && r.currentGap != null)
+    .sort((a, b) => b.z - a.z)
+  for (const r of overdueByZ) {
+    if (top10.length >= 3) break
+    top10.push(r); chosen.add(r.combo); countPat[r.pat]++
+    const digits = [...new Set(r.combo.split('-').map(Number))]
+    digits.forEach(d => digitCnt[d]++)
   }
 
-  // Pass 1: diversity-capped filling from score-ranked list
-  for (const r of all) {
+  // Pass 1: full diversity constraints
+  for (const r of sorted) {
     if (top10.length >= 10) break
-    if (chosen.has(r.k)) continue
+    if (chosen.has(r.combo)) continue
     if (countPat[r.pat] >= capPat[r.pat]) continue
-    const digits = [...new Set(r.k.split('-').map(Number))]
+    const digits = [...new Set(r.combo.split('-').map(Number))]
     if (digits.some(d => digitCnt[d] >= 2)) continue
-    top10.push(r)
-    chosen.add(r.k)
-    countPat[r.pat]++
-    digits.forEach(d => { digitCnt[d]++ })
+    top10.push(r); chosen.add(r.combo); countPat[r.pat]++
+    digits.forEach(d => digitCnt[d]++)
   }
 
-  // Pass 2: relax digit-sharing constraint, keep pattern cap
-  for (const r of all) {
+  // Pass 2: relax digit-sharing, keep pattern cap
+  for (const r of sorted) {
     if (top10.length >= 10) break
-    if (!chosen.has(r.k) && countPat[r.pat] < capPat[r.pat]) {
-      top10.push(r); chosen.add(r.k); countPat[r.pat]++
+    if (!chosen.has(r.combo) && countPat[r.pat] < capPat[r.pat]) {
+      top10.push(r); chosen.add(r.combo); countPat[r.pat]++
     }
   }
 
-  // Pass 3: last resort, no constraints
-  for (const r of all) {
+  // Pass 3: no constraints
+  for (const r of sorted) {
     if (top10.length >= 10) break
-    if (!chosen.has(r.k)) { top10.push(r); chosen.add(r.k) }
+    if (!chosen.has(r.combo)) { top10.push(r); chosen.add(r.combo) }
   }
-  top10.sort((a, b) => b.rawScore - a.rawScore)
 
-  const totalScore = top10.reduce((s, r) => s + r.rawScore, 0) || 1
-  return top10.map(r => ({
-    combo: r.k,
-    score: +r.rawScore.toFixed(4),
-    pct: +(r.rawScore / totalScore * 100).toFixed(1),
-    comboGap: r.comboGapRaw,
-    overdueRatio: +(r.comboGapRaw / 216).toFixed(2),
-    sumGap: r.sumGapRaw,
-    sumOD: +r.c2.toFixed(2),
-    sum: r.sum,
-    pat: r.pat,
-    stability: +r.stability.toFixed(2),
-  }))
+  return top10.sort((a, b) => b.score - a.score)
 }
 
-function predictRankedAll(data) {
+// ── Public API ────────────────────────────────────────────────────────────
+
+function predictRanked(data) {
   if (!data) data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'))
   if (!data || data.length < 2) return []
-  const chron = data.every(r => r.ky != null)
-    ? [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
-    : [...data]
-  const state = buildState(chron)
-  return scoreAll(state).map(r => ({
-    combo: r.k, score: r.rawScore, comboGap: r.comboGapRaw,
-    overdueRatio: r.comboGapRaw / 216, sumGap: r.sumGapRaw,
-    sumOD: r.c2, sum: r.sum, pat: r.pat,
+  const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
+  const now = new Date()
+  const all = ensembleAll(chron, now)
+  const top10 = selectTop10(all)
+  return top10.map(r => ({
+    combo: r.combo,
+    score: +r.score.toFixed(4),
+    pct: 0,           // filled by server.js, capped at 75%
+    overdueRatio: r.z,        // gap-based z (positive = overdue)
+    comboGap: r.currentGap,
+    sumOD: 0,           // kept for API compat
+    pat: r.pat,
+    stability: r.stability,
+    // 3-model breakdown
+    zScore: r.z,
+    statNorm: r.statNorm,
+    mk2Norm: r.mk2Norm,
+    sessNorm: r.sessNorm,
+    // legacy compat — some older UI code may reference these
+    coreNorm: r.statNorm,
+    chiNorm: 0,
   }))
 }
 
+/** Score map for all 216 combos — used by /stats backtest. */
 function predict(data) {
-  const ranked = predictRankedAll(data)
+  if (!data) data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'))
+  if (!data || data.length < 2) return {}
+  const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
+  const now = new Date()
+  const all = ensembleAll(chron, now)
   const out = {}
-  for (const r of ranked) out[r.combo] = r.score
+  for (const [k, v] of Object.entries(all)) out[k] = v.score
   return out
 }
 
