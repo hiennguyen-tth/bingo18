@@ -18,11 +18,22 @@ const FILE = path.join(__dirname, '../dataset/history.json')
 const BASE_URL = 'https://xoso.net.vn'
 const LIVE_URL = BASE_URL + '/xs-bingo-18.html'
 const MORE_URL = BASE_URL + '/XSDienToan/GetKetQuaBinGo18More'
-const HEADERS = { 'User-Agent': 'Mozilla/5.0 (compatible; bingo-ai-bot/1.0)', 'Referer': LIVE_URL }
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Referer': 'https://www.google.com.vn/',
+}
 
-// Second source — often posts results faster than xoso.net.vn (no draw-time, date only)
+// Second source — xsmn.net (sometimes publishes results sooner; date only, no draw time)
 const XSMN_URL = 'https://xsmn.net/xsbingo18-xo-so-bingo18'
-const XSMN_HEADERS = { 'User-Agent': 'Mozilla/5.0 (compatible; bingo-ai-bot/1.0)', 'Referer': XSMN_URL }
+const XSMN_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Cache-Control': 'no-cache',
+  'Referer': 'https://www.google.com.vn/',
+}
 
 /** Derive a stable id from ky + balls — idempotent across re-crawls. */
 function makeId(ky, n1, n2, n3) {
@@ -165,22 +176,50 @@ async function merge(incoming) {
   return { total: old.length, added: newRecords.length, newRecords }
 }
 
-/** Crawl latest draws from BOTH sources in parallel (used by the 90s server loop). */
+// ── Staleness tracking ───────────────────────────────────────────────────
+// When the primary source (xoso main page) returns the same latest ky as the
+// previous run it is likely still caching an old page. We then also hit the
+// paginated API endpoint (different backend path on the same host) which tends
+// to publish results sooner, avoiding missed draws while sources lag.
+let _prevPrimaryKy = null
+let _staleRuns = 0
+
+/** Crawl latest draws from multiple sources with staleness-aware fallback. */
 async function run() {
-  // Fire both requests simultaneously; tolerate individual failures
+  // Fire primary and secondary simultaneously; tolerate individual failures
   const [r1, r2] = await Promise.allSettled([
-    crawl(),
-    crawlXsmn(),
+    crawl(),      // xoso.net.vn main page — has exact draw times
+    crawlXsmn(),  // xsmn.net — sometimes publishes faster
   ])
 
-  const from1 = r1.status === 'fulfilled' ? r1.value : (console.error('[crawl] xoso error:', r1.reason?.message), [])
+  const from1 = r1.status === 'fulfilled' ? r1.value : (console.error('[crawl] xoso.main error:', r1.reason?.message), [])
   const from2 = r2.status === 'fulfilled' ? r2.value : (console.error('[crawl] xsmn error:', r2.reason?.message), [])
 
-  // Merge both source sets — xoso first so its drawTime wins in dedup
-  const combined = [...from1, ...from2]
+  // Staleness check: if the primary source's latest ky hasn't changed since the
+  // last successful run, also query the paginated API endpoint as a 3rd data point.
+  let fromPage = []
+  const primaryLatest = from1[0]?.ky ?? null
+  if (from1.length > 0) {
+    if (primaryLatest === _prevPrimaryKy) {
+      _staleRuns++
+      console.log(`[crawl] primary stuck at ky #${primaryLatest} — trying paginated fallback (stale ×${_staleRuns})`)
+      try {
+        fromPage = await crawlPage(1)
+      } catch (e) {
+        console.error('[crawl] paginated fallback error:', e.message)
+      }
+    } else {
+      _staleRuns = 0
+      _prevPrimaryKy = primaryLatest
+    }
+  }
+
+  // Merge all sources — xoso (drawTime) takes priority over xsmn (date-only)
+  const combined = [...from1, ...fromPage, ...from2]
   const result = await merge(combined)
-  const src = [from1.length && 'xoso', from2.length && 'xsmn'].filter(Boolean).join('+')
-  console.log(`[crawl] (${src}) records: ${result.total} (+${result.added} new)`)
+  const srcs = [from1.length && 'xoso', fromPage.length && 'page1', from2.length && 'xsmn'].filter(Boolean).join('+')
+  const staleTag = _staleRuns > 0 ? ` [stale×${_staleRuns}]` : ''
+  console.log(`[crawl] (${srcs || 'none'}) total: ${result.total} (+${result.added} new)${staleTag}`)
   return result
 }
 

@@ -523,10 +523,10 @@ async function crawlTick() {
 
 // ── Start ──────────────────────────────────────────────────────────────────
 
-// Poll every 90 seconds — Bingo18 publish times are irregular (not a fixed :00/:06
-// schedule), so phase-synced crawls miss results by up to one full cycle.
-// 90s polling guarantees we're at most 90s behind the site, regardless of schedule.
-const CRAWL_INTERVAL_MS = 90_000
+// Poll every 2 minutes — Bingo18 runs 06:00–21:54 every day with no scheduled breaks.
+// Staleness detection in crawl.js will also hit the paginated API endpoint as an
+// extra fallback whenever the primary source appears stuck on the same ky.
+const CRAWL_INTERVAL_MS = 2 * 60_000
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Bingo AI API  →  http://localhost:${PORT}`)
@@ -534,7 +534,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`SSE stream    →  http://localhost:${PORT}/events`)
   console.log(`Crawl interval: every ${CRAWL_INTERVAL_MS / 1000}s`)
 
-  // Startup crawl immediately, then poll every 90s
+  // Startup crawl immediately, then poll every 2 minutes
   crawlTick().catch(err => console.error('[crawler] startup error:', err.message))
   setInterval(crawlTick, CRAWL_INTERVAL_MS)
 })
