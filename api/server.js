@@ -165,7 +165,10 @@ app.use(express.static(path.join(__dirname, '../web'), { index: false }))
 
 // ── Helper ─────────────────────────────────────────────────────────────────
 async function loadHistory() {
-  return fs.readJSON(HISTORY_FILE).catch(() => [])
+  const data = await fs.readJSON(HISTORY_FILE).catch(() => [])
+  // Guard against corruption: must be a non-empty array of draw objects
+  if (!Array.isArray(data) || data.length === 0) return []
+  return data
 }
 
 // ── Routes ─────────────────────────────────────────────────────────────────

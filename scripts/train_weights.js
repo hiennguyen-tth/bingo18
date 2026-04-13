@@ -32,8 +32,9 @@ const path = require('path')
 const fs = require('fs-extra')
 const { getModelScores } = require('../predictor/ensemble')
 
-const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
-const WEIGHTS_FILE = path.join(__dirname, '../dataset/model.json')
+const HISTORY_FILE        = path.join(__dirname, '../dataset/history.json')
+const WEIGHTS_FILE        = path.join(__dirname, '../dataset/model.json')
+const WEIGHTS_HISTORY_FILE = path.join(__dirname, '../dataset/weights_history.json')
 
 const TRAIN_START = 50        // minimum draws before first prediction
 const TRAIN_STEP = 2         // sample every Nth draw in training window (speed)
@@ -203,7 +204,9 @@ async function main() {
     const improves = learnedValidAcc !== null ? learnedValidAcc >= fixedValidAcc : true
 
     const output = {
+        version: 'v6',
         trainedAt: new Date().toISOString(),
+        records: N,
         trainSamples: trainSamples.length,
         validSamples: validSamples.length,
         wA: refined.wA,
@@ -224,6 +227,27 @@ async function main() {
     await fs.ensureFile(WEIGHTS_FILE)
     await fs.writeJSON(WEIGHTS_FILE, output, { spaces: 2 })
     console.log(`[train_weights] Saved → ${WEIGHTS_FILE}`)
+
+    // ── Append to weights history ──────────────────────────────────────────
+    // Keeps a time-series log so you can track when models start contributing.
+    const histEntry = {
+        ts: output.trainedAt,
+        N,
+        wA: refined.wA,
+        wB: refined.wB,
+        wC: refined.wC,
+        wD: refined.wD,
+        wE: refined.wE,
+        bias: refined.bias,
+        validAcc: learnedValidAcc !== null ? +learnedValidAcc.toFixed(4) : null,
+        improvesValid: improves,
+    }
+    let wHistory = []
+    try { wHistory = await fs.readJSON(WEIGHTS_HISTORY_FILE) } catch (_) {}
+    wHistory.push(histEntry)
+    await fs.ensureFile(WEIGHTS_HISTORY_FILE)
+    await fs.writeJSON(WEIGHTS_HISTORY_FILE, wHistory, { spaces: 2 })
+    console.log(`[train_weights] Appended to ${WEIGHTS_HISTORY_FILE} (${wHistory.length} entries)`)
 }
 
 main().catch(err => {

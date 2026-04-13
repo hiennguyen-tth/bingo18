@@ -11,8 +11,9 @@ const path = require('path')
 const fs = require('fs-extra')
 const predict = require('../predictor/ensemble')
 
-const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
-const REPORT_FILE = path.join(__dirname, 'report.json')
+const HISTORY_FILE  = path.join(__dirname, '../dataset/history.json')
+const REPORT_FILE   = path.join(__dirname, 'report.json')
+const BT_HIST_FILE  = path.join(__dirname, '../dataset/backtest_history.json')
 const WINDOW = 10        // minimum records needed before first prediction
 
 async function runBacktest() {
@@ -78,6 +79,21 @@ async function runBacktest() {
   await fs.ensureFile(REPORT_FILE)
   await fs.writeJSON(REPORT_FILE, report, { spaces: 2 })
   console.log(`   Report saved       : backtest/report.json`)
+
+  // Append to backtest history — track accuracy over time as dataset grows.
+  const btEntry = {
+    ts: report.date,
+    N: data.length,
+    top1: +top1Acc.toFixed(4),
+    top3: +top3Acc.toFixed(4),
+    top10: +top10Acc.toFixed(4),
+  }
+  let btHistory = []
+  try { btHistory = await fs.readJSON(BT_HIST_FILE) } catch (_) {}
+  btHistory.push(btEntry)
+  await fs.ensureFile(BT_HIST_FILE)
+  await fs.writeJSON(BT_HIST_FILE, btHistory, { spaces: 2 })
+  console.log(`   History appended   : dataset/backtest_history.json (${btHistory.length} entries)`)
 
   return report
 }

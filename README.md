@@ -18,12 +18,15 @@ bingo/
 ├── dataset/
 │   └── history.json           # Dữ liệu đã crawl (persistent Fly volume)
 ├── predictor/
-│   ├── ensemble.js            # 4-model ensemble v5 (sigmoid, learned weights)
+│   ├── ensemble.js            # 5-model ensemble v6 (sigmoid, learned weights, rankNorm)
+│   ├── model_d.js              # k-NN Temporal Similarity (pure-JS)
 │   ├── frequency.js           # Tần suất combo
-│   ├── features.js            # Feature engineering
-│   └── markov.js              # Markov chain model
-├── backtest/
-│   └── run_backtest.js        # Walk-forward backtest
+│   └── features.js            # Feature engineering (dùng bởi /features endpoint)
+├── dataset/
+│   ├── history.json           # Dữ liệu đã crawl (persistent Fly volume)
+│   ├── model.json             # Learned weights (auto-reload via watchFile)
+│   ├── weights_history.json   # Time-series weight evolution log
+│   └── backtest_history.json  # Time-series accuracy log
 ├── web/
 │   ├── index.html             # Dashboard entry + AdSense injection
 │   ├── app.jsx                # React 18 dashboard (Babel Standalone)
@@ -124,17 +127,20 @@ score = sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias)
 
 | | Fixed weights | Learned weights (v6) | Baseline random |
 |---|---|---|---|
-| Top-1 | 0.60% | **0.80%** | 0.46% |
-| Top-3 | 1.09% | **1.69%** | 1.39% |
-| Top-10 | 4.67% | **4.77%** | 4.63% |
+| Top-1 | — | 0.20% | 0.46% |
+| Top-3 | — | 0.89% | 1.39% |
+| Top-10 | 4.72% | **5.07%** | 4.63% |
+
+> Top-10 +9.5% trên baseline. Top-1/3 thấp hơn random — bình thường với ~1016 kỳ (random game + diversity cap phân tán slots 1 và 3). Metric quan trọng nhất là Top-10.
 
 **Learned weights** (`dataset/model.json`):
 ```json
-{ "wA": 0.23, "wB": 0.20, "wC": 0.00, "wD": 0.00, "wE": 0.00, "bias": -0.50, "lambda": 0.01 }
+{ "version": "v6", "wA": 0.46, "wB": 0.10, "wC": -0.10, "wD": 0.00, "wE": 0.00, "bias": -0.50, "lambda": 0.01 }
 ```
-> wD=0 → k-NN features cải thiện (thêm digit freq + pattern), k-NN không còn gây hại.  
-> wE=0 → GBM prior chưa có predictive power ở ~1000 kỳ (cần data lớn hơn).  
-> L2 regularisation giữ weights nhỏ hơn, tránh overfit.
+> wC âm → session model hơi nhiễu ở dataset hiện tại.  
+> wD=0 → k-NN auto-disabled (wD không âm nhưng =0 trong grid).  
+> wE=0 → GBM chưa có signal (cần ~5000+ kỳ).  
+> L2 regularisation giữ weights compact, tránh overfit.
 
 ### Re-train
 
@@ -142,11 +148,14 @@ score = sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias)
 # Re-run GBM trước (refresh ml_output.json)
 source .venv/bin/activate && python python/ml_predictor.py
 
-# Tối ưu ensemble weights
+# Tối ưu ensemble weights (tự append vào dataset/weights_history.json)
 node scripts/train_weights.js
+
+# Đo accuracy thực (tự append vào dataset/backtest_history.json)
+node backtest/run_backtest.js
 ```
 
-Nên chạy lại sau mỗi ~200 kỳ mới. Nếu script tìm `improvesValid=false` → ensemble tự dùng fixed weights.
+Nên chạy lại sau mỗi ~200 kỳ mới. Server tự hot-reload `model.json` trong vòng 5 giây (fs.watchFile) — không cần restart. Nếu script tìm `improvesValid=false` → ensemble tự dùng fixed weights.
 
 ---
 
@@ -377,16 +386,22 @@ fly logs         # stream logs realtime
 | Model D k-NN ML | ✅ | Pure-JS, improved features (digit freq + pattern) |
 | Model E Python GBM | ✅ | ml_output.json → production ensemble, staleness guard |
 | Auto-disable D khi wD < 0 | ✅ | Tự động kill noise model, không tốn compute |
-| Sigmoid learned weights | ✅ | wA=0.23 wB=0.20 wC=0 wD=0 wE=0 bias=-0.5 |
+| Sigmoid learned weights | ✅ | wA=0.46 wB=0.10 wC=-0.10 wD=0 wE=0 bias=-0.5 |
 | L2 regularisation (λ=0.01) | ✅ | Tránh overfit, weights compact hơn |
+| rankNorm (thay minMaxNorm) | ✅ | Stable normalization — không thay đổi theo N |
+| Hot-reload model.json | ✅ | fs.watchFile 5s — không cần restart sau retrain |
+| version trong model.json | ✅ | v6 — debug & tracking dễ hơn |
+| weights_history.json | ✅ | Time-series log mỗi lần train |
+| backtest_history.json | ✅ | Time-series accuracy log mỗi lần backtest |
+| Dataset corruption guard | ✅ | Array.isArray check trong loadHistory() |
+| Backtest dùng predict.ranked() | ✅ | Đo đúng pipeline production (diversity cap + boost) |
 | scripts/train_weights.js | ✅ | Walk-forward grid+descent+L2, tự lưu model.json |
 | Python GBM predictor | ✅ | Offline tool, 64-feature GBM, xuất ml_output.json |
 | 5 trang SEO content | ✅ | about, how-it-works, 2 blog, privacy |
 | AdSense ads.txt | ✅ | pub-2330743593269954 |
 | Sitemap + robots.txt | ✅ | Đã submit Search Console |
 | /ml-status endpoint | ✅ | Xem trạng thái Model D + Python GBM |
-| Backtest top-1 | ✅ | 0.80% vs baseline 0.46% (+74%) |
-| Backtest top-10 | ✅ | 4.77% vs baseline 4.63% |
+| Backtest top-10 | ✅ | 5.07% vs baseline 4.63% (+9.5%) |
 | Model C slot 6 phút | ⏳ | Cần ~7.200 kỳ (~30 ngày) |
 | Markov-2 đầy đủ | ⏳ | Cần ~50.000 kỳ |
 | wE > 0 (GBM active) | ⏳ | Cần ~5.000+ kỳ để GBM có signal đủ mạnh |
