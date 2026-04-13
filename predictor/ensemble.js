@@ -569,6 +569,7 @@ function predictRanked(data) {
     mk2Norm: r.mk2Norm,
     sessNorm: r.sessNorm,
     mlNorm: r.mlNorm ?? 0,
+    gbmNorm: r.gbmNorm ?? 0,
     // legacy compat — some older UI code may reference these
     coreNorm: r.statNorm,
     chiNorm: 0,
