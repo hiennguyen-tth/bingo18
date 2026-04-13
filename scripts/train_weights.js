@@ -59,7 +59,7 @@ function hitRate(samples, wA, wB, wC, wD, wE, bias, lambda = 0) {
         if (scored.slice(0, 10).some(r => r.combo === actual)) hits++
     }
     const acc = samples.length ? hits / samples.length : 0
-    const l2  = lambda * (wA ** 2 + wB ** 2 + wC ** 2 + wD ** 2 + wE ** 2)
+    const l2 = lambda * (wA ** 2 + wB ** 2 + wC ** 2 + wD ** 2 + wE ** 2)
     return acc - l2
 }
 

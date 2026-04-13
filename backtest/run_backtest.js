@@ -31,16 +31,16 @@ async function runBacktest() {
 
   for (let i = WINDOW; i < data.length; i++) {
     const slice = data.slice(0, i)
-    const scores = predict(slice)
-
-    if (Object.keys(scores).length === 0) continue
+    // Use predict.ranked() — same pipeline as production (diversity cap + triple boost)
+    const ranked = predict.ranked(slice)
+    if (!ranked || ranked.length === 0) continue
 
     const actual = `${data[i].n1}-${data[i].n2}-${data[i].n3}`
-    const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1])
+    const top = ranked.map(r => r.combo)
 
-    if (sorted[0]?.[0] === actual) top1Correct++
-    if (sorted.slice(0, 3).some(([k]) => k === actual)) top3Correct++
-    if (sorted.slice(0, 10).some(([k]) => k === actual)) top10Correct++
+    if (top[0] === actual) top1Correct++
+    if (top.slice(0, 3).some(c => c === actual)) top3Correct++
+    if (top.slice(0, 10).some(c => c === actual)) top10Correct++
   }
 
   const top1Acc = tested > 0 ? top1Correct / tested : 0

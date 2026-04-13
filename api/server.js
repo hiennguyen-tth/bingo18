@@ -293,15 +293,16 @@ app.get('/stats', withCache('stats', 5 * 60_000, async () => {
 
   for (let i = WINDOW; i < chron.length; i++) {
     const slice = chron.slice(0, i)
-    const scores = predict(slice)
-    if (!scores || Object.keys(scores).length === 0) continue
+    // Use predict.ranked() — same pipeline as production (diversity cap + triple boost)
+    const ranked = predict.ranked(slice)
+    if (!ranked || ranked.length === 0) continue
 
     const actual = `${chron[i].n1}-${chron[i].n2}-${chron[i].n3}`
-    const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1])
+    const top = ranked.map(r => r.combo)
 
-    if (sorted[0]?.[0] === actual) top1++
-    if (sorted.slice(0, 3).some(([k]) => k === actual)) top3++
-    if (sorted.slice(0, 10).some(([k]) => k === actual)) top10++
+    if (top[0] === actual) top1++
+    if (top.slice(0, 3).some(c => c === actual)) top3++
+    if (top.slice(0, 10).some(c => c === actual)) top10++
     tested++
   }
 
