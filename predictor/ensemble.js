@@ -4,19 +4,24 @@
  *
  * 3-model ensemble — normalize each to [0,1] then combine equally:
  *
- *   MODEL A — Statistical gap z-score (overdueness measure)     [50%]
+ *   MODEL A — Statistical z-score (overdueness measure)     [40%]
  *     z = (currentGap – avgGap) / stdGap; clamped score = max(0, min(4, z))
  *     Overdue (z > 0) → boosted; recently appeared (z ≤ 0) → score=0
  *     Augmented by S3 (sum deviation) + S4 (digit momentum)
  *     Raw z exported as `zScore`; bypass cap when z > 2.5
  *
- *   MODEL B — Markov order-2 (transition probability)           [30%]
+ *   MODEL B — Markov order-2 (transition probability)           [25%]
  *     P(next | prev-2, prev-1); fallback to order-1; then 1/216
  *     Fallback chain: never crashes on undefined key
  *
- *   MODEL C — Time-of-day session model (frequency ratio)       [20%]
+ *   MODEL C — Time-of-day session model (frequency ratio)       [15%]
  *     morning 6–12h / afternoon 12–18h / evening 18–6h
- *     When < 20 draws in current session → weight=0 → 60% A + 40% B
+ *     When < 20 draws in current session → weight=0 → redistrib to A+B+D
+ *
+ *   MODEL D — k-NN Temporal Similarity (pure-JS ML)            [20%]
+ *     Finds k most historically similar draw contexts (Euclidean on lag
+ *     features), scores combos by inverse-distance-weighted hit count.
+ *     Disabled when history < K_MIN+WINDOW+1 draws (first ~25 draws).
  *
  * Triple boost (S2) applied AFTER ensemble — not inside any model:
  *   sinceTriple = draws since last triple appeared
@@ -31,9 +36,38 @@
 
 const path = require('path')
 const fs = require('fs')
+const modelD = require('./model_d')
 
 const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
+const WEIGHTS_FILE = path.join(__dirname, '../dataset/model.json')
 
+// ── Learned weights (sigmoid ensemble) ────────────────────────────────────
+// Trained by: node scripts/train_weights.js
+// Falls back to fixed weights if file not found or parse error.
+
+function sigmoid(x) { return 1 / (1 + Math.exp(-x)) }
+
+let _learnedWeights = null
+function loadLearnedWeights() {
+  try {
+    const raw = fs.readFileSync(WEIGHTS_FILE, 'utf8')
+    const w   = JSON.parse(raw)
+    // Minimal validation — must have numeric weights
+    if (typeof w.wA === 'number' && typeof w.wB === 'number') {
+      // Only activate if training confirmed validation improvement (or flag absent = legacy)
+      if (w.improvesValid === false) {
+        _learnedWeights = null    // training found no improvement; keep fixed weights
+      } else {
+        _learnedWeights = w
+      }
+    } else {
+      _learnedWeights = null
+    }
+  } catch (_) {
+    _learnedWeights = null
+  }
+}
+loadLearnedWeights()  // load once at startup
 const SUM_COUNT = {
   3: 1, 4: 3, 5: 6, 6: 10, 7: 15, 8: 21,
   9: 25, 10: 27, 11: 27, 12: 25, 13: 21, 14: 15,
@@ -349,18 +383,24 @@ function ensembleAll(chron, now) {
   const { scores: rawA, zMap } = modelA(chron)
   const rawB = modelB(chron)
   const rawC = modelC(chron, now)
+  const rawD = modelD(chron)
   const gapMeta = buildGapMeta(chron)
 
   const A = minMaxNorm(rawA)
   const B = minMaxNorm(rawB)
   const hasC = Object.keys(rawC).length > 0
+  const hasD = Object.keys(rawD).length > 0
   const C = hasC ? minMaxNorm(rawC) : {}
+  const D = hasD ? minMaxNorm(rawD) : {}
 
-  // Weights: stat=50% (overdueness dominates), mk2=30%, sess=20%
-  // When session has < 20 draws: shift fully to 60% stat / 40% Markov
-  const wA = hasC ? 0.50 : 0.60
-  const wB = hasC ? 0.30 : 0.40
-  const wC = hasC ? 0.20 : 0
+  // Fixed fallback weights (graceful degradation when models inactive)
+  const wA_fixed = hasC && hasD ? 0.40 : hasD ? 0.45 : hasC ? 0.50 : 0.60
+  const wB_fixed = hasC && hasD ? 0.25 : hasD ? 0.35 : hasC ? 0.30 : 0.40
+  const wC_fixed = hasC ? (hasD ? 0.15 : 0.20) : 0
+  const wD_fixed = hasD ? 0.20 : 0
+
+  // Use learned weights when available (trained by scripts/train_weights.js)
+  const lw = _learnedWeights
 
   const tripleBoost = tripleBoostMult(chron)
 
@@ -371,9 +411,19 @@ function ensembleAll(chron, now) {
     const sA = A[k] ?? 0.5
     const sB = B[k] ?? 0.5
     const sC = hasC ? (C[k] ?? 0.5) : 0
+    // k-NN: combos absent from similar historical contexts score 0 (strong signal)
+    const sD = hasD ? (D[k] ?? 0) : 0
 
-    // Weighted sum of normalized model scores
-    let score = wA * sA + wB * sB + wC * sC
+    // Sigmoid ensemble (learned) vs fixed linear (fallback)
+    // NOTE: sC=0 when !hasC, sD=0 when !hasD → learned weights auto-degrade.
+    //       Sigmoid is monotone → same ranking as linear; benefit is learned
+    //       weights that can be negative (penalise noisy models).
+    let score
+    if (lw) {
+      score = sigmoid(lw.wA * sA + lw.wB * sB + lw.wC * sC + lw.wD * sD + lw.bias)
+    } else {
+      score = wA_fixed * sA + wB_fixed * sB + wC_fixed * sC + wD_fixed * sD
+    }
 
     // Apply triple streak boost AFTER ensemble combination
     if (pat === 'triple') score *= tripleBoost
@@ -390,6 +440,7 @@ function ensembleAll(chron, now) {
       statNorm: +sA.toFixed(4),
       mk2Norm: +sB.toFixed(4),
       sessNorm: +(hasC ? (C[k] ?? 0) : 0).toFixed(4),
+      mlNorm: +(hasD ? (D[k] ?? 0) : 0).toFixed(4),
     }
   }
   return results
@@ -465,11 +516,12 @@ function predictRanked(data) {
     sumOD: 0,           // kept for API compat
     pat: r.pat,
     stability: r.stability,
-    // 3-model breakdown
+    // 4-model breakdown
     zScore: r.z,
     statNorm: r.statNorm,
     mk2Norm: r.mk2Norm,
     sessNorm: r.sessNorm,
+    mlNorm: r.mlNorm ?? 0,
     // legacy compat — some older UI code may reference these
     coreNorm: r.statNorm,
     chiNorm: 0,
@@ -488,5 +540,41 @@ function predict(data) {
   return out
 }
 
-predict.ranked = predictRanked
+/**
+ * Returns per-model normalised scores for all 216 combos.
+ * Used by scripts/train_weights.js for walk-forward weight optimisation.
+ */
+function getModelScores(data, now) {
+  if (!data || data.length < 2) return {}
+  const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
+  if (!now) now = new Date()
+
+  const { scores: rawA } = modelA(chron)
+  const rawB = modelB(chron)
+  const rawC = modelC(chron, now)
+  const rawD = modelD(chron)
+
+  const A    = minMaxNorm(rawA)
+  const B    = minMaxNorm(rawB)
+  const hasC = Object.keys(rawC).length > 0
+  const hasD = Object.keys(rawD).length > 0
+  const C    = hasC ? minMaxNorm(rawC) : {}
+  const D    = hasD ? minMaxNorm(rawD) : {}
+
+  const result = {}
+  for (const [a, b, c] of ALL_COMBOS) {
+    const k = key(a, b, c)
+    result[k] = {
+      sA: A[k] ?? 0.5,
+      sB: B[k] ?? 0.5,
+      sC: hasC ? (C[k] ?? 0.5) : 0,
+      sD: hasD ? (D[k] ?? 0) : 0,
+    }
+  }
+  return result
+}
+
+predict.ranked        = predictRanked
+predict.getModelScores = getModelScores
+predict.reloadWeights  = loadLearnedWeights
 module.exports = predict

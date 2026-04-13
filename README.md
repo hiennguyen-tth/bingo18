@@ -1,6 +1,6 @@
 # Bingo18 AI Predictor
 
-Hệ thống dự đoán Bingo18 dùng **3-model Ensemble v4** — normalize từng model về `[0, 1]` rồi cộng bình quân. Crawl dữ liệu song song từ 2 nguồn (xoso.net.vn + xsmn.net), phục vụ qua REST API + Dashboard React + 5 trang content SEO, deploy trên Fly.io.
+Hệ thống dự đoán Bingo18 dùng **4-model Ensemble v5** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward trained)**. Crawl dữ liệu song song từ 2 nguồn (xoso.net.vn + xsmn.net), phục vụ qua REST API + Dashboard React + 5 trang content SEO, deploy trên Fly.io.
 
 > **Production:** https://xs-bingo18.fly.dev
 
@@ -18,7 +18,7 @@ bingo/
 ├── dataset/
 │   └── history.json           # Dữ liệu đã crawl (persistent Fly volume)
 ├── predictor/
-│   ├── ensemble.js            # 3-model ensemble v4 (stat + markov + session)
+│   ├── ensemble.js            # 4-model ensemble v5 (sigmoid, learned weights)
 │   ├── frequency.js           # Tần suất combo
 │   ├── features.js            # Feature engineering
 │   └── markov.js              # Markov chain model
@@ -90,7 +90,7 @@ node api/server.js             # dashboard → http://localhost:8080
 
 ---
 
-## Logic dự đoán — Ensemble v4
+## Logic dự đoán — Ensemble v5
 
 ### Tổng quan pipeline
 
@@ -98,17 +98,84 @@ node api/server.js             # dashboard → http://localhost:8080
 Lịch sử N kỳ
     │
     ├─ Model A: Statistical z-score ──► normalize [0,1] ─┐
-    ├─ Model B: Markov order-2       ──► normalize [0,1] ─┼─►  1/3 mỗi model
-    └─ Model C: Session (giờ ngày)  ──► normalize [0,1] ─┘  (50/50 A+B nếu C thiếu data)
+    ├─ Model B: Markov order-2       ──► normalize [0,1] ─┼──► sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + bias)
+    ├─ Model C: Session (giờ ngày)  ──► normalize [0,1] ─┤         ↑ learned weights (dataset/model.json)
+    └─ Model D: k-NN Temporal ML    ──► normalize [0,1] ─┘
                                                             │
                                               S2 Triple boost (chỉ khi hạn)
                                                             │
                                               Diversity cap + top-10
 ```
 
+### Sigmoid ensemble (v5)
+
+```
+score = sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + bias)
+```
+
+- Trọng số học qua **walk-forward optimisation** (node scripts/train_weights.js)
+- Weights có thể **âm** → phạt model nhiễu (vd: khi sD gây hại, wD=-0.1)
+- Sigmoid monotone → ranking không đổi so với linear; lợi ích là **learned weights**
+- Fallback về fixed linear nếu `dataset/model.json` không tồn tại hoặc `improvesValid=false`
+
+**Kết quả hiện tại** (1016 kỳ, April 2026):
+
+| | Fixed weights | Learned weights | Baseline random |
+|---|---|---|---|
+| Top-1 | 0.60% | **0.70%** | 0.46% |
+| Top-10 | 4.67% | **4.77%** | 4.63% |
+
+**Learned weights** (`dataset/model.json`):
+```json
+{ "wA": 0.35, "wB": 0.10, "wC": 0.00, "wD": -0.10, "bias": -0.50 }
+```
+> wD âm → k-NN counterproductive tại ~1000 kỳ (cần nhiều hơn). Retrain khi data tăng.
+
+### Re-train
+
+```bash
+node scripts/train_weights.js   # grid search + coordinate descent, tự lưu dataset/model.json
+```
+
+Nên chạy lại sau mỗi ~200 kỳ mới. Nếu script tìm `improvesValid=false` → ensemble tự dùng fixed weights.
+
 ---
 
-### MODEL A — Statistical z-score (33.33%)
+### MODEL D — k-NN Temporal Similarity (20%)
+
+**Ý nghĩa:** Tìm k kỳ lịch sử có "bối cảnh" gần nhất (Euclidean distance trên lag features), dự đoán combo dựa trên tần suất kết quả thực tế sau các bối cảnh đó.
+
+```
+Feature vector per context = [sum/18, n1/6, n2/6, n3/6] × WINDOW(8) lags
+k = adaptive: max(15, 5% records), capped at 60
+Score(combo) = Σ 1/(dist+ε) for each neighbor that resulted in combo
+```
+
+**Khi nào active:** ≥ 24 kỳ lịch sử (WINDOW=8 + K_MIN=15 + 1).  
+**Combos không tìm thấy trong k neighbors:** sD = 0 (k-NN hàm ý unlikelihood).  
+**Pure JavaScript:** Không cần Python, chạy trong production Docker.  
+**Tốc độ:** < 15ms với 1000 kỳ.  
+
+---
+
+### Python GBM Predictor (offline, optional)
+
+Tool phân tích offline dùng Gradient Boosting, train 3 classifier riêng biệt cho P(n1), P(n2), P(n3):
+
+```bash
+# Setup lần đầu
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r python/requirements.txt
+
+# Chạy GBM predictor (xuất python/ml_output.json)
+python python/ml_predictor.py
+```
+
+**Feature engineering (64 dims):** last-10 sum/n1/n2/n3/pattern lags + sin/cos giờ + digit counts + digit gaps.
+
+---
+
+### MODEL A — Statistical z-score (40%)
 
 **Ý nghĩa:** Combo đang xuất hiện ÍT hơn kỳ vọng (under-represented) → tăng điểm.
 
@@ -124,7 +191,7 @@ Score_A = –z × S3 × S4
 
 ---
 
-### MODEL B — Markov order-2 (33.33%)
+### MODEL B — Markov order-2 (25%)
 
 **Ý nghĩa:** Dựa trên 2 kỳ liền trước, combo nào có xác suất transition cao nhất?
 
@@ -139,7 +206,7 @@ Cần ~50.000 kỳ để Matrix order-2 đầy đủ. Hiện tại (~1210 kỳ) 
 
 ---
 
-### MODEL C — Session theo giờ (33.33%)
+### MODEL C — Session theo giờ (15%)
 
 ```
 Ca sáng:   6h–12h
@@ -291,10 +358,16 @@ fly logs         # stream logs realtime
 | Feature | Status | Ghi chú |
 |---------|--------|---------|
 | Model A z-score | ✅ | Hoạt động |
-| Model B Markov-2 | ✅ | Fallback ord-1 với ~1210 kỳ hiện tại |
+| Model B Markov-2 | ✅ | Fallback ord-1 với ~1016 kỳ hiện tại |
 | Model C Session | ✅ | Ca sáng / chiều / tối |
+| Model D k-NN ML | ✅ | Pure-JS, active ngay |
+| Sigmoid learned weights | ✅ | wA=0.35 wB=0.10 wC=0 wD=-0.10 bias=-0.5 |
+| scripts/train_weights.js | ✅ | Walk-forward grid+descent, tự lưu model.json |
+| Python GBM predictor | ✅ | Offline tool, 64-feature GBM, xuất ml_output.json |
 | 5 trang SEO content | ✅ | about, how-it-works, 2 blog, privacy |
 | AdSense ads.txt | ✅ | pub-2330743593269954 |
 | Sitemap + robots.txt | ✅ | Đã submit Search Console |
+| /ml-status endpoint | ✅ | Xem trạng thái Model D + Python GBM |
+| Backtest top-10 | ✅ | 4.67% vs baseline 4.63% |
 | Model C slot 6 phút | ⏳ | Cần ~7.200 kỳ (~30 ngày) |
 | Markov-2 đầy đủ | ⏳ | Cần ~50.000 kỳ |

@@ -1,0 +1,15 @@
+{
+  "trainedAt": "2026-04-13T07:53:49.817Z",
+  "trainSamples": 356,
+  "validSamples": 254,
+  "wA": 0.35,
+  "wB": 0.1,
+  "wC": 0,
+  "wD": -0.1,
+  "bias": -0.5,
+  "trainTop10Acc": 0.0758,
+  "fixedTrainAcc": 0.0646,
+  "fixedValidAcc": 0.0433,
+  "learnedValidAcc": 0.0472,
+  "improvesValid": true
+}

@@ -201,11 +201,12 @@ app.get('/predict', withCache('predict', 5 * 60_000, async () => {
     sumOD: +(r.sumOD ?? 0).toFixed(2),
     pat: r.pat,
     stability: r.stability != null ? +r.stability.toFixed(2) : null,
-    // 3-model breakdown (v4)
+    // 4-model breakdown (v5)
     zScore: r.zScore != null ? +r.zScore.toFixed(2) : null,
     statNorm: r.statNorm ?? 0,
     mk2Norm: r.mk2Norm ?? 0,
     sessNorm: r.sessNorm ?? 0,
+    mlNorm: r.mlNorm ?? 0,
     // legacy compat
     coreNorm: r.coreNorm ?? 0,
     chiNorm: 0,
@@ -220,6 +221,34 @@ app.get('/predict', withCache('predict', 5 * 60_000, async () => {
 
   return { next, sumStats, total: data.length, maxScore: +maxScore.toFixed(3) }
 }))
+
+/** GET /ml-status — Model D (k-NN) readiness + dataset stats */
+app.get('/ml-status', async (_req, res) => {
+  try {
+    const data = await loadHistory()
+    const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
+    const N = chron.length
+    // Model D needs WINDOW(8) + K_MIN(15) + 1 = 24 draws minimum
+    const ML_MIN = 24
+    res.json({
+      modelD: {
+        name: 'k-NN Temporal Similarity',
+        active: N >= ML_MIN,
+        records: N,
+        minRequired: ML_MIN,
+        kNeighbors: Math.min(60, Math.max(15, Math.floor((N - 9) * 0.05))),
+        window: 8,
+      },
+      pythonGBM: {
+        name: 'Gradient Boosting (offline)',
+        script: 'python python/ml_predictor.py',
+        note: 'Run locally to generate python/ml_output.json for hybrid scoring',
+      },
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
 
 /** GET /history — raw records (?limit=50), newest first */
 app.get('/history', async (req, res) => {

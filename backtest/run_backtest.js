@@ -26,6 +26,7 @@ async function runBacktest() {
 
   let top1Correct = 0
   let top3Correct = 0
+  let top10Correct = 0
   const tested = data.length - WINDOW
 
   for (let i = WINDOW; i < data.length; i++) {
@@ -39,16 +40,21 @@ async function runBacktest() {
 
     if (sorted[0]?.[0] === actual) top1Correct++
     if (sorted.slice(0, 3).some(([k]) => k === actual)) top3Correct++
+    if (sorted.slice(0, 10).some(([k]) => k === actual)) top10Correct++
   }
 
   const top1Acc = tested > 0 ? top1Correct / tested : 0
   const top3Acc = tested > 0 ? top3Correct / tested : 0
+  const top10Acc = tested > 0 ? top10Correct / tested : 0
 
-  console.log('── Backtest Results ─────────────────────')
+  const RANDOM = { top1: 1 / 216, top3: 3 / 216, top10: 10 / 216 }
+
+  console.log('── Backtest Results ──────────────────────')
   console.log(`   Records in dataset : ${data.length}`)
   console.log(`   Rounds tested      : ${tested}`)
-  console.log(`   Top-1 accuracy     : ${(top1Acc * 100).toFixed(2)}%  (${top1Correct}/${tested})`)
-  console.log(`   Top-3 accuracy     : ${(top3Acc * 100).toFixed(2)}%  (${top3Correct}/${tested})`)
+  console.log(`   Top-1  accuracy    : ${(top1Acc * 100).toFixed(2)}%  (${top1Correct}/${tested})  baseline=${(RANDOM.top1 * 100).toFixed(2)}%`)
+  console.log(`   Top-3  accuracy    : ${(top3Acc * 100).toFixed(2)}%  (${top3Correct}/${tested})  baseline=${(RANDOM.top3 * 100).toFixed(2)}%`)
+  console.log(`   Top-10 accuracy    : ${(top10Acc * 100).toFixed(2)}%  (${top10Correct}/${tested})  baseline=${(RANDOM.top10 * 100).toFixed(2)}%`)
   console.log('─────────────────────────────────────────')
 
   const report = {
@@ -58,8 +64,15 @@ async function runBacktest() {
     tested,
     top1Correct,
     top3Correct,
+    top10Correct,
     top1Accuracy: +top1Acc.toFixed(4),
     top3Accuracy: +top3Acc.toFixed(4),
+    top10Accuracy: +top10Acc.toFixed(4),
+    baseline: {
+      top1: +(RANDOM.top1 * 100).toFixed(2),
+      top3: +(RANDOM.top3 * 100).toFixed(2),
+      top10: +(RANDOM.top10 * 100).toFixed(2),
+    },
   }
 
   await fs.ensureFile(REPORT_FILE)
