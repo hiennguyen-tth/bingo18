@@ -1,6 +1,6 @@
 # Bingo18 AI Predictor
 
-Hệ thống dự đoán Bingo18 dùng **4-model Ensemble v5** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward trained)**. Crawl dữ liệu song song từ 2 nguồn (xoso.net.vn + xsmn.net), phục vụ qua REST API + Dashboard React + 5 trang content SEO, deploy trên Fly.io.
+Hệ thống dự đoán Bingo18 dùng **5-model Ensemble v6** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward + L2 regularisation)**. Crawl dữ liệu song song từ 2 nguồn (xoso.net.vn + xsmn.net), phục vụ qua REST API + Dashboard React + 5 trang content SEO, deploy trên Fly.io.
 
 > **Production:** https://xs-bingo18.fly.dev
 
@@ -90,77 +90,88 @@ node api/server.js             # dashboard → http://localhost:8080
 
 ---
 
-## Logic dự đoán — Ensemble v5
+## Logic dự đoán — Ensemble v6
 
 ### Tổng quan pipeline
 
 ```
 Lịch sử N kỳ
     │
-    ├─ Model A: Statistical z-score ──► normalize [0,1] ─┐
-    ├─ Model B: Markov order-2       ──► normalize [0,1] ─┼──► sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + bias)
-    ├─ Model C: Session (giờ ngày)  ──► normalize [0,1] ─┤         ↑ learned weights (dataset/model.json)
-    └─ Model D: k-NN Temporal ML    ──► normalize [0,1] ─┘
-                                                            │
-                                              S2 Triple boost (chỉ khi hạn)
-                                                            │
-                                              Diversity cap + top-10
+    ├─ Model A: Statistical z-score  ──► normalize [0,1] ─┐
+    ├─ Model B: Markov order-2        ──► normalize [0,1] ─┼──► sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias)
+    ├─ Model C: Session (giờ ngày)   ──► normalize [0,1] ─┤         ↑ learned weights + L2 reg (dataset/model.json)
+    ├─ Model D: k-NN Temporal ML     ──► normalize [0,1] ─┤         auto-disable D if wD < 0
+    └─ Model E: Python GBM prior     ──► normalize [0,1] ─┘         (from python/ml_output.json)
+                                                             │
+                                               S2 Triple boost (chỉ khi hạn)
+                                                             │
+                                               Diversity cap + top-10
 ```
 
-### Sigmoid ensemble (v5)
+### Sigmoid ensemble (v6)
 
 ```
-score = sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + bias)
+score = sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias)
 ```
 
-- Trọng số học qua **walk-forward optimisation** (node scripts/train_weights.js)
-- Weights có thể **âm** → phạt model nhiễu (vd: khi sD gây hại, wD=-0.1)
-- Sigmoid monotone → ranking không đổi so với linear; lợi ích là **learned weights**
+- Trọng số học qua **walk-forward optimisation với L2 regularisation** (node scripts/train_weights.js)
+- `objective = top10_acc - λ·(wA²+wB²+wC²+wD²+wE²)`, λ=0.01 để tránh overfit
+- Weights có thể **âm** → phạt model nhiễu; **Model D tự động bị disable khi wD < 0**
+- Model E (GBM): dùng khi `python/ml_output.json` tồn tại và còn fresh (< 200 kỳ staleness)
 - Fallback về fixed linear nếu `dataset/model.json` không tồn tại hoặc `improvesValid=false`
 
 **Kết quả hiện tại** (1016 kỳ, April 2026):
 
-| | Fixed weights | Learned weights | Baseline random |
+| | Fixed weights | Learned weights (v6) | Baseline random |
 |---|---|---|---|
-| Top-1 | 0.60% | **0.70%** | 0.46% |
+| Top-1 | 0.60% | **0.80%** | 0.46% |
+| Top-3 | 1.09% | **1.69%** | 1.39% |
 | Top-10 | 4.67% | **4.77%** | 4.63% |
 
 **Learned weights** (`dataset/model.json`):
 ```json
-{ "wA": 0.35, "wB": 0.10, "wC": 0.00, "wD": -0.10, "bias": -0.50 }
+{ "wA": 0.23, "wB": 0.20, "wC": 0.00, "wD": 0.00, "wE": 0.00, "bias": -0.50, "lambda": 0.01 }
 ```
-> wD âm → k-NN counterproductive tại ~1000 kỳ (cần nhiều hơn). Retrain khi data tăng.
+> wD=0 → k-NN features cải thiện (thêm digit freq + pattern), k-NN không còn gây hại.  
+> wE=0 → GBM prior chưa có predictive power ở ~1000 kỳ (cần data lớn hơn).  
+> L2 regularisation giữ weights nhỏ hơn, tránh overfit.
 
 ### Re-train
 
 ```bash
-node scripts/train_weights.js   # grid search + coordinate descent, tự lưu dataset/model.json
+# Re-run GBM trước (refresh ml_output.json)
+source .venv/bin/activate && python python/ml_predictor.py
+
+# Tối ưu ensemble weights
+node scripts/train_weights.js
 ```
 
 Nên chạy lại sau mỗi ~200 kỳ mới. Nếu script tìm `improvesValid=false` → ensemble tự dùng fixed weights.
 
 ---
 
-### MODEL D — k-NN Temporal Similarity (20%)
+### MODEL D — k-NN Temporal Similarity
 
-**Ý nghĩa:** Tìm k kỳ lịch sử có "bối cảnh" gần nhất (Euclidean distance trên lag features), dự đoán combo dựa trên tần suất kết quả thực tế sau các bối cảnh đó.
+**Ý nghĩa:** Tìm k kỳ lịch sử có "bối cảnh" gần nhất, dự đoán combo dựa trên tần suất kết quả thực tế sau các bối cảnh đó.
 
 ```
-Feature vector per context = [sum/18, n1/6, n2/6, n3/6] × WINDOW(8) lags
+Feature vector per context (dim = 5×WINDOW + 6):
+  [sum/18, n1/6, n2/6, n3/6, pattern] × WINDOW(8)  ← lag features (5×8=40 dims)
+  digit_frequency[1..6] / max_count                  ← global context (6 dims)
+
 k = adaptive: max(15, 5% records), capped at 60
 Score(combo) = Σ 1/(dist+ε) for each neighbor that resulted in combo
 ```
 
-**Khi nào active:** ≥ 24 kỳ lịch sử (WINDOW=8 + K_MIN=15 + 1).  
-**Combos không tìm thấy trong k neighbors:** sD = 0 (k-NN hàm ý unlikelihood).  
-**Pure JavaScript:** Không cần Python, chạy trong production Docker.  
-**Tốc độ:** < 15ms với 1000 kỳ.  
+**Khi nào active:** ≥ 24 kỳ lịch sử + wD ≥ 0 (auto-disable khi wD < 0 để giảm noise).  
+**Feature cải thiện (v6):** Thêm digit frequency + pattern encoding vs v5 (chỉ có sum/n1/n2/n3).  
+**Pure JavaScript:** Không cần Python, chạy trong production Docker.
 
 ---
 
-### Python GBM Predictor (offline, optional)
+### MODEL E — Python GBM Prior (offline → production)
 
-Tool phân tích offline dùng Gradient Boosting, train 3 classifier riêng biệt cho P(n1), P(n2), P(n3):
+Train 3 GBM classifier riêng biệt cho P(n1), P(n2), P(n3), rồi ghép thành P(combo):
 
 ```bash
 # Setup lần đầu
@@ -168,14 +179,17 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r python/requirements.txt
 
 # Chạy GBM predictor (xuất python/ml_output.json)
-python python/ml_predictor.py
+source .venv/bin/activate && python python/ml_predictor.py
 ```
 
-**Feature engineering (64 dims):** last-10 sum/n1/n2/n3/pattern lags + sin/cos giờ + digit counts + digit gaps.
+Output `python/ml_output.json` được `ensemble.js` load tự động:
+- **Active khi:** file tồn tại AND `|currentRecords - trainRecords| ≤ 200`
+- **Stale check:** nếu dataset tăng > 200 kỳ → sE=0 (tự động vô hiệu)
+- **Feature engineering (64 dims):** last-10 sum/n1/n2/n3/pattern lags + sin/cos giờ + digit counts + digit gaps
 
 ---
 
-### MODEL A — Statistical z-score (40%)
+### MODEL A — Statistical z-score
 
 **Ý nghĩa:** Combo đang xuất hiện ÍT hơn kỳ vọng (under-represented) → tăng điểm.
 
@@ -360,14 +374,19 @@ fly logs         # stream logs realtime
 | Model A z-score | ✅ | Hoạt động |
 | Model B Markov-2 | ✅ | Fallback ord-1 với ~1016 kỳ hiện tại |
 | Model C Session | ✅ | Ca sáng / chiều / tối |
-| Model D k-NN ML | ✅ | Pure-JS, active ngay |
-| Sigmoid learned weights | ✅ | wA=0.35 wB=0.10 wC=0 wD=-0.10 bias=-0.5 |
-| scripts/train_weights.js | ✅ | Walk-forward grid+descent, tự lưu model.json |
+| Model D k-NN ML | ✅ | Pure-JS, improved features (digit freq + pattern) |
+| Model E Python GBM | ✅ | ml_output.json → production ensemble, staleness guard |
+| Auto-disable D khi wD < 0 | ✅ | Tự động kill noise model, không tốn compute |
+| Sigmoid learned weights | ✅ | wA=0.23 wB=0.20 wC=0 wD=0 wE=0 bias=-0.5 |
+| L2 regularisation (λ=0.01) | ✅ | Tránh overfit, weights compact hơn |
+| scripts/train_weights.js | ✅ | Walk-forward grid+descent+L2, tự lưu model.json |
 | Python GBM predictor | ✅ | Offline tool, 64-feature GBM, xuất ml_output.json |
 | 5 trang SEO content | ✅ | about, how-it-works, 2 blog, privacy |
 | AdSense ads.txt | ✅ | pub-2330743593269954 |
 | Sitemap + robots.txt | ✅ | Đã submit Search Console |
 | /ml-status endpoint | ✅ | Xem trạng thái Model D + Python GBM |
-| Backtest top-10 | ✅ | 4.67% vs baseline 4.63% |
+| Backtest top-1 | ✅ | 0.80% vs baseline 0.46% (+74%) |
+| Backtest top-10 | ✅ | 4.77% vs baseline 4.63% |
 | Model C slot 6 phút | ⏳ | Cần ~7.200 kỳ (~30 ngày) |
 | Markov-2 đầy đủ | ⏳ | Cần ~50.000 kỳ |
+| wE > 0 (GBM active) | ⏳ | Cần ~5.000+ kỳ để GBM có signal đủ mạnh |
