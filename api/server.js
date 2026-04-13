@@ -122,6 +122,44 @@ app.get(['/', '/index.html'], (_req, res) => {
   res.send(renderIndex())
 })
 
+// ── SEO / Content pages — clean URL routes ────────────────────────────────
+const WEB_DIR = path.join(__dirname, '../web')
+
+app.get('/about', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8')
+  res.sendFile(path.join(WEB_DIR, 'about.html'))
+})
+
+app.get('/how-it-works', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8')
+  res.sendFile(path.join(WEB_DIR, 'how-it-works.html'))
+})
+
+app.get('/blog/what-is-bingo18', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8')
+  res.sendFile(path.join(WEB_DIR, 'blog/what-is-bingo18.html'))
+})
+
+app.get('/blog/best-strategy-2026', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8')
+  res.sendFile(path.join(WEB_DIR, 'blog/best-strategy-2026.html'))
+})
+
+app.get('/privacy-policy', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8')
+  res.sendFile(path.join(WEB_DIR, 'privacy-policy.html'))
+})
+
+app.get('/sitemap.xml', (_req, res) => {
+  res.setHeader('Content-Type', 'application/xml; charset=utf-8')
+  res.sendFile(path.join(WEB_DIR, 'sitemap.xml'))
+})
+
+app.get('/ads.txt', (_req, res) => {
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+  res.sendFile(path.join(WEB_DIR, 'ads.txt'))
+})
+
 // Static assets (app.jsx, heatmap.jsx, css…) — index.html excluded above
 app.use(express.static(path.join(__dirname, '../web'), { index: false }))
 

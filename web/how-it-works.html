@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cách Hoạt Động — Bingo18 AI Ensemble 7 Tín Hiệu</title>
+    <meta name="description"
+        content="Tìm hiểu chi tiết cách Bingo18 AI phân tích xổ số 36D: 7 tín hiệu thống kê, Markov Chain, walk-forward backtest, và hệ thống crawl realtime 90 giây." />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="https://xs-bingo18.fly.dev/how-it-works" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="Cách Hoạt Động — Bingo18 AI Ensemble" />
+    <meta property="og:description"
+        content="Giải thích chi tiết 7 tín hiệu AI, Markov Chain, Overdue Analysis và Walk-forward Backtest trong hệ thống dự đoán Bingo18." />
+    <meta property="og:locale" content="vi_VN" />
+    <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "TechArticle",
+    "headline": "Cách hoạt động của Bingo18 AI — Giải thích 7 tín hiệu phân tích",
+    "description": "Hướng dẫn chi tiết về phương pháp AI Ensemble, 7 tín hiệu thống kê và hệ thống backtest trong Bingo18 AI",
+    "url": "https://xs-bingo18.fly.dev/how-it-works",
+    "inLanguage": "vi",
+    "isPartOf": { "@type": "WebSite", "name": "Bingo18 AI", "url": "https://xs-bingo18.fly.dev/" }
+  }
+  </script>
+    <style>
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+            line-height: 1.7;
+        }
+
+        a {
+            color: #818cf8;
+            text-decoration: none;
+        }
+
+        a:hover {
+            color: #a5b4fc;
+            text-decoration: underline;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #1e1b4b 0%, #312e81 100%);
+            padding: 18px 28px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid rgba(99, 102, 241, 0.3);
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .logo {
+            font-size: 22px;
+            font-weight: 800;
+            color: #a5b4fc;
+            letter-spacing: -0.5px;
+            text-decoration: none;
+        }
+
+        .logo:hover {
+            color: #c7d2fe;
+            text-decoration: none;
+        }
+
+        .nav {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .nav a {
+            font-size: 13px;
+            color: #94a3b8;
+            font-weight: 500;
+        }
+
+        .nav a:hover {
+            color: #e2e8f0;
+        }
+
+        .nav a.active {
+            color: #a5b4fc;
+        }
+
+        .container {
+            max-width: 820px;
+            margin: 0 auto;
+            padding: 48px 24px;
+        }
+
+        .breadcrumb {
+            font-size: 12px;
+            color: #475569;
+            margin-bottom: 32px;
+        }
+
+        .breadcrumb a {
+            color: #6366f1;
+        }
+
+        h1 {
+            font-size: clamp(24px, 4vw, 36px);
+            font-weight: 800;
+            color: #f1f5f9;
+            line-height: 1.3;
+            margin-bottom: 16px;
+        }
+
+        .meta {
+            font-size: 13px;
+            color: #475569;
+            margin-bottom: 40px;
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        h2 {
+            font-size: 20px;
+            font-weight: 700;
+            color: #c7d2fe;
+            margin-top: 44px;
+            margin-bottom: 16px;
+            padding-left: 14px;
+            border-left: 3px solid #6366f1;
+        }
+
+        h3 {
+            font-size: 16px;
+            font-weight: 700;
+            color: #a5b4fc;
+            margin-top: 28px;
+            margin-bottom: 12px;
+        }
+
+        p {
+            margin-bottom: 18px;
+            color: #cbd5e1;
+            font-size: 15px;
+        }
+
+        ul,
+        ol {
+            padding-left: 24px;
+            margin-bottom: 18px;
+            color: #cbd5e1;
+            font-size: 15px;
+            line-height: 1.85;
+        }
+
+        li {
+            margin-bottom: 6px;
+        }
+
+        .highlight-box {
+            background: rgba(99, 102, 241, 0.1);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            border-radius: 12px;
+            padding: 22px 24px;
+            margin: 28px 0;
+        }
+
+        .highlight-box p {
+            margin-bottom: 0;
+        }
+
+        .step {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+
+        .step-num {
+            flex-shrink: 0;
+            width: 36px;
+            height: 36px;
+            background: linear-gradient(135deg, #6366f1, #7c3aed);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 900;
+            font-size: 15px;
+            color: #fff;
+        }
+
+        .step-body {
+            flex: 1;
+        }
+
+        .step-body h3 {
+            margin-top: 4px;
+        }
+
+        .signal-detail {
+            background: #1e293b;
+            border: 1px solid rgba(255, 255, 255, 0.07);
+            border-radius: 10px;
+            padding: 20px 22px;
+            margin-bottom: 16px;
+        }
+
+        .signal-detail .tag {
+            display: inline-block;
+            font-size: 10px;
+            font-weight: 800;
+            padding: 3px 10px;
+            border-radius: 20px;
+            background: rgba(99, 102, 241, 0.2);
+            color: #818cf8;
+            border: 1px solid rgba(99, 102, 241, 0.35);
+            margin-bottom: 10px;
+        }
+
+        .signal-detail h3 {
+            margin-top: 0;
+            margin-bottom: 8px;
+        }
+
+        .signal-detail p {
+            margin-bottom: 0;
+            font-size: 14px;
+            color: #94a3b8;
+        }
+
+        .code-block {
+            background: #0f172a;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 8px;
+            padding: 16px 20px;
+            font-family: 'Menlo', 'Consolas', monospace;
+            font-size: 13px;
+            color: #7dd3fc;
+            margin: 16px 0;
+            overflow-x: auto;
+            line-height: 1.6;
+        }
+
+        .accuracy-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 14px;
+        }
+
+        .accuracy-table th {
+            padding: 10px 14px;
+            text-align: left;
+            color: #64748b;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .accuracy-table td {
+            padding: 10px 14px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+            color: #cbd5e1;
+        }
+
+        .accuracy-table .good {
+            color: #34d399;
+            font-weight: 700;
+        }
+
+        .disclaimer {
+            background: rgba(251, 191, 36, 0.08);
+            border: 1px solid rgba(251, 191, 36, 0.25);
+            border-radius: 10px;
+            padding: 18px 22px;
+            margin-top: 40px;
+        }
+
+        .disclaimer strong {
+            color: #fbbf24;
+        }
+
+        .disclaimer p {
+            color: #94a3b8;
+            font-size: 13px;
+            margin-bottom: 0;
+        }
+
+        .cta-box {
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.15), rgba(139, 92, 246, 0.1));
+            border: 1px solid rgba(99, 102, 241, 0.35);
+            border-radius: 12px;
+            padding: 28px 24px;
+            margin-top: 40px;
+            text-align: center;
+        }
+
+        .cta-box h3 {
+            color: #a5b4fc;
+            margin-top: 0;
+        }
+
+        .btn {
+            display: inline-block;
+            background: #6366f1;
+            color: #fff;
+            border-radius: 8px;
+            padding: 10px 24px;
+            font-size: 14px;
+            font-weight: 600;
+            margin-top: 12px;
+        }
+
+        .btn:hover {
+            background: #4f46e5;
+            text-decoration: none;
+        }
+
+        .footer {
+            background: #0f172a;
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+            padding: 32px 24px;
+            text-align: center;
+            margin-top: 60px;
+        }
+
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 24px;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+        }
+
+        .footer-links a {
+            font-size: 13px;
+            color: #475569;
+        }
+
+        .footer-links a:hover {
+            color: #94a3b8;
+        }
+
+        .footer-copy {
+            font-size: 12px;
+            color: #334155;
+        }
+
+        @media (max-width: 640px) {
+            .nav {
+                gap: 12px;
+            }
+
+            .container {
+                padding: 32px 16px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <header class="header">
+        <a href="/" class="logo">🎰 Bingo18 AI</a>
+        <nav class="nav">
+            <a href="/">Dashboard</a>
+            <a href="/about">Về chúng tôi</a>
+            <a href="/how-it-works" class="active">Cách hoạt động</a>
+            <a href="/blog/what-is-bingo18">Blog</a>
+        </nav>
+    </header>
+
+    <main class="container">
+        <div class="breadcrumb"><a href="/">Trang chủ</a> › Cách hoạt động</div>
+
+        <h1>Cách Bingo18 AI hoạt động — Giải thích đầy đủ hệ thống 7 tín hiệu</h1>
+        <div class="meta">
+            <span>📅 Cập nhật: Tháng 4, 2026</span>
+            <span>📖 ~8 phút đọc</span>
+            <span>🔬 Kỹ thuật</span>
+        </div>
+
+        <p>
+            Bingo18 AI không hoạt động theo kiểu "đoán mò" hay dùng thuật toán hộp đen bí ẩn. Toàn bộ quy trình phân
+            tích đều dựa trên các phương pháp thống kê minh bạch, có thể giải thích được. Trang này giải thích chi tiết
+            từng bước.
+        </p>
+
+        <h2>Kiến trúc tổng quan</h2>
+        <p>
+            Hệ thống gồm 4 lớp chính hoạt động liên tục:
+        </p>
+
+        <div class="step">
+            <div class="step-num">1</div>
+            <div class="step-body">
+                <h3>Thu thập dữ liệu (Crawler)</h3>
+                <p>Mỗi 90 giây, crawler tự động kiểm tra website Bingo18 / Xổ số 36D để tìm kỳ mới nhất. Khi phát hiện
+                    kỳ chưa có trong cơ sở dữ liệu, hệ thống lưu ngay: số kỳ (ky), 3 chữ số n1/n2/n3, tổng (sum),
+                    pattern (triple/pair/normal), và thời gian quay (drawTime).</p>
+            </div>
+        </div>
+
+        <div class="step">
+            <div class="step-num">2</div>
+            <div class="step-body">
+                <h3>Feature Engineering (Trích xuất đặc trưng)</h3>
+                <p>Với mỗi kỳ trong lịch sử, hệ thống tính toán hàng chục đặc trưng thống kê: khoảng cách từ lần xuất
+                    hiện gần nhất, tần suất lịch sử, xác suất chuyển tiếp Markov, phân phối theo phiên, và nhiều thứ
+                    khác.</p>
+            </div>
+        </div>
+
+        <div class="step">
+            <div class="step-num">3</div>
+            <div class="step-body">
+                <h3>Ensemble Scoring (Mô hình tổng hợp)</h3>
+                <p>7 mô hình con chạy song song, mỗi mô hình cho điểm từng combo từ 1-1-1 đến 6-6-6 (216 combo). Điểm từ
+                    7 mô hình được chuẩn hóa (normalize) về cùng thang đo và tổng hợp bằng trung bình có trọng số. Top
+                    10 combo điểm cao nhất được hiển thị.</p>
+            </div>
+        </div>
+
+        <div class="step">
+            <div class="step-num">4</div>
+            <div class="step-body">
+                <h3>Push realtime + Backtest</h3>
+                <p>Kết quả được đẩy đến trình duyệt qua SSE (Server-Sent Events) trong vài giây. Song song, hệ thống
+                    chạy walk-forward backtest trên toàn bộ lịch sử để đo độ chính xác thực tế.</p>
+            </div>
+        </div>
+
+        <h2>Chi tiết 7 tín hiệu thống kê</h2>
+        <p>Đây là phần cốt lõi của hệ thống. Mỗi tín hiệu phân tích dữ liệu từ một góc nhìn khác nhau:</p>
+
+        <div class="signal-detail">
+            <div class="tag">Tín hiệu 1</div>
+            <h3>Combo Overdue — Quá hạn tổ hợp</h3>
+            <p>Với mỗi combo (ví dụ: 1-2-3), hệ thống tính: <em>số kỳ từ lần xuất hiện gần nhất ÷ khoảng cách trung bình
+                    lịch sử</em>. Kết quả &gt; 1x nghĩa là combo đang "quá hạn" — xuất hiện ít hơn kỳ vọng thống kê. Lý
+                thuyết gambler's ruin lâu dài ủng hộ rằng combo quá hạn có xác suất xuất hiện cao hơn trong ngắn hạn —
+                nhưng đây chỉ là xu hướng thống kê, không phải đảm bảo.</p>
+        </div>
+
+        <div class="signal-detail">
+            <div class="tag">Tín hiệu 2</div>
+            <h3>Sum Overdue — Quá hạn tổng</h3>
+            <p>Tổng 3 chữ số dao động từ 3 (1+1+1) đến 18 (6+6+6). Không phải tổng nào cũng có xác suất xuất hiện bằng
+                nhau — tổng 9, 10, 11 có nhiều combo hơn (56 tổ hợp) so với tổng 3 hay 18 (chỉ 1 tổ hợp). Tín hiệu này
+                đánh giá tổng nào đang thấp hơn kỳ vọng của nó, sau đó tăng điểm cho các combo thuộc tổng đó.</p>
+        </div>
+
+        <div class="signal-detail">
+            <div class="tag">Tín hiệu 3</div>
+            <h3>Pattern Overdue — Quá hạn mẫu</h3>
+            <p>Bingo18 có 3 loại pattern: <strong>Triple</strong> (ba số giống nhau: 111, 222...), <strong>Pair</strong>
+                (hai số giống nhau: 112, 551...) và <strong>Normal</strong> (ba số khác nhau). Mỗi loại có tần suất xuất
+                hiện khác nhau theo phân phối lý thuyết. Tín hiệu này theo dõi khi nào một pattern đang xuất hiện ít hơn
+                kỳ vọng.</p>
+        </div>
+
+        <div class="signal-detail">
+            <div class="tag">Tín hiệu 4</div>
+            <h3>Digit Coldness — Độ lạnh chữ số</h3>
+            <p>Trong 20-30 kỳ gần nhất, chữ số nào (1-6) xuất hiện ít nhất? Tín hiệu này đo "độ lạnh" của từng chữ số và
+                tăng điểm cho các combo chứa nhiều chữ số "lạnh". Đây là biến thể của phân tích tần suất trượt (rolling
+                frequency window).</p>
+        </div>
+
+        <div class="signal-detail">
+            <div class="tag">Tín hiệu 5</div>
+            <h3>Markov Chain — Chuỗi Markov bậc 2</h3>
+            <p>Mô hình Markov phân tích xác suất chuyển tiếp: <em>"Nếu hai kỳ trước là A và B, thì kỳ tiếp theo có xác
+                    suất bao nhiêu phần trăm là C?"</em> Bằng cách đếm tần suất các cặp chuyển tiếp trong lịch sử, hệ
+                thống xây dựng ma trận xác suất và dự đoán kỳ tiếp theo. Markov Chain là một trong các tín hiệu mạnh
+                nhất vì nó nắm bắt được phụ thuộc tuần tự.</p>
+        </div>
+
+        <div class="signal-detail">
+            <div class="tag">Tín hiệu 6</div>
+            <h3>Stability Factor — Hệ số ổn định</h3>
+            <p>Một combo có điểm cao ở tín hiệu 1-5 nhưng độ biến động lớn thì kém tin cậy hơn combo có điểm vừa phải
+                nhưng ổn định. Tín hiệu này đo variance (phương sai) của điểm số combo qua các cửa sổ thời gian khác
+                nhau (7, 15, 30 kỳ). Combo ổn định hơn được ưu tiên.</p>
+        </div>
+
+        <div class="signal-detail">
+            <div class="tag">Tín hiệu 7</div>
+            <h3>Session Signal — Phân tích theo phiên</h3>
+            <p>Bingo18 quay số nhiều lần mỗi ngày. Liệu phân phối combo có khác nhau giữa các phiên sáng/chiều/tối
+                không? Tín hiệu này phân tích phân phối combo theo giờ quay, đặc biệt tìm kiếm các combo có xu hướng
+                "thiên lệch phiên" đáng kể.</p>
+        </div>
+
+        <h2>Walk-Forward Backtest — Kiểm chứng không thiên lệch</h2>
+        <p>
+            Nhiều hệ thống dự đoán mắc lỗi <strong>look-ahead bias</strong> (sử dụng dữ liệu tương lai khi kiểm tra quá
+            khứ). Bingo18 AI dùng walk-forward backtest để tránh điều này:
+        </p>
+
+        <div class="code-block">
+            Với mỗi kỳ i từ kỳ thứ 10 đến kỳ cuối:<br />
+            &nbsp;&nbsp;1. Train: dùng dữ liệu từ kỳ 1 → i-1<br />
+            &nbsp;&nbsp;2. Predict: dự đoán kỳ i (chưa thấy bao giờ)<br />
+            &nbsp;&nbsp;3. Evaluate: so sánh top-1, top-3, top-10 với kết quả thực<br />
+            &nbsp;&nbsp;4. Record: lưu kết quả, tiếp tục với i+1<br /><br />
+            Kết quả cuối: accuracy = hits / total_tests × 100%
+        </div>
+
+        <table class="accuracy-table">
+            <thead>
+                <tr>
+                    <th>Chỉ số</th>
+                    <th>Baseline ngẫu nhiên</th>
+                    <th>Bingo18 AI (mẫu)</th>
+                    <th>Ý nghĩa</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Top 1</td>
+                    <td>0.46%</td>
+                    <td class="good">Xem dashboard →</td>
+                    <td>Đúng số #1</td>
+                </tr>
+                <tr>
+                    <td>Top 3</td>
+                    <td>1.39%</td>
+                    <td class="good">Xem dashboard →</td>
+                    <td>Combo trong 3 dự đoán đầu</td>
+                </tr>
+                <tr>
+                    <td>Top 10</td>
+                    <td>4.63%</td>
+                    <td class="good">Xem dashboard →</td>
+                    <td>Combo trong 10 dự đoán đầu</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p style="font-size: 13px; color: #475569;">
+            * Kết quả thực tế thay đổi theo lượng dữ liệu. Xem <a href="/">Dashboard</a> để biết accuracy hiện tại được
+            tính trực tiếp trên dữ liệu thực.
+        </p>
+
+        <h2>Cách đọc dashboard</h2>
+
+        <h3>Cột "% share" là gì?</h3>
+        <p>
+            % share là tỷ lệ điểm của combo trong tổng điểm top-10. Ví dụ, combo được 20% nghĩa là nó chiếm 20% tổng
+            điểm của 10 combo hàng đầu — <em>không phải</em> xác suất 20% sẽ xuất hiện. Để tránh hiểu nhầm, chúng tôi cố
+            ý giới hạn % tối đa ở 75%.
+        </p>
+
+        <h3>Chỉ số z-score nghĩa là gì?</h3>
+        <p>
+            Z-score đo khoảng cách vắng mặt của combo so với trung bình thống kê, tính bằng số độ lệch chuẩn. Z-score
+            &gt; 2.0 (màu cam) có nghĩa combo đang vắng mặt rất lâu — đây là tín hiệu "nóng" nhất. Z-score &lt; 0 nghĩa
+            combo xuất hiện nhiều hơn kỳ vọng gần đây — ít được ưu tiên.
+        </p>
+
+        <h3>Badge HOT / STRONG / GOOD là gì?</h3>
+        <p>
+            Badge dựa trên điểm chuẩn hóa (0-100) tổng hợp từ 7 tín hiệu: HOT (≥85 điểm), STRONG (≥70), GOOD (≥55), WEAK
+            (≥40), COLD (&lt;40). Đây là cách trực quan để phân hạng combo theo mức độ "được AI đề xuất".
+        </p>
+
+        <div class="disclaimer">
+            <strong>⚠️ Nhắc nhở quan trọng:</strong>
+            <p style="margin-top: 8px;">
+                Tất cả phân tích trên là thống kê thuần túy dựa trên dữ liệu lịch sử. Kết quả xổ số trong tương lai hoàn
+                toàn độc lập và ngẫu nhiên. Bingo18 AI không đảm bảo bất kỳ kết quả nào. Chơi có trách nhiệm.
+            </p>
+        </div>
+
+        <div class="cta-box">
+            <h3>Xem dự đoán hôm nay — cập nhật realtime</h3>
+            <p style="color: #94a3b8; margin-top: 8px;">Top 10 combo được AI phân tích, cập nhật tự động sau mỗi kỳ
+                quay.</p>
+            <a href="/" class="btn">Mở Dashboard →</a>
+            <a href="/about" class="btn"
+                style="background: rgba(99,102,241,0.2); border: 1px solid rgba(99,102,241,0.4); margin-left: 10px;">Về
+                chúng tôi →</a>
+        </div>
+    </main>
+
+    <footer class="footer">
+        <div class="footer-links">
+            <a href="/">Dashboard</a>
+            <a href="/about">Về chúng tôi</a>
+            <a href="/how-it-works">Cách hoạt động</a>
+            <a href="/blog/what-is-bingo18">Bingo18 là gì?</a>
+            <a href="/blog/best-strategy-2026">Chiến thuật 2026</a>
+            <a href="/privacy-policy">Chính sách bảo mật</a>
+        </div>
+        <div class="footer-copy">© 2026 Bingo18 AI · Chỉ dành cho mục đích tham khảo thống kê · Không khuyến khích cờ
+            bạc</div>
+    </footer>
+</body>
+
+</html>

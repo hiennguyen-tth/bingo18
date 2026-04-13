@@ -625,6 +625,26 @@ function App() {
         </div>
 
       </div>
+
+      {/* ── Footer ── */}
+      <footer style={{ borderTop: '1px solid rgba(255,255,255,0.06)', padding: '28px 24px', textAlign: 'center', marginTop: 8 }}>
+        <div style={{ display: 'flex', justifyContent: 'center', gap: 24, flexWrap: 'wrap', marginBottom: 12 }}>
+          {[
+            { href: '/about', label: 'Về chúng tôi' },
+            { href: '/how-it-works', label: 'Cách hoạt động' },
+            { href: '/blog/what-is-bingo18', label: 'Bingo18 là gì?' },
+            { href: '/blog/best-strategy-2026', label: 'Chiến thuật 2026' },
+            { href: '/privacy-policy', label: 'Chính sách bảo mật' },
+          ].map(({ href, label }) => (
+            <a key={href} href={href} style={{ fontSize: 13, color: '#475569', textDecoration: 'none' }}>
+              {label}
+            </a>
+          ))}
+        </div>
+        <div style={{ fontSize: 12, color: '#334155' }}>
+          © 2026 Bingo18 AI · Chỉ dành cho mục đích tham khảo thống kê · Không khuyến khích cờ bạc
+        </div>
+      </footer>
     </div>
   )
 }
