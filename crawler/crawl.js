@@ -15,10 +15,9 @@ const path = require('path')
 const crypto = require('crypto')
 
 const FILE = path.join(__dirname, '../dataset/history.json')
-// Primary + inline backup sources (xomo.com as fallback)
+// Source config: old xoso web is primary (currently fastest/freshest).
 const SOURCES = {
   primary: { name: 'xoso.net.vn', liveUrl: 'https://xoso.net.vn/xs-bingo-18.html', moreUrl: 'https://xoso.net.vn/XSDienToan/GetKetQuaBinGo18More' },
-  backup: { name: 'xomo.com', liveUrl: 'https://xomo.com/ket-qua/xo-so-kien-thiet/bingo-18', moreUrl: null },
 }
 const BASE_URL = 'https://xoso.net.vn'
 const LIVE_URL = SOURCES.primary.liveUrl
@@ -82,48 +81,57 @@ function parseBlocks($) {
   return results
 }
 
-/** Fetch and parse the live page — THREE sources concurrently, merge by ky.
- *  Sources:
- *    A) xoso.net.vn HTML live page
- *    B) xoso.net.vn AJAX endpoint (page 1) — different CDN cache tier, often fresher
- *    C) xomo.com HTML page — independent source, catches draws A/B miss briefly
+/** Fetch and parse latest draws.
+ *  Strategy:
+ *    1) xoso HTML live page (old web) as primary source.
+ *    2) xoso AJAX endpoint only as fallback when HTML fails/empty.
  *
  *  Cache-busting: appending _t=<timestamp> forces a fresh fetch past CDN edge caches
- *  that ignore Cache-Control headers.  Merge by ky (lower ky = older; first wins).
+ *  that may ignore Cache-Control headers.
  */
 async function crawl() {
   const ts = Date.now()
   const bust = `_t=${ts}`   // CDN cache-buster
 
-  const fetchHtml = (url, timeout, label) =>
-    axios.get(`${url}?${bust}`, { timeout, headers: HEADERS })
-      .then(r => parseBlocks(cheerio.load(r.data)))
-      .catch(err => { console.warn(`[crawl] ${label} failed: ${err.message}`); return [] })
-
-  const fetchAjax = () =>
-    axios.get(MORE_URL, { params: { pageIndex: 1, _t: ts }, timeout: 10_000, headers: HEADERS })
-      .then(r => (r.data && r.data.trim().length > 50 ? parseBlocks(cheerio.load(r.data)) : []))
-      .catch(err => { console.warn(`[crawl] AJAX failed: ${err.message}`); return [] })
-
-  const [primaryRecs, ajaxRecs, backupRecs] = await Promise.all([
-    fetchHtml(LIVE_URL, 10_000, SOURCES.primary.name),
-    fetchAjax(),
-    fetchHtml(SOURCES.backup.liveUrl, 10_000, SOURCES.backup.name),
-  ])
-
-  // Merge: deduplicate by ky — primary HTML first (most complete), then AJAX, then backup
-  const byKy = new Map()
-  for (const r of [...primaryRecs, ...ajaxRecs, ...backupRecs]) {
-    if (!byKy.has(r.ky)) byKy.set(r.ky, r)
+  const fetchHtml = async () => {
+    try {
+      const r = await axios.get(`${LIVE_URL}?${bust}`, { timeout: 10_000, headers: HEADERS })
+      return parseBlocks(cheerio.load(r.data))
+    } catch (err) {
+      console.warn(`[crawl] ${SOURCES.primary.name} HTML failed: ${err.message}`)
+      return []
+    }
   }
 
-  const combined = Array.from(byKy.values())
-  const maxKy = combined.length ? Math.max(...combined.map(r => Number(r.ky))) : '—'
-  console.log(`[crawl] html:${primaryRecs.length} ajax:${ajaxRecs.length} backup:${backupRecs.length} merged:${combined.length} maxKy:${maxKy}`)
+  const fetchAjax = async () => {
+    try {
+      const r = await axios.get(MORE_URL, {
+        params: { pageIndex: 1, _t: ts },
+        timeout: 8_000,
+        headers: HEADERS,
+      })
+      return (r.data && r.data.trim().length > 50) ? parseBlocks(cheerio.load(r.data)) : []
+    } catch (err) {
+      console.warn(`[crawl] AJAX fallback failed: ${err.message}`)
+      return []
+    }
+  }
 
-  // Polite delay after parallel fetch
+  const htmlRecs = await fetchHtml()
+  if (htmlRecs.length > 0) {
+    const maxKy = Math.max(...htmlRecs.map(r => Number(r.ky)))
+    console.log(`[crawl] source:html count:${htmlRecs.length} maxKy:${maxKy}`)
+    await new Promise(r => setTimeout(r, 120))
+    return htmlRecs
+  }
+
+  const ajaxRecs = await fetchAjax()
+  const maxKy = ajaxRecs.length ? Math.max(...ajaxRecs.map(r => Number(r.ky))) : '—'
+  console.log(`[crawl] source:ajax-fallback count:${ajaxRecs.length} maxKy:${maxKy}`)
+
+  // Polite delay after fetch
   await new Promise(r => setTimeout(r, 150))
-  return combined
+  return ajaxRecs
 }
 
 /** Fetch one paginated page of history (pageIndex = 1, 2, 3…). Used by crawlAll().

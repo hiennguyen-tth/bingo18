@@ -617,6 +617,38 @@ function selectTop10(results) {
   return top10.sort((a, b) => b.score - a.score)
 }
 
+/**
+ * Prevent triple combos from dominating top-1/top-2 under weak evidence.
+ *
+ * Policy:
+ *   - default: triple should start from rank >= 5
+ *   - moderately overdue (ratio >= 1.8): triple can start from rank >= 3
+ *   - very strong signal (pattern_detected and ratio >= 2.6): triple may be rank 1
+ */
+function rebalanceTripleRanks(top10, overdueRatio, verdict) {
+  if (!Array.isArray(top10) || top10.length === 0) return top10
+
+  let minTripleRank = 5
+  if (overdueRatio >= 1.8) minTripleRank = 3
+  if (verdict === 'pattern_detected' && overdueRatio >= 2.6) minTripleRank = 1
+  if (minTripleRank === 1) return top10
+
+  const delayedTriples = []
+  const kept = []
+  for (let i = 0; i < top10.length; i++) {
+    const r = top10[i]
+    const rank = i + 1
+    if (r.pat === 'triple' && rank < minTripleRank) delayedTriples.push(r)
+    else kept.push(r)
+  }
+
+  if (!delayedTriples.length) return top10
+
+  const insertAt = Math.min(kept.length, minTripleRank - 1)
+  kept.splice(insertAt, 0, ...delayedTriples)
+  return kept.slice(0, 10)
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 function predictRanked(data) {
@@ -626,7 +658,6 @@ function predictRanked(data) {
   const now = new Date()
   const statRes = runStatTests(chron)
   const all = ensembleAll(chron, now)
-  const top10 = selectTop10(all)
 
   // ── Triple signal: single O(N) pass for all triple stats ────────────
   const EXPECTED_GAP = 36 // 6/216 — one triple every 36 draws on average
@@ -648,6 +679,8 @@ function predictRanked(data) {
     : EXPECTED_GAP
 
   const boostMult = tripleBoostMult(chron)
+  let top10 = selectTop10(all)
+  top10 = rebalanceTripleRanks(top10, overdueRatio, statRes.verdict)
 
   // Show all triples that made it into top10 — if a triple is here it earned
   // its place via the overdue boost proportional to kỳ chưa về.
