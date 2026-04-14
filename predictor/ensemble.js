@@ -622,15 +622,15 @@ function selectTop10(results) {
  *
  * Policy:
  *   - default: triple should start from rank >= 5
- *   - moderately overdue (ratio >= 1.8): triple can start from rank >= 3
- *   - very strong signal (pattern_detected and ratio >= 2.6): triple may be rank 1
+ *   - strongly overdue (ratio >= 2.2): triple can start from rank >= 3
+ *   - very strong signal (pattern_detected and ratio >= 3.0): triple may be rank 1
  */
 function rebalanceTripleRanks(top10, overdueRatio, verdict) {
   if (!Array.isArray(top10) || top10.length === 0) return top10
 
   let minTripleRank = 5
-  if (overdueRatio >= 1.8) minTripleRank = 3
-  if (verdict === 'pattern_detected' && overdueRatio >= 2.6) minTripleRank = 1
+  if (overdueRatio >= 2.2) minTripleRank = 3
+  if (verdict === 'pattern_detected' && overdueRatio >= 3.0) minTripleRank = 1
   if (minTripleRank === 1) return top10
 
   const delayedTriples = []
