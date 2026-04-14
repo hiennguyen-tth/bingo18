@@ -1,6 +1,8 @@
 # Bingo18 AI Predictor
 
-Hệ thống dự đoán Bingo18 dùng **5-model Ensemble v6** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward + L2 regularisation)**. Crawl dữ liệu song song từ 2 nguồn (xoso.net.vn + xsmn.net), phục vụ qua REST API + Dashboard React + 5 trang content SEO, deploy trên Fly.io.
+Hệ thống dự đoán Bingo18 dùng **5-model Ensemble v8** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward + L2 regularisation)**. Model A được bổ sung 4 tín hiệu phụ (S3–S6). Crawl dữ liệu song song từ 2 nguồn (xoso.net.vn + xsmn.net), phục vụ qua REST API + Dashboard React + 5 trang content SEO, deploy trên Fly.io.
+
+Kể từ v8, `/stats` bổ sung thêm **"Reality Check"** — 3 statistical test (chi-square, autocorr, runs) để kiểm tra xem Bingo18 có pattern thực sự hay gần với random. Backtest cũng chia 3 segment (train/valid/forward) để phát hiện overfitting.
 
 > **Production:** https://xs-bingo18.fly.dev
 
@@ -18,7 +20,8 @@ bingo/
 ├── dataset/
 │   └── history.json           # Dữ liệu đã crawl (persistent Fly volume)
 ├── predictor/
-│   ├── ensemble.js            # 5-model ensemble v6 (sigmoid, learned weights, rankNorm)
+│   ├── ensemble.js            # 5-model ensemble v8 (sigmoid, learned weights, rankNorm)
+│   ├── stats_tests.js         # Statistical reality check (chi-square, autocorr, runs)
 │   ├── model_d.js              # k-NN Temporal Similarity (pure-JS)
 │   ├── frequency.js           # Tần suất combo
 │   └── features.js            # Feature engineering (dùng bởi /features endpoint)
@@ -69,10 +72,10 @@ node api/server.js             # dashboard → http://localhost:8080
 | Method | Route | Mô tả |
 |--------|-------|--------|
 | GET | `/` | Dashboard React |
-| GET | `/predict` | Top 10 combo + breakdown 3 model — **cached 5 phút** |
+| GET | `/predict` | Top 10 combo + breakdown 3 model + `tripleSignal` — **cached 5 phút** |
 | GET | `/history?limit=500` | Lịch sử kỳ gần nhất |
-| GET | `/overdue` | Thống kê quá hạn: bộ ba / cặp đôi / tổng — **cached** |
-| GET | `/stats` | Walk-forward backtest accuracy — **cached** |
+| GET | `/overdue` | Thống kê quá hạn: bộ ba / `anyTriple` / cặp đôi / tổng — **cached** |
+| GET | `/stats` | Walk-forward backtest accuracy + Reality Check (3 stat tests) + Train/Valid/Forward segments — **cached** |
 | GET | `/frequency` | Tần suất combo — **cached** |
 | GET | `/events` | SSE stream — phát `new-draw` khi có kỳ mới |
 | POST | `/crawl` | Crawl thủ công ngay lập tức |
@@ -100,15 +103,15 @@ node api/server.js             # dashboard → http://localhost:8080
 ```
 Lịch sử N kỳ
     │
-    ├─ Model A: Statistical z-score  ──► normalize [0,1] ─┐
-    ├─ Model B: Markov order-2        ──► normalize [0,1] ─┼──► sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias)
-    ├─ Model C: Session (giờ ngày)   ──► normalize [0,1] ─┤         ↑ learned weights + L2 reg (dataset/model.json)
-    ├─ Model D: k-NN Temporal ML     ──► normalize [0,1] ─┤         auto-disable D if wD < 0
-    └─ Model E: Python GBM prior     ──► normalize [0,1] ─┘         (from python/ml_output.json)
-                                                             │
-                                               S2 Triple boost (chỉ khi hạn)
-                                                             │
-                                               Diversity cap + top-10
+    ├─ Model A: Statistical z-score + S3–S6  ──► normalize [0,1] ─┐
+    ├─ Model B: Markov order-2                ──► normalize [0,1] ─┼──► sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias)
+    ├─ Model C: Session (giờ ngày)            ──► normalize [0,1] ─┤         ↑ learned weights + L2 reg (dataset/model.json)
+    ├─ Model D: k-NN Temporal ML             ──► normalize [0,1] ─┤         auto-disable D if wD < 0
+    └─ Model E: Python GBM prior             ──► normalize [0,1] ─┘         (from python/ml_output.json)
+                                                                    │
+                                                      S2 Triple boost (chỉ khi hạn)
+                                                                    │
+                                              Diversity cap + top-10 selection
 ```
 
 ### Sigmoid ensemble (v6)
@@ -200,17 +203,29 @@ Output `python/ml_output.json` được `ensemble.js` load tự động:
 
 ### MODEL A — Statistical z-score
 
-**Ý nghĩa:** Combo đang xuất hiện ÍT hơn kỳ vọng (under-represented) → tăng điểm.
+**Ý nghĩa:** Combo đang chờ lâu hơn trung bình lịch sử → tăng điểm.
 
 ```
-Window: 1000 kỳ gần nhất
-expected = W / 216
-z = (observed – expected) / sqrt(expected)   ← Poisson z-score
-Score_A = –z × S3 × S4
+gapList[combo] = danh sách các khoảng cách giữa các lần xuất hiện
+curGap        = số kỳ kể từ lần xuất hiện cuối
+z             = (curGap – avgGap) / stdGap    [≥2 gaps]
+              = (curGap – avgGap) / avgGap    [1 gap, cap ±2]
+              = 2.0                            [chưa từng xuất hiện]
+baseScore     = max(0, min(4, z))              [chỉ boost khi quá hạn]
 ```
 
-**S3 — Sum deviation (window 200 kỳ):** boost +30% nếu sum vắng mặt hoàn toàn.  
-**S4 — Digit momentum (window 30 kỳ):** boost +15% nếu các digit đang "hot".
+Augmented bởi 4 tín hiệu phụ — nhân AFTER baseScore:
+
+| Signal | Mô tả | Tác động |
+|--------|-------|----------|
+| **S3** Sum deviation | Sum bucket thiếu so với kỳ vọng (window 200 kỳ) | +0–30% |
+| **S4** Digit momentum | Digit đang "hot" trong 30 kỳ gần nhất | +0–15% |
+| **S5** Sum overdue | Sum bucket quá hạn (kySinceLast/avgInterval > 1) | +0–25% |
+| **S6** Pair-digit overdue | Cặp đôi VV quá hạn, áp cho combo pair/triple | +0–20% |
+
+```
+score_A = baseScore × s3 × s4 × s5 × s6
+```
 
 ---
 
@@ -243,16 +258,65 @@ score[k] = count_in_session / (session_draws / 216)
 
 ---
 
+### Triple signal (xxx)
+
+Mỗi lần `/predict` trả về thêm `tripleSignal` — thống kê khả năng ra hoa bất kỳ:
+
+```json
+{
+  "sinceLastTriple": 14,
+  "expectedGap": 36,
+  "avgGap": 33.1,
+  "overdueRatio": 0.39,
+  "boostMult": 1.0,
+  "appeared": 31,
+  "hotTriples": ["3-3-3", "5-5-5", "6-6-6"]
+}
+```
+
+- `overdueRatio < 1` → LOW (chưa đến lúc)  
+- `1–2×` → MED — bắt đầu chú ý  
+- `> 2×` → HIGH — khả năng cao  
+- Dashboard hiển thị `TripleSignalCard` phía trên top-10, toggle màu theo level.
+
+### Confidence (35–80%)
+
+Không dùng giá trị cứng 75%. Confidence được tính dựa trên khoảng cách score thực trong top-10:
+
+```
+confidence = 35 + ((score – minScore) / (maxScore – minScore)) × 45
+```
+
+→ Rank 1: ~80%, Rank 10: ~35%. Mỗi combo có giá trị khác nhau thay vì đồng loạt 75%.
+
+### Phân phối Sum
+
+Tính đơn giản: đếm tần suất mỗi giá trị tổng (3–18) trên toàn bộ lịch sử:
+
+```js
+cnt[sum]++  // cho mỗi draw
+pct[sum] = cnt[sum] / totalDraws × 100
+```
+
+Bingo18 có cấu trúc xác suất lý thuyết: Sum=10 và Sum=11 phổ biến nhất (27/216 = 12.5% mỗi loại). Dashboard hiển thị phân phối thực tế và so sánh với lý thuyết.
+
+---
+
 ### Diversity cap + top-10 selection
 
 ```
-Pass 0 — bypass: z < –2.5 → bắt buộc vào top 10 (tối đa 3 slot)
+Pass 0 — bypass: z > 2.5 → bắt buộc vào top 10, sắp xếp theo z DESC (tối đa 3 slot)
 Pass 1 — full: max 2 triple, 4 pair, 4 normal; không quá 2 combo cùng digit
-Pass 2 — relax digit-sharing
+Pass 2 — relax digit-sharing, giữ pattern cap
 Pass 3 — no constraints
 ```
 
----
+### Cache invalidation
+
+Triple mechanism:
+1. **Crawler push**: khi crawl phát hiện kỳ mới → `invalidateCache()` + SSE broadcast
+2. **File watcher**: `fs.watchFile(history.json, interval=3s)` — tự clear cache khi file thay đổi từ bên ngoài (dedup, chỉnh tay…)
+3. **TTL 5 phút**: safety net nếu cả 2 cơ chế trên miss
 
 ### Badge ranking
 
@@ -274,7 +338,7 @@ Pass 3 — no constraints
 Promise.allSettled([crawl(), crawlXsmn()])   // xoso.net.vn + xsmn.net
 ```
 
-Hai nguồn chạy song song, `merge()` dedup theo `ky`. Crawl tự động mỗi **90 giây** bên trong `api/server.js`.
+Hai nguồn chạy song song, `merge()` dedup theo `ky`. Crawl tự động mỗi **2 phút** bên trong `api/server.js`.
 
 ### Ghi chú: Bingo18 có lịch nghỉ
 
@@ -304,6 +368,53 @@ Train trên `i-1` kỳ, dự đoán kỳ `i`:
 - **Top-3**: combo trong top 3
 - **Top-10**: combo trong top 10
 - **Random baseline**: 0.46% / 1.39% / 4.63%
+
+### Segmented accuracy (train / valid / forward)
+
+Backtest chia 3 đoạn để phát hiện overfitting:
+
+| Đoạn | Kỳ | Mục đích |
+|------|-----|--------|
+| **Train** | first 60% | Accuracy trên dữ liệu training |
+| **Valid** | next 20% | Accuracy ngoài training (offline validation) |
+| **Forward** | last 20% | Accuracy trên dữ liệu mới nhất (most realistic) |
+
+Nếu **train >> forward**: model có thể overfit. Nếu cả 3 gần nhau: consistent.
+
+---
+
+## Reality Check — Statistical Tests
+
+`/stats` trả về thêm `statTests` — kiểm tra xem dữ liệu có pattern thực sự hay gần random:
+
+```json
+{
+  "statTests": {
+    "chiSquare": { "stat": 234.5, "df": 215, "pValue": 0.18, "significant": false },
+    "autocorr":  { "r": 0.023,   "z": 0.82,  "pValue": 0.41, "significant": false },
+    "runs":      { "runs": 634,  "z": -0.5,  "pValue": 0.62, "significant": false },
+    "verdict": "no_pattern"
+  }
+}
+```
+
+| Test | H0 | Ý nghĩa nếu p < 0.05 |
+|------|-----|----------------------|
+| **Chi-square** | Tần suất mỗi combo = 1/216 | Một số combo xuất hiện nhiều hơn kỳ vọng |
+| **Autocorr** | Sum giữa các kỳ độc lập (r₁=0) | Kỳ trước tương quan với kỳ sau (chuỗi) |
+| **Runs** | Chuỗi trên/dưới median ngẫu nhiên | Có hot/cold streak có ý nghĩa |
+
+**Verdict**:
+- `no_pattern` — 0 test significant → game consistent với IID random → model A/B/D fit noise
+- `weak_pattern` — 1 test → có thể là noise, cần thêm dữ liệu
+- `pattern_detected` — 2-3 test → evidence cấu trúc thực sự
+
+**Lưu ý quan trọng:**
+- Significant ≠ predictable: Chi-square p < 0.05 chỉ nghĩa là tần suất không hoàn toàn phẳng, không có nghĩa là combo cụ thể có thể dự đoán
+- wA = 0.46 (learned) có thể là noise; cần nhiều dữ liệu hơn để kết luận
+- Model D (k-NN) bị kill (wD=0) là dấu hiệu không có local pattern
+
+Dashboard hiển thị Reality Check trong tab Độ chính xác — toggle để xem p-value của từng test.
 
 ---
 
@@ -368,10 +479,10 @@ fly logs         # stream logs realtime
 
 | Cơ chế | Chi tiết |
 |--------|---------|
-| **In-memory cache** | `/predict`, `/overdue`: TTL 5 phút; invalidate khi có kỳ mới |
+| **In-memory cache** | `/predict`, `/overdue`: TTL 5 phút; invalidate khi có kỳ mới (crawler SSE + file watcher) |
 | **SSE live reload** | Client giữ kết nối `/events`, tự reconnect sau 5s |
 | **gzip** | `compression` middleware — SSE exempt |
-| **React.memo** | `PredCard`, `SumBar`, `AccuracyPanel`, `OverdueTable` |
+| **React.memo** | `PredCard`, `SumBar`, `AccuracyPanel`, `OverdueTable`, `TripleSignalCard` |
 | **Dual-source crawl** | `Promise.allSettled` — không crash nếu 1 nguồn down |
 
 ---
@@ -402,6 +513,14 @@ fly logs         # stream logs realtime
 | Sitemap + robots.txt | ✅ | Đã submit Search Console |
 | /ml-status endpoint | ✅ | Xem trạng thái Model D + Python GBM |
 | Backtest top-10 | ✅ | 5.07% vs baseline 4.63% (+9.5%) |
+| S5 sum overdue boost | ✅ | +0–25% cho combo có sum quá hạn |
+| S6 pair-digit overdue boost | ✅ | +0–20% cho pair/triple khi cặp digit đó quá hạn |
+| anyTriple signal (xxx) | ✅ | Tín hiệu + thống kê hoa bất kỳ trên dashboard |
+| TripleSignalCard UI | ✅ | LOW/MED/HIGH + hotTriples + boost multiplier |
+| Confidence 35–80% | ✅ | Thay thế hardcap 75%; tính theo score spread top-10 |
+| File watcher cache invalidation | ✅ | fs.watchFile 3s + SSE broadcast — backup cho crawler SSE |
+| Statistical reality check | ✅ | Chi-square / autocorr / runs — p-value trên dashboard |
+| Segmented backtest (train/valid/fwd) | ✅ | Phát hiện overfitting; 3 cột trên dashboard |
 | Model C slot 6 phút | ⏳ | Cần ~7.200 kỳ (~30 ngày) |
 | Markov-2 đầy đủ | ⏳ | Cần ~50.000 kỳ |
 | wE > 0 (GBM active) | ⏳ | Cần ~5.000+ kỳ để GBM có signal đủ mạnh |

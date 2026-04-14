@@ -46,12 +46,14 @@ function getRankingBadge(normScore) {
   return { label: '❄️ COLD', color: '#6B7280', bg: 'rgba(107,114,128,0.12)', border: 'rgba(107,114,128,0.35)' }
 }
 
-const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability, zScore, statNorm, mk2Norm, sessNorm }) {
+const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability, zScore, statNorm, mk2Norm, sessNorm, confidence: confFromServer }) {
   const nums = combo.split('-')
   const normScore = maxScore > 0 ? Math.round((score / maxScore) * 100) : 0
   const badge = getRankingBadge(normScore)
-  // Cap at 75% — this is a relative model score, not a true probability
-  const confidence = Math.min(75, Math.round(1 / (1 + Math.exp(-0.05 * (normScore - 50))) * 100))
+  // Use server-computed confidence (35–80% range, varies by score spread)
+  // Falls back to rank-based estimate if not provided
+  const confidence = confFromServer != null ? confFromServer
+    : Math.max(35, Math.round(80 - rank * 4.5))
 
   const patLabel = { triple: '♦ Triple', pair: '◆ Pair', normal: '◇ Normal' }[pat] || pat || '◇ Normal'
   const patColor = { triple: '#c4b5fd', pair: '#7dd3fc', normal: '#94a3b8' }[pat] || '#94a3b8'
@@ -198,17 +200,19 @@ const PatTag = memo(function PatTag({ pat }) {
 
 /* ─────────────────────────── AccuracyPanel ─────────────────────────────── */
 const AccuracyPanel = memo(function AccuracyPanel({ stats, loading }) {
+  const [showReality, setShowReality] = React.useState(false)
+
   if (loading) return (
     <div style={{ color: '#475569', fontSize: 13, padding: '20px 0' }}>Đang tính độ chính xác…</div>
   )
-  if (!stats || stats.message) return (
+  if (!stats || stats.message || stats.error || !stats.accuracy) return (
     <div style={{ color: '#fcd34d', fontSize: 12, lineHeight: 1.6 }}>
       Cần thêm dữ liệu để tính chính xác.<br />
       Hiện có: {stats?.total || 0} kỳ, cần ít nhất 12 kỳ.
     </div>
   )
 
-  const { accuracy, hits, tested, baseline } = stats
+  const { accuracy, hits, tested, baseline, segments, statTests } = stats
 
   const rows = [
     { label: 'Top 1', key: 'top1', desc: 'đoán đúng combo #1', color: '#fbbf24' },
@@ -226,12 +230,31 @@ const AccuracyPanel = memo(function AccuracyPanel({ stats, loading }) {
     )
   }
 
+  // Reality check rendering
+  const verdictMeta = statTests && {
+    no_pattern: { label: 'Không phát hiện pattern', color: '#34d399', icon: '✓' },
+    weak_pattern: { label: 'Có thể có pattern yếu', color: '#fbbf24', icon: '⚠' },
+    pattern_detected: { label: 'Phát hiện pattern có ý nghĩa', color: '#f87171', icon: '!' },
+  }[statTests.verdict]
+
+  const pCell = (p) => {
+    if (p == null) return <span style={{ color: '#475569' }}>—</span>
+    const sig = p < 0.05
+    return <span style={{ color: sig ? '#f87171' : '#34d399', fontWeight: sig ? 700 : 400 }}>{p}</span>
+  }
+
+  // Segment overfit indicator: compare train top10 vs forward top10
+  const overfit = segments && segments.train && segments.forward
+    ? +(segments.train.top10 - segments.forward.top10).toFixed(2)
+    : null
+
   return (
     <div>
       <div style={{ fontSize: 11, color: '#475569', marginBottom: 16 }}>
         Walk-forward test trên <strong style={{ color: '#e2e8f0' }}>{tested}</strong> kỳ
         &nbsp;·&nbsp;Random baseline: top1={baseline.top1}% / top3={baseline.top3}% / top10={baseline.top10}%
       </div>
+
       {rows.map(r => (
         <div key={r.key} style={{ marginBottom: 14 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 5 }}>
@@ -259,6 +282,183 @@ const AccuracyPanel = memo(function AccuracyPanel({ stats, loading }) {
           </div>
         </div>
       ))}
+
+      {/* Segmented accuracy: train / valid / forward */}
+      {segments && (
+        <div style={{ marginTop: 18, marginBottom: 4 }}>
+          <div style={{ fontSize: 10, color: '#64748b', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
+            Overfitting check — Train / Valid / Forward
+            {overfit !== null && (
+              <span style={{ marginLeft: 8, color: overfit > 1 ? '#f87171' : '#34d399', fontWeight: 400 }}>
+                (train−forward top10: {overfit > 0 ? '+' : ''}{overfit}%)
+              </span>
+            )}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+            {[
+              { key: 'train', label: 'Train (60%)', color: '#60a5fa' },
+              { key: 'valid', label: 'Valid (20%)', color: '#a78bfa' },
+              { key: 'forward', label: 'Forward (20%)', color: '#34d399' },
+            ].map(({ key, label, color }) => {
+              const s = segments[key]
+              if (!s) return null
+              return (
+                <div key={key} style={{ background: 'rgba(255,255,255,0.04)', borderRadius: 8, padding: '8px 10px' }}>
+                  <div style={{ fontSize: 10, color, fontWeight: 700, marginBottom: 4 }}>{label}</div>
+                  <div style={{ fontSize: 11, color: '#e2e8f0' }}>Top10: <strong>{s.top10}%</strong></div>
+                  <div style={{ fontSize: 10, color: '#64748b' }}>Top1: {s.top1}% · {s.tested}kỳ</div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Reality Check (statistical tests) */}
+      {statTests && (
+        <div style={{ marginTop: 16 }}>
+          <button
+            onClick={() => setShowReality(v => !v)}
+            style={{
+              background: 'none', border: `1px solid ${verdictMeta.color}44`,
+              borderRadius: 6, padding: '5px 10px', cursor: 'pointer',
+              color: verdictMeta.color, fontSize: 11, display: 'flex', alignItems: 'center', gap: 6,
+            }}
+          >
+            <span>{verdictMeta.icon}</span>
+            <span>Reality Check: {verdictMeta.label}</span>
+            <span style={{ marginLeft: 'auto', opacity: 0.6 }}>{showReality ? '▲' : '▼'}</span>
+          </button>
+
+          {showReality && (
+            <div style={{ marginTop: 8, fontSize: 11, background: 'rgba(255,255,255,0.03)', borderRadius: 8, padding: '10px 12px' }}>
+              <div style={{ color: '#64748b', marginBottom: 8 }}>
+                p &lt; 0.05 = có ý nghĩa thống kê (reject H0). Nếu tất cả p &gt; 0.05 → game random → model A/B/D có thể chỉ fit noise.
+              </div>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+                <thead>
+                  <tr>
+                    {['Test', 'Stat', 'p-value', 'Ý nghĩa'].map(h => (
+                      <th key={h} style={{ textAlign: 'left', color: '#475569', fontWeight: 600, paddingBottom: 6, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td style={{ color: '#e2e8f0', paddingTop: 6, paddingRight: 8 }}>Chi-square</td>
+                    <td style={{ color: '#94a3b8', paddingRight: 8 }}>{statTests.chiSquare.stat ?? '—'}</td>
+                    <td>{pCell(statTests.chiSquare.pValue)}</td>
+                    <td style={{ color: '#475569' }}>Tần suất combo phẳng?</td>
+                  </tr>
+                  <tr>
+                    <td style={{ color: '#e2e8f0', paddingTop: 4, paddingRight: 8 }}>Autocorr</td>
+                    <td style={{ color: '#94a3b8', paddingRight: 8 }}>{statTests.autocorr.r ?? '—'}</td>
+                    <td>{pCell(statTests.autocorr.pValue)}</td>
+                    <td style={{ color: '#475569' }}>Sum liên tiếp tương quan?</td>
+                  </tr>
+                  <tr>
+                    <td style={{ color: '#e2e8f0', paddingTop: 4, paddingRight: 8 }}>Runs</td>
+                    <td style={{ color: '#94a3b8', paddingRight: 8 }}>{statTests.runs.runs ?? '—'}</td>
+                    <td>{pCell(statTests.runs.pValue)}</td>
+                    <td style={{ color: '#475569' }}>Chuỗi trên/dưới trung vị ngẫu nhiên?</td>
+                  </tr>
+                </tbody>
+              </table>
+              <div style={{ marginTop: 8, color: '#475569', fontSize: 10, lineHeight: 1.5 }}>
+                * Ý nghĩa thống kê ≠ khả năng dự đoán. Chi-square có thể reject H0 chỉ vì tần suất không hoàn toàn phẳng, không có nghĩa là combo cụ thể nào có thể dự đoán được.
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+})
+
+/* ─────────────────────────── TripleSignalCard ──────────────────────────── */
+const TripleSignalCard = memo(function TripleSignalCard({ signal, anyTriple }) {
+  if (!signal) return null
+  const { sinceLastTriple, expectedGap, avgGap, overdueRatio, boostMult, hotTriples } = signal
+
+  const level = overdueRatio >= 2 ? 'HIGH' : overdueRatio >= 1 ? 'MED' : 'LOW'
+  const levelColor = { HIGH: '#f87171', MED: '#fbbf24', LOW: '#34d399' }[level]
+  const levelBg = { HIGH: 'rgba(248,113,113,0.08)', MED: 'rgba(251,191,36,0.08)', LOW: 'rgba(52,211,153,0.06)' }[level]
+  const barW = Math.min(100, (overdueRatio / 3) * 100)
+
+  return (
+    <div style={{
+      background: levelBg,
+      border: `1px solid ${levelColor}44`,
+      borderRadius: 12, padding: '14px 18px', marginBottom: 16,
+      display: 'grid',
+      gridTemplateColumns: '1fr 1fr 1fr',
+      gap: '12px 24px',
+      alignItems: 'start',
+    }}>
+      {/* Tín hiệu hoa */}
+      <div>
+        <div style={{ fontSize: 10, color: '#64748b', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>
+          🎲 Tín hiệu hoa (xxx)
+        </div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 }}>
+          <span style={{ fontSize: 22, fontWeight: 900, color: levelColor }}>{overdueRatio.toFixed(2)}x</span>
+          <span style={{ fontSize: 11, color: '#64748b' }}>quá hạn</span>
+        </div>
+        <div style={{ height: 5, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden', marginBottom: 6 }}>
+          <div style={{ width: `${barW}%`, height: '100%', background: levelColor, borderRadius: 3, transition: 'width 0.6s ease' }} />
+        </div>
+        <div style={{ fontSize: 11, color: '#64748b' }}>
+          Chưa ra: <span style={{ color: levelColor, fontWeight: 700 }}>{sinceLastTriple}</span> kỳ
+          &nbsp;·&nbsp;TB: <span style={{ color: '#e2e8f0' }}>{avgGap}</span> kỳ/lần
+        </div>
+      </div>
+
+      {/* Thống kê */}
+      <div>
+        <div style={{ fontSize: 10, color: '#64748b', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>
+          📊 Thống kê xxx
+        </div>
+        <div style={{ fontSize: 12, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '3px 8px' }}>
+          <span style={{ color: '#64748b' }}>Tổng lần ra</span>
+          <span style={{ color: '#e2e8f0', fontWeight: 700 }}>{anyTriple?.appeared ?? '—'}</span>
+          <span style={{ color: '#64748b' }}>TB mỗi kỳ</span>
+          <span style={{ color: '#e2e8f0', fontWeight: 700 }}>{anyTriple?.avgInterval ?? avgGap}ky</span>
+          <span style={{ color: '#64748b' }}>Boost hiện tại</span>
+          <span style={{ color: boostMult >= 1.3 ? '#f87171' : '#fbbf24', fontWeight: 700 }}>{boostMult}×</span>
+        </div>
+      </div>
+
+      {/* Hoa khả năng nhất */}
+      <div>
+        <div style={{ fontSize: 10, color: '#64748b', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>
+          {level === 'HIGH' ? '🔥 Hoa khả năng cao' : '💡 Hoa tiềm năng'}
+        </div>
+        {hotTriples && hotTriples.length > 0 ? (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {hotTriples.map((combo, i) => {
+              const [n] = combo.split('-')
+              return (
+                <div key={combo} style={{
+                  background: i === 0 ? 'rgba(196,181,253,0.15)' : 'rgba(255,255,255,0.05)',
+                  border: `1px solid ${i === 0 ? 'rgba(196,181,253,0.4)' : 'rgba(255,255,255,0.1)'}`,
+                  borderRadius: 8, padding: '4px 10px', fontSize: 16, fontWeight: 900,
+                  color: i === 0 ? '#c4b5fd' : '#94a3b8',
+                  letterSpacing: 2,
+                }}>
+                  {n}{n}{n}
+                </div>
+              )
+            })}
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, color: '#475569' }}>
+            {level === 'LOW' ? 'Chưa đến lúc' : 'Đang tính…'}
+          </div>
+        )}
+        {level === 'LOW' && (
+          <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>Khả năng ra hoa chưa cao, chờ thêm {Math.round((expectedGap - sinceLastTriple))} kỳ</div>
+        )}
+      </div>
     </div>
   )
 })
@@ -361,6 +561,14 @@ function App() {
   const [overdue, setOverdue] = useState(null)
   const [overdueLoading, setOverdueLoading] = useState(true)
   const [crawling, setCrawling] = useState(false)
+  const [tripleSignal, setTripleSignal] = useState(null)
+
+  // Bingo18 operating hours: 06:00–21:54 Vietnam time (UTC+7)
+  const isNowOperating = () => {
+    const vnMin = ((new Date().getUTCHours() + 7) % 24) * 60 + new Date().getUTCMinutes()
+    return vnMin >= 360 && vnMin <= 1314
+  }
+  const [bingoClosed, setBingoClosed] = React.useState(!isNowOperating())
 
   const loadOverdue = useCallback(async () => {
     setOverdueLoading(true)
@@ -389,6 +597,7 @@ function App() {
         fetch('/history?limit=500', { cache: 'no-store' }).then(r => r.json()),
       ])
       setPreds(pRes.next || [])
+      setTripleSignal(pRes.tripleSignal || null)
       setSumStats(pRes.sumStats || [])
       setMaxScore(pRes.maxScore || 1)
       setTotal(pRes.total || 0)
@@ -453,16 +662,29 @@ function App() {
   }, []) // stable — callbacks accessed via refs
 
   // ── Periodic data refresh ──
-  // predict+history: every 30s | stats+overdue: every 3 minutes
+  // - Skip all fetches when the browser tab is hidden (saves mobile battery + server CPU)
+  // - predict+history: every 30s during operating hours (06:00–21:54 VN), else every 5min
+  // - stats+overdue:   every 5 minutes (heavy O(N²) backtest, changes slowly)
+  // SSE handles instant updates when a new draw appears; polling is just a safety net.
   useEffect(() => {
+    function isOperatingHours() {
+      const vnMin = ((new Date().getUTCHours() + 7) % 24) * 60 + new Date().getUTCMinutes()
+      return vnMin >= 360 && vnMin <= 1314  // 06:00–21:54 VN
+    }
+
     load()
     loadStats()
     loadOverdue()
-    const tFast = setInterval(() => load(true), 30_000)
+    const tFast = setInterval(() => {
+      if (document.hidden) return          // tab not visible — skip
+      load(true)
+    }, 30_000)
     const tSlow = setInterval(() => {
+      if (document.hidden) return          // tab not visible — skip
+      if (!isOperatingHours()) return      // no new draws outside hours
       loadStats()
       loadOverdue()
-    }, 3 * 60_000)
+    }, 5 * 60_000)
     return () => {
       clearInterval(tFast)
       clearInterval(tSlow)
@@ -491,6 +713,16 @@ function App() {
           }}>
             {sseConnected ? '🟢 Live' : '🔴 Connecting…'}{liveKy ? ` · #${liveKy}` : ''}
           </span>
+          {bingoClosed && (
+            <span style={{
+              ...C.pill,
+              color: '#fbbf24',
+              borderColor: 'rgba(251,191,36,0.4)',
+              background: 'rgba(251,191,36,0.08)',
+            }} title="Bingo18 mở 06:00–21:54 VN. Không có kỳ mới ngoài giờ này.">
+              🔕 Ngoài giờ Bingo
+            </span>
+          )}
           <span style={{ ...C.pill, color: '#94a3b8' }}>
             ⟳ {updated}
           </span>
@@ -512,12 +744,12 @@ function App() {
         {/* ── Error banner ── */}
         {error && (
           <div style={{ ...C.warn, color: '#fca5a5', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)' }}>
-            ⚠ {error} — Hãy chắc chắn API đang chạy: <code>node api/server.js</code>
+            ⚠ {error} — Hãy chắc chắn API đang chạy và có dữ liệu (cần ít nhất 100 kỳ để dự đoán). Click "Cập nhật" để thử lại.
           </div>
         )}
         {!loading && !error && total === 0 && (
           <div style={{ ...C.warn, color: '#fcd34d', background: 'rgba(251,191,36,0.1)', border: '1px solid rgba(251,191,36,0.3)' }}>
-            Chưa có dữ liệu. Chạy trước: <code>node crawler/crawl.js</code>
+            Chưa có dữ liệu. Chờ hệ thống thu thập đủ kỳ mở thưởng để bắt đầu dự đoán (cần ít nhất 100 kỳ).
           </div>
         )}
 
@@ -534,6 +766,7 @@ function App() {
               % = tỷ lệ trong top-10 · X.Xx = số lần quá hạn so với kỳ vọng (1x = bình thường, &gt;1x = lâu chưa về)
             </div>
           </div>
+          <TripleSignalCard signal={tripleSignal} anyTriple={overdue?.anyTriple} />
           <div className="grid3">
             {preds.length === 0 && !loading && (
               <div style={{ color: '#64748b', fontSize: 13 }}>Chưa có dự đoán.</div>
@@ -544,7 +777,8 @@ function App() {
                 overdueRatio={p.overdueRatio} comboGap={p.comboGap ?? 0}
                 pat={p.pat} stability={p.stability}
                 zScore={p.zScore} statNorm={p.statNorm ?? p.coreNorm}
-                mk2Norm={p.mk2Norm} sessNorm={p.sessNorm} />
+                mk2Norm={p.mk2Norm} sessNorm={p.sessNorm}
+                confidence={p.confidence} />
             ))}
           </div>
         </div>
@@ -557,9 +791,13 @@ function App() {
               <div style={{ fontSize: 11, color: '#475569' }} className="hide-mobile">Số kỳ chưa về ÷ TB mỗi kỳ — &gt;1x là quá hạn</div>
             </div>
             <div className="grid-overdue">
-              <OverdueTable items={overdue.triples} loading={overdueLoading} title={`Bộ ba — 111~666 (${overdue.triples?.length || 0})`} />
-              <OverdueTable items={overdue.pairs} loading={overdueLoading} title={`Cặp đôi — 11~66 (${overdue.pairs?.length || 0})`} />
-              <OverdueTable items={overdue.sums} loading={overdueLoading} title={`Tổng — 3~18 (${overdue.sums?.length || 0})`} />
+              <OverdueTable
+                items={overdue.anyTriple ? [overdue.anyTriple, ...overdue.triples] : overdue.triples}
+                loading={overdueLoading}
+                title={`Hoa — 111~666 (${overdue.triples?.length || 0})`}
+              />
+              <OverdueTable items={overdue.pairs} loading={overdueLoading} title={`D - 11~66 (${overdue.pairs?.length || 0})`} />
+              <OverdueTable items={overdue.sums} loading={overdueLoading} title={`T — 3~18 (${overdue.sums?.length || 0})`} />
             </div>
           </div>
         )}
@@ -604,7 +842,23 @@ function App() {
           </div>
         </div>
 
-        {/* ── Accuracy + Heatmap + Sum (desktop bottom) ── */}
+        {/* ── Sum distribution (visible on all screen sizes) ── */}
+        {sumStats.length > 0 && (
+          <div style={{ ...C.card, marginBottom: 28 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 14 }}>
+              <div style={C.label}>Phân phối Sum</div>
+              <div style={{ fontSize: 11, color: '#475569' }}>% kỳ có tổng n1+n2+n3 = X · Lý thuyết: Sum 10/11 = 12.5% cao nhất</div>
+            </div>
+            {(() => {
+              const maxSumPct = Math.max(...sumStats.map(x => x.pct), 1)
+              return sumStats.slice(0, 16).map(s => (
+                <SumBar key={s.sum} sum={s.sum} pct={s.pct} maxPct={maxSumPct} />
+              ))
+            })()}
+          </div>
+        )}
+
+        {/* ── Accuracy + Heatmap (desktop only — complex layout) ── */}
         <div className="hide-mobile">
           <div style={{ ...C.card, marginBottom: 28 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
@@ -613,14 +867,8 @@ function App() {
             </div>
             <AccuracyPanel stats={stats} loading={statsLoading} />
           </div>
-          <div className="grid2">
-            <div style={C.card}><Heatmap history={history} /></div>
-            <div style={C.card}>
-              <div style={C.label}>Phân phối Sum</div>
-              {sumStats.slice(0, 16).map(s => (
-                <SumBar key={s.sum} sum={s.sum} pct={s.pct} maxPct={Math.max(...sumStats.map(x => x.pct), 1)} />
-              ))}
-            </div>
+          <div style={C.card}>
+            <Heatmap history={history} />
           </div>
         </div>
 

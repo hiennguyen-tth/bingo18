@@ -32,8 +32,8 @@ const path = require('path')
 const fs = require('fs-extra')
 const { getModelScores } = require('../predictor/ensemble')
 
-const HISTORY_FILE        = path.join(__dirname, '../dataset/history.json')
-const WEIGHTS_FILE        = path.join(__dirname, '../dataset/model.json')
+const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
+const WEIGHTS_FILE = path.join(__dirname, '../dataset/model.json')
 const WEIGHTS_HISTORY_FILE = path.join(__dirname, '../dataset/weights_history.json')
 
 const TRAIN_START = 50        // minimum draws before first prediction
@@ -243,7 +243,7 @@ async function main() {
         improvesValid: improves,
     }
     let wHistory = []
-    try { wHistory = await fs.readJSON(WEIGHTS_HISTORY_FILE) } catch (_) {}
+    try { wHistory = await fs.readJSON(WEIGHTS_HISTORY_FILE) } catch (_) { }
     wHistory.push(histEntry)
     await fs.ensureFile(WEIGHTS_HISTORY_FILE)
     await fs.writeJSON(WEIGHTS_HISTORY_FILE, wHistory, { spaces: 2 })

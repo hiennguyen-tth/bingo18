@@ -41,6 +41,7 @@ const compression = require('compression')
 const predict = require('../predictor/ensemble')
 const frequency = require('../predictor/frequency')
 const features = require('../predictor/features')
+const { runStatTests } = require('../predictor/stats_tests')
 const { run: crawlRun } = require('../crawler/crawl')
 
 const app = express()
@@ -50,6 +51,21 @@ const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
 
 // Read index.html once at startup; inject ADSENSE_PUBLISHER_ID per request
 const INDEX_TPL = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8')
+
+// ── History file watcher: invalidate cache on ANY external change ────────
+// Belt-and-suspenders: covers manual edits, dedup runs, or missed crawl events.
+// Also broadcasts SSE so clients reload immediately — needed when crawl runs
+// in a separate process (e.g. node crawler/realtime.js in dev).
+fs.watchFile(HISTORY_FILE, { interval: 3000, persistent: false }, (curr, prev) => {
+  if (curr.mtime > prev.mtime) {
+    console.log('[cache] history.json changed externally — invalidating + SSE')
+    invalidateCache()
+    // Small delay to ensure file write is fully flushed before we broadcast
+    setTimeout(() => {
+      broadcast('new-draw', { added: 0, latestKy: '?', total: 0, ts: new Date().toISOString(), source: 'watcher' })
+    }, 500)
+  }
+})
 
 // ── SSE client registry ───────────────────────────────────────────────────
 const sseClients = new Set()
@@ -187,18 +203,22 @@ app.get('/predict', withCache('predict', 5 * 60_000, async () => {
   }
 
   // Ranked predictions with full breakdown
-  const ranked = predict.ranked(data)
-  const top10 = ranked.slice(0, 10)
+  const { top10, tripleSignal } = predict.ranked(data)
 
   // pct = share within top-10 so they sum to 100%
   const top10Total = top10.reduce((s, r) => s + r.score, 0) || 1
   const maxScore = top10[0]?.score || 1
+  const minScore = top10[top10.length - 1]?.score || 0
+  const scoreSpread = maxScore - minScore || 1
 
   const next = top10.map(r => ({
     combo: r.combo,
     score: +r.score.toFixed(3),
-    // pct = share of top-10 total score, hard-capped at 75% to avoid misleading display
-    pct: Math.min(75, +(r.score / top10Total * 100).toFixed(1)),
+    // pct = share of top-10 total score (uncapped — display as-is)
+    pct: +(r.score / top10Total * 100).toFixed(1),
+    // confidence = calibrated [35–80%] based on score spread within top-10
+    // Rank 1 → ~78%, Rank 10 → ~35%; varies meaningfully by model strength
+    confidence: Math.round(35 + ((r.score - minScore) / scoreSpread) * 45),
     overdueRatio: r.overdueRatio != null ? +r.overdueRatio.toFixed(2) : null,
     comboGap: r.comboGap,
     sumOD: +(r.sumOD ?? 0).toFixed(2),
@@ -222,7 +242,7 @@ app.get('/predict', withCache('predict', 5 * 60_000, async () => {
     .map(([sum, cnt]) => ({ sum: +sum, pct: +(cnt / data.length * 100).toFixed(2) }))
     .sort((a, b) => b.pct - a.pct)
 
-  return { next, sumStats, total: data.length, maxScore: +maxScore.toFixed(3) }
+  return { next, tripleSignal, sumStats, total: data.length, maxScore: +maxScore.toFixed(3) }
 }))
 
 /** GET /ml-status — Model D (k-NN) readiness + dataset stats */
@@ -280,7 +300,16 @@ app.get('/frequency', withCache('frequency', 5 * 60_000, async () => {
 }))
 
 /**
- * GET /stats — walk-forward backtest accuracy (cached, expensive O(N²) operation)
+ * GET /stats — walk-forward backtest accuracy + statistical reality check.
+ *
+ * Walk-forward: train on i-1 draws, predict draw i.
+ * Segmented: train (first 60%), valid (next 20%), forward (last 20%)
+ *   → lets you spot overfitting if valid/forward accuracy diverges from train.
+ *
+ * Statistical tests (chiSquare, autocorr, runs):
+ *   → p < 0.05 means that specific test found evidence of non-randomness.
+ *   → If all p > 0.05: data consistent with random → Models A/B/D
+ *     are working on noise; wA=0.46 may just be fit noise.
  */
 app.get('/stats', withCache('stats', 5 * 60_000, async () => {
   const data = await loadHistory()
@@ -291,29 +320,71 @@ app.get('/stats', withCache('stats', 5 * 60_000, async () => {
 
   // Data is newest-first in file; reverse for chronological order
   const chron = [...data].reverse()
+  const N = chron.length
 
+  // Segment boundaries (by draw index in chron)
+  const trainEnd = Math.floor(N * 0.6)
+  const validEnd = Math.floor(N * 0.8)
+
+  // Overall counters
   let top1 = 0, top3 = 0, top10 = 0, tested = 0
 
-  for (let i = WINDOW; i < chron.length; i++) {
+  // Per-segment counters: train / valid / forward
+  const seg = {
+    train: { top1: 0, top3: 0, top10: 0, tested: 0 },
+    valid: { top1: 0, top3: 0, top10: 0, tested: 0 },
+    forward: { top1: 0, top3: 0, top10: 0, tested: 0 },
+  }
+
+  for (let i = WINDOW; i < N; i++) {
     const slice = chron.slice(0, i)
     // Use predict.ranked() — same pipeline as production (diversity cap + triple boost)
     const ranked = predict.ranked(slice)
-    if (!ranked || ranked.length === 0) continue
+    if (!ranked || !ranked.top10 || ranked.top10.length === 0) continue
 
     const actual = `${chron[i].n1}-${chron[i].n2}-${chron[i].n3}`
-    const top = ranked.map(r => r.combo)
+    const top = ranked.top10.map(r => r.combo)
 
-    if (top[0] === actual) top1++
-    if (top.slice(0, 3).some(c => c === actual)) top3++
-    if (top.slice(0, 10).some(c => c === actual)) top10++
+    const hit1 = top[0] === actual
+    const hit3 = top.slice(0, 3).some(c => c === actual)
+    const hit10 = top.slice(0, 10).some(c => c === actual)
+
+    if (hit1) top1++
+    if (hit3) top3++
+    if (hit10) top10++
     tested++
+
+    const segKey = i < trainEnd ? 'train' : i < validEnd ? 'valid' : 'forward'
+    seg[segKey].tested++
+    if (hit1) seg[segKey].top1++
+    if (hit3) seg[segKey].top3++
+    if (hit10) seg[segKey].top10++
   }
 
-  const baseline = { top1: +(1 / 216 * 100).toFixed(2), top3: +(3 / 216 * 100).toFixed(2), top10: +(10 / 216 * 100).toFixed(2) }
+  const baseline = {
+    top1: +(1 / 216 * 100).toFixed(2),
+    top3: +(3 / 216 * 100).toFixed(2),
+    top10: +(10 / 216 * 100).toFixed(2),
+  }
+
+  // Build segmented accuracy object
+  const segments = {}
+  for (const [name, s] of Object.entries(seg)) {
+    const t = s.tested
+    segments[name] = {
+      tested: t,
+      top1: t ? +(s.top1 / t * 100).toFixed(2) : 0,
+      top3: t ? +(s.top3 / t * 100).toFixed(2) : 0,
+      top10: t ? +(s.top10 / t * 100).toFixed(2) : 0,
+    }
+  }
+
+  // Statistical reality check — runs OUTSIDE the backtest loop (cheap O(N))
+  const statTests = runStatTests(chron)
 
   return {
     tested,
-    total: data.length,
+    total: N,
     accuracy: {
       top1: tested ? +(top1 / tested * 100).toFixed(2) : 0,
       top3: tested ? +(top3 / tested * 100).toFixed(2) : 0,
@@ -321,6 +392,8 @@ app.get('/stats', withCache('stats', 5 * 60_000, async () => {
     },
     hits: { top1, top3, top10 },
     baseline,
+    segments,
+    statTests,
   }
 }))
 
@@ -413,6 +486,30 @@ app.get('/overdue', withCache('overdue', 5 * 60_000, async () => {
     }))
   ].sort((a, b) => b.overdueScore - a.overdueScore)
 
+  // ── "Any triple" aggregate row \u2014 tracks when ANY triple last appeared ────────
+  let sinceAnyTriple = 0
+  let lastTripleIdx = -1
+  const anyTripleGaps = []
+  chron.forEach((r, i) => {
+    const pat = r.pattern || (r.n1 === r.n2 && r.n2 === r.n3 ? 'triple' : 'other')
+    if (pat === 'triple') {
+      if (lastTripleIdx >= 0) anyTripleGaps.push(i - lastTripleIdx)
+      lastTripleIdx = i
+    }
+  })
+  sinceAnyTriple = lastTripleIdx >= 0 ? N - 1 - lastTripleIdx : N
+  const avgAnyTripleGap = anyTripleGaps.length
+    ? +(anyTripleGaps.reduce((a, b) => a + b, 0) / anyTripleGaps.length).toFixed(1)
+    : 36
+  const anyTriple = {
+    key: 'any-triple',
+    label: 'XXX',
+    appeared: tripleResult.reduce((s, t) => s + t.appeared, 0),
+    kySinceLast: sinceAnyTriple,
+    avgInterval: avgAnyTripleGap,
+    overdueScore: +(sinceAnyTriple / (avgAnyTripleGap || 36)).toFixed(2),
+  }
+
   // ── Pairs: 11, 22, 33, 44, 55, 66 ────────────────────────────────────
   // A draw contributes to pair "VV" if at least two of its numbers equal V.
   // Triples (1-1-1) also count as pair 11.
@@ -455,6 +552,7 @@ app.get('/overdue', withCache('overdue', 5 * 60_000, async () => {
   return {
     total: N,
     triples: tripleResult,
+    anyTriple,
     pairs: pairResult,
     sums: sumResult,
   }
@@ -525,7 +623,24 @@ app.post('/crawl', async (_req, res) => {
 let lastKnownTotal = 0
 let lastCrawlAttempt = 0
 
+/**
+ * Returns true when Bingo18 is operating (06:00–21:54 Vietnam time, UTC+7).
+ * 159 draws/day at ~6-minute intervals; no draws published outside this window.
+ * Skipping crawls outside hours saves CPU and network on Fly.io.
+ */
+function isOperatingHours() {
+  const now = new Date()
+  // Convert UTC → VN local time (UTC+7) without moment/luxon dependency
+  const vnMinutes = ((now.getUTCHours() + 7) % 24) * 60 + now.getUTCMinutes()
+  // 06:00 = 360 min, 21:54 = 1314 min
+  return vnMinutes >= 360 && vnMinutes <= 1314
+}
+
 async function crawlTick() {
+  if (!isOperatingHours()) {
+    console.log('[crawler] off-hours (Bingo18 06:00–21:54 VN) — skipping')
+    return
+  }
   lastCrawlAttempt = Date.now()
   const ts = new Date().toLocaleTimeString('vi-VN')
   console.log(`[crawler] ${ts} — crawling…`)
@@ -556,9 +671,9 @@ async function crawlTick() {
 
 // ── Start ──────────────────────────────────────────────────────────────────
 
-// Poll every 2 minutes — Bingo18 runs 06:00–21:54 every day with no scheduled breaks.
-// Staleness detection in crawl.js will also hit the paginated API endpoint as an
-// extra fallback whenever the primary source appears stuck on the same ky.
+// Poll every 2 minutes during operating hours (06:00–21:54 VN).
+// crawlTick() is a no-op outside those hours — saves compute between 21:54 and 06:00.
+// 159 draws/day at ~6-minute intervals; polling 2 min gives <1 draw lag on average.
 const CRAWL_INTERVAL_MS = 2 * 60_000
 
 app.listen(PORT, '0.0.0.0', () => {

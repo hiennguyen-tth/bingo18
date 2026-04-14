@@ -1,37 +1,42 @@
 'use strict'
 /**
- * predictor/ensemble.js — v4
+ * predictor/ensemble.js — v8
  *
- * 3-model ensemble — normalize each to [0,1] then combine equally:
+ * 5-model sigmoid ensemble. Each model normalised to [0,1] via rank-percentile,
+ * then combined through sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias).
+ * Weights trained walk-forward with L2 regularisation (scripts/train_weights.js).
  *
- *   MODEL A — Statistical z-score (overdueness measure)     [40%]
- *     z = (currentGap – avgGap) / stdGap; clamped score = max(0, min(4, z))
- *     Overdue (z > 0) → boosted; recently appeared (z ≤ 0) → score=0
- *     Augmented by S3 (sum deviation) + S4 (digit momentum)
- *     Raw z exported as `zScore`; bypass cap when z > 2.5
+ *   MODEL A — Statistical z-score + 4 auxiliary signals (S3–S6)
+ *     z-score = gap overdueness; S3 sum deviation; S4 digit momentum;
+ *     S5 sum-bucket overdue (+0–7% gentle nudge);
+ *     S6 pair-digit overdue (+0–7% gentle nudge — applies to pair/triple only)
+ *     ALL signals merged in a SINGLE O(N) pass for performance.
  *
- *   MODEL B — Markov order-2 (transition probability)           [25%]
- *     P(next | prev-2, prev-1); fallback to order-1; then 1/216
- *     Fallback chain: never crashes on undefined key
+ *   MODEL B — Markov order-2 (transition probability)
+ *     P(next | prev-2, prev-1); fallback order-1; fallback 1/216.
  *
- *   MODEL C — Time-of-day session model (frequency ratio)       [15%]
+ *   MODEL C — Time-of-day session model (frequency ratio)
  *     morning 6–12h / afternoon 12–18h / evening 18–6h
- *     When < 20 draws in current session → weight=0 → redistrib to A+B+D
+ *     When < 20 draws in session → weight=0, redistribute to A+B.
  *
- *   MODEL D — k-NN Temporal Similarity (pure-JS ML)            [20%]
- *     Finds k most historically similar draw contexts (Euclidean on lag
- *     features), scores combos by inverse-distance-weighted hit count.
- *     Disabled when history < K_MIN+WINDOW+1 draws (first ~25 draws).
+ *   MODEL D — k-NN Temporal Similarity (pure-JS ML)
+ *     Auto-disabled when learned weight wD < 0.
  *
- * Triple boost (S2) applied AFTER ensemble — not inside any model:
- *   sinceTriple = draws since last triple appeared
- *   mult = min(3.0, 1 + (1 – (210/216)^sinceTriple) * 2)
+ *   MODEL E — Python GBM prior (offline, from python/ml_output.json)
+ *     Active when file present AND dataset grew ≤ 200 records since training.
  *
- * Diversity cap bypass:
- *   Combos with z > 2.5 (severely overdue) → forced into top-10
- *   sorted by z DESC (most overdue first) — max 3 bypass slots
+ * S2 Triple streak boost — applied AFTER ensemble:
+ *   ratio = sinceTriple / 36;  ratio ≤ 1 → no boost;  max 1.5× at ratio ≥ 2
+ *   Only fires when clearly overdue (not within normal variance of 36-draw gap).
  *
- * Confidence display cap: 75% — enforced in server.js on the pct field
+ * S5/S6 design note:
+ *   These are gentle tie-breakers, NOT dominant signals.
+ *   Max +7% each (combined ≤ +14.5%) prevents compounding bias from inflating
+ *   triple scores above high-z normal combos.
+ *
+ * Diversity cap (selectTop10):
+ *   max 2 triple, 4 pair, 4 normal per top-10.
+ *   Bypass slot (z > 2.5, max 3): severely overdue combos forced in by z DESC.
  */
 
 const path = require('path')
@@ -151,71 +156,126 @@ function rankNorm(scoreMap) {
   return out
 }
 
-// ── MODEL A: Statistical z-score ──────────────────────────────────────────
-
-function sig3SumDeviation(chron) {
-  const window = chron.slice(-200)
-  const W = window.length
-  const countMap = {}
-  for (const r of window) countMap[r.sum] = (countMap[r.sum] || 0) + 1
-  const dev = {}
-  for (let s = 3; s <= 18; s++) {
-    const expected = W * (SUM_COUNT[s] / 216)
-    const actual = countMap[s] || 0
-    dev[s] = expected > 0 ? Math.max(0, expected - actual) / expected : 0
-  }
-  return dev
-}
-
-function sig4DigitMomentum(chron) {
-  const window = chron.slice(-30)
-  const W = window.length
-  const expected = W * 3 / 6
-  const count = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 }
-  for (const r of window) { count[r.n1]++; count[r.n2]++; count[r.n3]++ }
-  const hot = {}
-  for (let d = 1; d <= 6; d++) {
-    hot[d] = expected > 0 ? Math.max(0, count[d] - expected) / expected : 0
-  }
-  return hot
-}
-
+// ── MODEL A: Statistical z-score + S3–S6 (single O(N) pass) ──────────────
 /**
- * Model A: gap-based z-score — how many std deviations overdue is each combo?
+ * Model A: gap-based z-score with 4 auxiliary signals in ONE O(N) pass.
  *
- *   z = (currentGap – avgGap) / stdGap
+ *   z = (currentGap – avgGap) / stdGap  [clamped to 0–4]
+ *   z ≤ 0 → score = 0 (recently appeared, no boost)
+ *   Never seen → z = 2.0 (moderately overdue default)
  *
- *   z > 0  → overdue (waited longer than average) → gets score boost
- *   z ≤ 0  → recently appeared → score = 0 (floor, no negative penalty)
- *   z is clamped to [0, 4] to prevent outlier combos with tiny stdGap from
- *   dominating (e.g., a combo with stdGap=3 and curGap=500 → z=126 → capped to 4)
+ * Auxiliary signals (applied as multipliers on baseScore):
+ *   S3 (+0–30%) sum-bucket observed short vs expected (last-200 draws)
+ *   S4 (+0–15%) digit momentum (last-30 draws)
+ *   S5 (+0–7%)  sum-bucket overdue ratio — gentle tie-breaker only
+ *   S6 (+0–7%)  pair-digit overdue ratio — pairs/triples only; gentle nudge
  *
- * Special cases:
- *   - Only 1 historical gap (no stdGap): use ratio (curGap – avgGap) / avgGap, cap ±2
- *   - Never seen: z = 2.0  (moderately overdue default)
- *
- * Augmented by S3 (sum deviation) and S4 (digit momentum) as tie-breakers.
+ * S5/S6 are intentionally capped at +7% each (combined ≤ +14.5%):
+ *   They should NOT be strong enough to push a triple to rank #1 by themselves.
+ *   Triples have 1/36 base rate; boosting them aggressively amplifies gambler's fallacy.
  */
 function modelA(chron) {
   const N = chron.length
+  const start200 = Math.max(0, N - 200)  // window for S3
+  const start30 = Math.max(0, N - 30)   // window for S4
 
-  // Build gap history for every combo
-  const lastIdx = {}
-  const gapLists = {}
-  chron.forEach((r, i) => {
+  // ── Single O(N) pass accumulates all signal data ───────────────────────
+  const lastIdx = {}   // combo → last draw index (for gap tracking)
+  const gapLists = {}   // combo → array of historical gaps
+
+  const sumCountW = {}   // S3: sum count in last-200 draws
+  const digitCntW = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 }  // S4: digit count in last-30
+
+  const sumLastSeen = {}   // S5: last draw index where this sum appeared
+  const sumGapList = {}   // S5: gaps between same-sum draws
+
+  const pairLastSeen = {}   // S6: last draw index where this pair-digit fired
+  const pairGapList = {}   // S6: gaps between same-pair-digit draws
+
+  for (let i = 0; i < N; i++) {
+    const r = chron[i]
     const k = key(r.n1, r.n2, r.n3)
+    const s = r.n1 + r.n2 + r.n3
+
+    // Combo gaps (for z-score)
     if (lastIdx[k] !== undefined) {
       if (!gapLists[k]) gapLists[k] = []
       gapLists[k].push(i - lastIdx[k])
     }
     lastIdx[k] = i
-  })
 
-  const sumDev = sig3SumDeviation(chron)
-  const digitHot = sig4DigitMomentum(chron)
+    // S3: count sums in last-200 window
+    if (i >= start200) sumCountW[s] = (sumCountW[s] || 0) + 1
 
+    // S4: count digits in last-30 window
+    if (i >= start30) { digitCntW[r.n1]++; digitCntW[r.n2]++; digitCntW[r.n3]++ }
+
+    // S5: track gap between draws of the same sum
+    if (sumLastSeen[s] !== undefined) {
+      if (!sumGapList[s]) sumGapList[s] = []
+      sumGapList[s].push(i - sumLastSeen[s])
+    }
+    sumLastSeen[s] = i
+
+    // S6: track gap between draws containing each pair-digit (≥2 dice equal).
+    // Avoid double-counting triples (1-1-1) using arithmetic rather than Set.
+    const pv1 = (r.n1 === r.n2 || r.n1 === r.n3) ? r.n1 : -1
+    const pv2 = (r.n2 === r.n3 && r.n2 !== pv1) ? r.n2 : -1
+    if (pv1 !== -1) {
+      if (pairLastSeen[pv1] !== undefined) {
+        if (!pairGapList[pv1]) pairGapList[pv1] = []
+        pairGapList[pv1].push(i - pairLastSeen[pv1])
+      }
+      pairLastSeen[pv1] = i
+    }
+    if (pv2 !== -1) {
+      if (pairLastSeen[pv2] !== undefined) {
+        if (!pairGapList[pv2]) pairGapList[pv2] = []
+        pairGapList[pv2].push(i - pairLastSeen[pv2])
+      }
+      pairLastSeen[pv2] = i
+    }
+  }
+
+  // ── Derive per-sum and per-digit signals ──────────────────────────────
+  // S3: observed deficit vs theoretical expectation over last-200
+  const W200 = N - start200
+  const sumDev = {}
+  for (let s = 3; s <= 18; s++) {
+    const expected = W200 * (SUM_COUNT[s] / 216)
+    sumDev[s] = expected > 0 ? Math.max(0, expected - (sumCountW[s] || 0)) / expected : 0
+  }
+
+  // S4: digit momentum — excess count vs expected in last-30
+  const W30 = N - start30
+  const expected30 = W30 * 3 / 6    // each digit expected W30*3/6 appearances
+  const digitHot = {}
+  for (let d = 1; d <= 6; d++) {
+    digitHot[d] = expected30 > 0 ? Math.max(0, digitCntW[d] - expected30) / expected30 : 0
+  }
+
+  // S5: for each sum, overdue ratio = draws since last / avg gap (>1 = overdue)
+  const sumOD = {}
+  for (let s = 3; s <= 18; s++) {
+    const since = sumLastSeen[s] !== undefined ? N - 1 - sumLastSeen[s] : N
+    const g = sumGapList[s] || []
+    const avg = g.length ? g.reduce((a, b) => a + b, 0) / g.length : N
+    sumOD[s] = avg > 0 ? since / avg : 1
+  }
+
+  // S6: for each pair-digit, overdue ratio
+  const pairOD = {}
+  for (let v = 1; v <= 6; v++) {
+    const since = pairLastSeen[v] !== undefined ? N - 1 - pairLastSeen[v] : N
+    const g = pairGapList[v] || []
+    const avg = g.length ? g.reduce((a, b) => a + b, 0) / g.length : N
+    pairOD[v] = avg > 0 ? since / avg : 1
+  }
+
+  // ── Score each of the 216 combos ──────────────────────────────────────
   const scores = {}
   const zMap = {}
+  const gapMeta = {}
 
   for (const [a, b, c] of ALL_COMBOS) {
     const k = key(a, b, c)
@@ -230,29 +290,46 @@ function modelA(chron) {
 
     let z
     if (avg !== null && std !== null && std >= 1) {
-      // ≥2 historical gaps: full gap z-score
       z = (curGap - avg) / std
     } else if (avg !== null) {
-      // exactly 1 historical gap: ratio-based, capped to [-2, 2]
       z = Math.max(-2, Math.min(2, (curGap - avg) / avg))
     } else {
-      // never seen before
-      z = 2.0
+      z = 2.0  // never seen — treat as moderately overdue
     }
 
     zMap[k] = z
+    gapMeta[k] = {
+      currentGap: curGap,
+      avgGap: avg,
+      stability: avg !== null && std !== null && std > 0 ? avg / std : null,
+    }
 
-    // Score: clamp to [0, 4] — only overdue combos get a boost
     const baseScore = Math.max(0, Math.min(4, z))
 
+    // S3 & S4 — can add up to 30% + 15% for strong signals
     const s3 = 1 + sumDev[a + b + c] * 0.30
-    const digits = [...new Set([a, b, c])]
+    const digits = a === b && b === c ? [a] : a === b ? [a, c] : a === c ? [a, b] : b === c ? [b, a] : [a, b, c]
     const avgHot = digits.reduce((acc, d) => acc + digitHot[d], 0) / digits.length
     const s4 = 1 + avgHot * 0.15
 
-    scores[k] = baseScore * s3 * s4
+    // S5 — gentle sum-overdue nudge: max +7%
+    const sumRatio = sumOD[a + b + c] || 1
+    const s5 = sumRatio > 1 ? 1 + Math.min(0.07, (sumRatio - 1) * 0.05) : 1
+
+    // S6 — gentle pair-digit-overdue nudge: max +7%, pairs/triples only
+    // Triples are rare (1/36 per draw); capping S6 prevents them being
+    // inflated to rank #1 purely by pair overdue signal.
+    let s6 = 1
+    const pat = classify(a, b, c)
+    if (pat === 'pair' || pat === 'triple') {
+      const pairDigit = (a === b || a === c) ? a : b
+      const pRatio = pairOD[pairDigit] || 1
+      s6 = pRatio > 1 ? 1 + Math.min(0.07, (pRatio - 1) * 0.04) : 1
+    }
+
+    scores[k] = baseScore * s3 * s4 * s5 * s6
   }
-  return { scores, zMap }
+  return { scores, zMap, gapMeta }
 }
 
 // ── MODEL B: Markov order-2 ───────────────────────────────────────────────
@@ -390,42 +467,10 @@ function tripleBoostMult(chron) {
   return Math.min(1.5, 1 + (ratio - 1) * 0.5)
 }
 
-// ── Gap / stability metadata (display only, not for scoring) ─────────────
-
-function buildGapMeta(chron) {
-  const N = chron.length
-  const lastIdx = {}
-  const gapLists = {}
-  chron.forEach((r, i) => {
-    const k = key(r.n1, r.n2, r.n3)
-    if (lastIdx[k] !== undefined) {
-      if (!gapLists[k]) gapLists[k] = []
-      gapLists[k].push(i - lastIdx[k])
-    }
-    lastIdx[k] = i
-  })
-  const meta = {}
-  for (const [a, b, c] of ALL_COMBOS) {
-    const k = key(a, b, c)
-    const gaps = gapLists[k] || []
-    const avg = gaps.length ? gaps.reduce((s, v) => s + v, 0) / gaps.length : null
-    const variance = gaps.length > 1 && avg !== null
-      ? gaps.reduce((acc, g) => acc + (g - avg) ** 2, 0) / gaps.length
-      : null
-    const std = variance !== null ? Math.sqrt(variance) : null
-    meta[k] = {
-      currentGap: lastIdx[k] !== undefined ? N - 1 - lastIdx[k] : N,
-      avgGap: avg,
-      stability: avg !== null && std !== null && std > 0 ? avg / std : null,
-    }
-  }
-  return meta
-}
-
 // ── ENSEMBLE ──────────────────────────────────────────────────────────────
 
 function ensembleAll(chron, now) {
-  const { scores: rawA, zMap } = modelA(chron)
+  const { scores: rawA, zMap, gapMeta } = modelA(chron)  // gapMeta built in same O(N) pass
   const rawB = modelB(chron)
   const rawC = modelC(chron, now)
 
@@ -437,8 +482,6 @@ function ensembleAll(chron, now) {
 
   // Model E: Python GBM prior (loaded from python/ml_output.json, if present & fresh)
   const rawE = getGBMScores(chron.length)
-
-  const gapMeta = buildGapMeta(chron)
 
   const A = rankNorm(rawA)
   const B = rankNorm(rawB)
@@ -502,6 +545,17 @@ function ensembleAll(chron, now) {
       gbmNorm: +(hasE ? (E[k] ?? 0) : 0).toFixed(4),
     }
   }
+
+  // Compute score range across all 216 combos for confidence normalization
+  const allScores = Object.values(results).map(r => r.score)
+  const scoreMin = Math.min(...allScores)
+  const scoreMax = Math.max(...allScores)
+  for (const r of Object.values(results)) {
+    r.scoreRankPct = scoreMax > scoreMin
+      ? +((r.score - scoreMin) / (scoreMax - scoreMin) * 100).toFixed(1)
+      : 50
+  }
+
   return results
 }
 
@@ -561,31 +615,72 @@ function selectTop10(results) {
 
 function predictRanked(data) {
   if (!data) data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'))
-  if (!data || data.length < 2) return []
+  if (!data || data.length < 2) return { top10: [], tripleSignal: null }
   const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
   const now = new Date()
   const all = ensembleAll(chron, now)
   const top10 = selectTop10(all)
-  return top10.map(r => ({
+
+  // ── Triple signal: single O(N) pass for all triple stats ────────────
+  const EXPECTED_GAP = 36 // 6/216 — one triple every 36 draws on average
+  let tripleCount = 0
+  let lastTripleIdx = -1
+  const tripleGaps = []
+  chron.forEach((r, i) => {
+    const pat = r.pattern || classify(r.n1, r.n2, r.n3)
+    if (pat === 'triple') {
+      tripleCount++
+      if (lastTripleIdx >= 0) tripleGaps.push(i - lastTripleIdx)
+      lastTripleIdx = i
+    }
+  })
+  const sinceTriple = lastTripleIdx >= 0 ? chron.length - 1 - lastTripleIdx : chron.length
+  const overdueRatio = sinceTriple / EXPECTED_GAP
+  const avgTripleGap = tripleGaps.length
+    ? +(tripleGaps.reduce((a, b) => a + b, 0) / tripleGaps.length).toFixed(1)
+    : EXPECTED_GAP
+
+  // Compute boost multiplier inline (same formula as tripleBoostMult)
+  const boostRatio = sinceTriple / EXPECTED_GAP
+  const boostMult = boostRatio <= 1 ? 1.0 : Math.min(1.5, 1 + (boostRatio - 1) * 0.5)
+  // Rank all 6 triples by their model score
+  const allSorted = Object.values(all).sort((a, b) => b.score - a.score)
+  const hotTriples = allSorted
+    .filter(r => r.pat === 'triple')
+    .slice(0, 3)
+    .map(r => r.combo)
+
+  const tripleSignal = {
+    sinceLastTriple: sinceTriple,
+    expectedGap: EXPECTED_GAP,
+    avgGap: avgTripleGap,
+    overdueRatio: +overdueRatio.toFixed(2),
+    boostMult: +boostMult.toFixed(2),
+    appeared: tripleCount,
+    hotTriples,
+  }
+
+  const mapped = top10.map(r => ({
     combo: r.combo,
     score: +r.score.toFixed(4),
-    pct: 0,           // filled by server.js, capped at 75%
-    overdueRatio: r.z,        // gap-based z (positive = overdue)
+    scoreRankPct: r.scoreRankPct ?? 50,
+    pct: 0,           // filled by server.js
+    overdueRatio: r.z,
     comboGap: r.currentGap,
-    sumOD: 0,           // kept for API compat
+    sumOD: 0,
     pat: r.pat,
     stability: r.stability,
-    // 4-model breakdown
     zScore: r.z,
     statNorm: r.statNorm,
     mk2Norm: r.mk2Norm,
     sessNorm: r.sessNorm,
     mlNorm: r.mlNorm ?? 0,
     gbmNorm: r.gbmNorm ?? 0,
-    // legacy compat — some older UI code may reference these
     coreNorm: r.statNorm,
     chiNorm: 0,
   }))
+
+  return { top10: mapped, tripleSignal }
 }
 
 /** Score map for all 216 combos — used by /stats backtest. */
