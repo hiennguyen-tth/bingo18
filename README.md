@@ -1,8 +1,8 @@
 # Bingo18 AI Predictor
 
-Hệ thống dự đoán Bingo18 dùng **5-model Ensemble v8** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward + L2 regularisation)**. Model A được bổ sung 4 tín hiệu phụ (S3–S6). Crawl dữ liệu song song từ 2 nguồn (xoso.net.vn + xsmn.net), phục vụ qua REST API + Dashboard React + 5 trang content SEO, deploy trên Fly.io.
+Hệ thống dự đoán Bingo18 dùng **5-model Ensemble v8** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward + L2 regularisation)**. Model A được bổ sung 4 tín hiệu phụ (S3–S6), Model B dùng Laplace smoothing, và ensemble có **reality-aware shrink** khi dữ liệu trông gần random. Crawler dùng **xoso.net.vn** làm primary và **xomo.com** làm fallback, phục vụ qua REST API + Dashboard React, deploy trên Fly.io.
 
-Kể từ v8, `/stats` bổ sung thêm **"Reality Check"** — 3 statistical test (chi-square, autocorr, runs) để kiểm tra xem Bingo18 có pattern thực sự hay gần với random. Backtest cũng chia 3 segment (train/valid/forward) để phát hiện overfitting.
+Kể từ logic mới nhất, `/stats` bổ sung **Reality Check** (chi-square, autocorr, runs), chia 3 segment (train/valid/forward), và trả thêm **calibrated hit rate theo từng rank**. Triple signal chỉ còn là lớp thông tin hỗ trợ; top-10 không còn ép combo hoa lên đầu bằng bypass.
 
 > **Production:** https://xs-bingo18.fly.dev
 
@@ -15,7 +15,7 @@ bingo/
 ├── api/
 │   └── server.js              # Express API + SSE live stream + in-memory cache
 ├── crawler/
-│   ├── crawl.js               # Dual-source parallel crawler (xoso + xsmn)
+│   ├── crawl.js               # Primary crawler (xoso) + fallback (xomo) + rate limiting
 │   └── realtime.js            # Standalone crawler loop (dùng local dev)
 ├── dataset/
 │   └── history.json           # Dữ liệu đã crawl (persistent Fly volume)
@@ -58,7 +58,7 @@ cd bingo
 npm install
 
 # Crawl dữ liệu ban đầu
-node crawler/crawl.js          # crawl ~15 kỳ mới nhất từ xoso.net.vn
+node crawler/crawl.js          # crawl ~15 kỳ mới nhất từ xoso.net.vn (fallback xomo.com nếu lỗi)
 node crawler/crawl.js --all    # crawl toàn bộ lịch sử (60 trang × 15 ≈ 900 kỳ)
 
 # Chạy server
@@ -72,14 +72,14 @@ node api/server.js             # dashboard → http://localhost:8080
 | Method | Route | Mô tả |
 |--------|-------|--------|
 | GET | `/` | Dashboard React |
-| GET | `/predict` | Top 10 combo + breakdown 3 model + `tripleSignal` — **cached 5 phút** |
+| GET | `/predict` | Top 10 combo + breakdown model + `tripleSignal` đã được AI xác nhận — **cached 5 phút** |
 | GET | `/history?limit=500` | Lịch sử kỳ gần nhất |
 | GET | `/overdue` | Thống kê quá hạn: bộ ba / `anyTriple` / cặp đôi / tổng — **cached** |
-| GET | `/stats` | Walk-forward backtest accuracy + Reality Check (3 stat tests) + Train/Valid/Forward segments — **cached** |
+| GET | `/stats` | Walk-forward backtest + Reality Check + Train/Valid/Forward + calibrated rank buckets — **cached** |
 | GET | `/frequency` | Tần suất combo — **cached** |
 | GET | `/events` | SSE stream — phát `new-draw` khi có kỳ mới |
 | POST | `/crawl` | Crawl thủ công ngay lập tức |
-| GET | `/health` | Liveness probe (historySize, lastDrawAt, sseClients) |
+| GET | `/health` | Liveness probe (historySize, freshness, crawlerStatus, cacheKeys) |
 | GET | `/ads.txt` | Google AdSense publisher declaration |
 | GET | `/robots.txt` | Crawl rules + sitemap pointer |
 | GET | `/sitemap.xml` | XML sitemap 6 URLs |
@@ -96,7 +96,7 @@ node api/server.js             # dashboard → http://localhost:8080
 
 ---
 
-## Logic dự đoán — Ensemble v6
+## Logic dự đoán — Ensemble v8
 
 ### Tổng quan pipeline
 
@@ -114,27 +114,26 @@ Lịch sử N kỳ
                                               Diversity cap + top-10 selection
 ```
 
-### Sigmoid ensemble (v6)
+### Sigmoid ensemble (v8)
 
 ```
 score = sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias)
 ```
 
 - Trọng số học qua **walk-forward optimisation với L2 regularisation** (node scripts/train_weights.js)
-- `objective = top10_acc - λ·(wA²+wB²+wC²+wD²+wE²)`, λ=0.01 để tránh overfit
+- `objective = (top10_acc - baseline_random) - λ·(wA²+wB²+wC²+wD²+wE²)`, λ=0.01 để tránh học noise không beat nổi random
 - Weights có thể **âm** → phạt model nhiễu; **Model D tự động bị disable khi wD < 0**
 - Model E (GBM): dùng khi `python/ml_output.json` tồn tại và còn fresh (< 200 kỳ staleness)
 - Fallback về fixed linear nếu `dataset/model.json` không tồn tại hoặc `improvesValid=false`
+- Khi `Reality Check = no_pattern`, weights của A/B/D bị shrink để tránh overconfidence
 
-**Kết quả hiện tại** (1016 kỳ, April 2026):
+**Kết quả học gần nhất** (`dataset/model.json`):
 
-| | Fixed weights | Learned weights (v6) | Baseline random |
+| | Fixed weights | Learned weights | Baseline random |
 |---|---|---|---|
-| Top-1 | — | 0.20% | 0.46% |
-| Top-3 | — | 0.89% | 1.39% |
-| Top-10 | 4.72% | **5.07%** | 4.63% |
+| Top-10 valid | 4.72% | **5.91%** | 4.63% |
 
-> Top-10 +9.5% trên baseline. Top-1/3 thấp hơn random — bình thường với ~1016 kỳ (random game + diversity cap phân tán slots 1 và 3). Metric quan trọng nhất là Top-10.
+> Metric chính là Top-10. Rank 1–3 được hiển thị kèm calibrated historical hit rate trong UI để tránh ảo giác tự tin.
 
 **Learned weights** (`dataset/model.json`):
 ```json
@@ -220,27 +219,29 @@ Augmented bởi 4 tín hiệu phụ — nhân AFTER baseScore:
 |--------|-------|----------|
 | **S3** Sum deviation | Sum bucket thiếu so với kỳ vọng (window 200 kỳ) | +0–30% |
 | **S4** Digit momentum | Digit đang "hot" trong 30 kỳ gần nhất | +0–15% |
-| **S5** Sum overdue | Sum bucket quá hạn (kySinceLast/avgInterval > 1) | +0–25% |
-| **S6** Pair-digit overdue | Cặp đôi VV quá hạn, áp cho combo pair/triple | +0–20% |
+| **S5** Sum overdue | Sum bucket quá hạn (kySinceLast/avgInterval > 1) | +0–7% |
+| **S6** Pair-digit overdue | Cặp đôi VV quá hạn, áp cho combo pair/triple | +0–7% |
 
 ```
 score_A = baseScore × s3 × s4 × s5 × s6
 ```
 
+Ngoài ra Model A bị nhân thêm `sampleDecay = min(1, log(N)/log(5000))` để tránh quá tự tin khi dữ liệu còn ít.
+
 ---
 
-### MODEL B — Markov order-2 (25%)
+### MODEL B — Markov order-2
 
 **Ý nghĩa:** Dựa trên 2 kỳ liền trước, combo nào có xác suất transition cao nhất?
 
-**Fallback chain:**
+**Fallback chain + smoothing:**
 ```
-1. key(kỳ[-2], kỳ[-1]) → dùng nếu ≥ 5 observations
+1. key(kỳ[-2], kỳ[-1]) → Laplace smoothing
 2. key(kỳ[-1]) → order-1
 3. Fallback: uniform 1/216
 ```
 
-Cần ~50.000 kỳ để Matrix order-2 đầy đủ. Hiện tại (~1210 kỳ) thường fallback về order-1.
+Xác suất được tính bằng `(count + α) / (total + α×216)` với `α = 0.5` để tránh zero-probability ở context hiếm.
 
 ---
 
@@ -274,12 +275,12 @@ Mỗi lần `/predict` trả về thêm `tripleSignal` — thống kê khả nă
 }
 ```
 
-- `overdueRatio < 1` → LOW (chưa đến lúc)  
-- `1–2×` → MED — bắt đầu chú ý  
-- `> 2×` → HIGH — khả năng cao  
-- Dashboard hiển thị `TripleSignalCard` phía trên top-10, toggle màu theo level.
+- `overdueRatio < 1` → LOW (chưa đến lúc)
+- `1–2×` → MED — bắt đầu chú ý
+- `> 2×` → HIGH — chỉ là điều kiện cần, không tự động được lên top
+- Combo hoa chỉ hiện trong `hotTriples` khi **đã vào top-10 cuối cùng** và điểm cuối đủ mạnh
 
-### Confidence (35–80%)
+### Confidence + calibration
 
 Không dùng giá trị cứng 75%. Confidence được tính dựa trên khoảng cách score thực trong top-10:
 
@@ -287,7 +288,9 @@ Không dùng giá trị cứng 75%. Confidence được tính dựa trên khoả
 confidence = 35 + ((score – minScore) / (maxScore – minScore)) × 45
 ```
 
-→ Rank 1: ~80%, Rank 10: ~35%. Mỗi combo có giá trị khác nhau thay vì đồng loạt 75%.
+→ Rank 1: ~80%, Rank 10: ~35%. Đây là confidence tương đối theo score spread.
+
+UI hiển thị thêm `lịch sử: x.xxx%` từ `/stats.calBuckets` — đó mới là hit rate thực nghiệm theo từng rank position.
 
 ### Phân phối Sum
 
@@ -305,11 +308,12 @@ Bingo18 có cấu trúc xác suất lý thuyết: Sum=10 và Sum=11 phổ biến
 ### Diversity cap + top-10 selection
 
 ```
-Pass 0 — bypass: z > 2.5 → bắt buộc vào top 10, sắp xếp theo z DESC (tối đa 3 slot)
 Pass 1 — full: max 2 triple, 4 pair, 4 normal; không quá 2 combo cùng digit
 Pass 2 — relax digit-sharing, giữ pattern cap
 Pass 3 — no constraints
 ```
+
+Không còn bypass ép combo quá hạn vào top-10. Ranking giờ thuần theo final score sau ensemble.
 
 ### Cache invalidation
 
@@ -332,13 +336,13 @@ Triple mechanism:
 
 ## Crawler
 
-### Dual-source parallel
+### Crawler
 
 ```js
-Promise.allSettled([crawl(), crawlXsmn()])   // xoso.net.vn + xsmn.net
+crawl()   // xoso.net.vn primary, xomo.com fallback nếu primary lỗi
 ```
 
-Hai nguồn chạy song song, `merge()` dedup theo `ky`. Crawl tự động mỗi **2 phút** bên trong `api/server.js`.
+Crawler tự chạy mỗi **60 giây** trong giờ mở thưởng. `crawl.js` dùng timeout ngắn + no-cache headers + fallback source để giảm lag nhưng vẫn giữ rate-limit lịch sự.
 
 ### Ghi chú: Bingo18 có lịch nghỉ
 

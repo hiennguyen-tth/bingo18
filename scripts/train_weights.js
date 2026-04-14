@@ -10,8 +10,9 @@
  *   • For **ranking**, sigmoid is monotone ⇒ same as linear; benefit is the
  *     data-driven weight calibration (not the sigmoid nonlinearity itself)
  *
- * L2 regularisation: objective = top10_acc - λ·(wA²+wB²+wC²+wD²+wE²)
- *   • Prevents overfit to training set (extreme weights)
+ * L2 regularisation: objective = (top10_acc − baseline) − λ·(wA²+wB²+wC²+wD²+wE²)
+ *   Penalises weights that don’t beat the 4.63% random-pick baseline first.
+ *   Prevents learning “noise patterns” if the ensemble barely beats random.
  *   • λ = 0.01 — small enough not to override accuracy signal
  *
  * Train / validation split:
@@ -44,6 +45,7 @@ const VALID_RATIO = 0.25      // last 25% of steps = validation holdout
 function sigmoid(x) { return 1 / (1 + Math.exp(-x)) }
 
 const LAMBDA = 0.01   // L2 regularisation coefficient
+const BASELINE_TOP10 = 10 / 216   // random baseline ≈04.63% — objective must beat this
 
 // ── Scoring ──────────────────────────────────────────────────────
 
@@ -61,7 +63,7 @@ function hitRate(samples, wA, wB, wC, wD, wE, bias, lambda = 0) {
     }
     const acc = samples.length ? hits / samples.length : 0
     const l2 = lambda * (wA ** 2 + wB ** 2 + wC ** 2 + wD ** 2 + wE ** 2)
-    return acc - l2
+    return (acc - BASELINE_TOP10) - l2  // objective: exceed random first, then penalize complexity
 }
 
 // ── Pre-compute model scores ───────────────────────────────────────────────

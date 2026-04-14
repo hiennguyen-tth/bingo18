@@ -96,12 +96,18 @@ function withCache(key, ttlMs, fn) {
     const hit = apiCache.get(key)
     if (hit && (ttlMs === 0 || now - hit.ts < ttlMs)) {
       res.set('X-Cache', 'HIT')
+      const lastMod = new Date(hit.ts).toUTCString()
+      res.set('Last-Modified', lastMod)
+      if (req.headers['if-modified-since'] && new Date(req.headers['if-modified-since']) >= new Date(hit.ts)) {
+        return res.status(304).end()
+      }
       return res.json(hit.data)
     }
     try {
       const data = await fn(req)
       apiCache.set(key, { data, ts: now })
       res.set('X-Cache', 'MISS')
+      res.set('Last-Modified', new Date(now).toUTCString())
       res.json(data)
     } catch (err) {
       console.error(`[${key}]`, err.message)
@@ -276,10 +282,17 @@ app.get('/ml-status', async (_req, res) => {
 /** GET /history — raw records (?limit=50), newest first */
 app.get('/history', async (req, res) => {
   try {
-    res.set('Cache-Control', 'no-store, no-cache, must-revalidate')
-    res.set('Pragma', 'no-cache')
     const data = await loadHistory()
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 500)
+
+    // ETag: fingerprint from total count + newest draw id (cheap, no hashing)
+    const etag = `"${data.length}-${data[0]?.ky || '0'}"`
+    res.set('Cache-Control', 'no-cache')  // store but validate before reuse
+    res.set('ETag', etag)
+    if (req.headers['if-none-match'] === etag) {
+      return res.status(304).end()
+    }
+
     res.json({ records: data.slice(0, limit), total: data.length })
   } catch (err) {
     res.status(500).json({ error: err.message })
@@ -328,6 +341,8 @@ app.get('/stats', withCache('stats', 5 * 60_000, async () => {
 
   // Overall counters
   let top1 = 0, top3 = 0, top10 = 0, tested = 0
+  // Per-rank hit counters for calibrated confidence (rank 1–10 → empirical hit rate)
+  const rankHits = new Array(10).fill(0)
 
   // Per-segment counters: train / valid / forward
   const seg = {
@@ -348,6 +363,11 @@ app.get('/stats', withCache('stats', 5 * 60_000, async () => {
     const hit1 = top[0] === actual
     const hit3 = top.slice(0, 3).some(c => c === actual)
     const hit10 = top.slice(0, 10).some(c => c === actual)
+
+    // Record which rank position the actual draw landed in (for calibration)
+    for (let r = 0; r < Math.min(ranked.top10.length, 10); r++) {
+      if (ranked.top10[r].combo === actual) { rankHits[r]++; break }
+    }
 
     if (hit1) top1++
     if (hit3) top3++
@@ -382,6 +402,11 @@ app.get('/stats', withCache('stats', 5 * 60_000, async () => {
   // Statistical reality check — runs OUTSIDE the backtest loop (cheap O(N))
   const statTests = runStatTests(chron)
 
+  // Calibrated hit rates per rank position (empirical win rate at each rank)
+  const calBuckets = tested > 0
+    ? rankHits.map((h, i) => ({ rank: i + 1, hitPct: +(h / tested * 100).toFixed(3) }))
+    : []
+
   return {
     tested,
     total: N,
@@ -394,6 +419,7 @@ app.get('/stats', withCache('stats', 5 * 60_000, async () => {
     baseline,
     segments,
     statTests,
+    calBuckets,
   }
 }))
 
@@ -590,10 +616,25 @@ app.get('/health', async (_req, res) => {
   try {
     const data = await loadHistory()
     const newest = data[0]  // history is stored newest-first
+    const drawTime = newest?.drawTime ?? newest?.draw_time ?? null
+    const dataFreshness = drawTime
+      ? Math.floor((Date.now() - new Date(drawTime).getTime()) / 1000)
+      : null
+
+    let modelFreshness = null
+    try {
+      const wStat = fs.statSync(path.join(__dirname, '../dataset/model.json'))
+      modelFreshness = Math.floor((Date.now() - wStat.mtimeMs) / 1000)
+    } catch (_) { }
+
     res.json({
       status: 'ok',
       historySize: data.length,
-      lastDrawAt: newest?.drawTime ?? newest?.draw_time ?? null,
+      lastDrawAt: drawTime,
+      dataFreshness,           // seconds since newest draw
+      modelFreshness,          // seconds since model.json last updated
+      crawlerStatus: isOperatingHours() ? 'operating' : 'offline',
+      lastCrawlAttemptAt: lastCrawlAttempt ? new Date(lastCrawlAttempt).toISOString() : null,
       uptime: Math.floor(process.uptime()),
       sseClients: sseClients.size,
       cacheKeys: [...apiCache.keys()],
@@ -671,10 +712,12 @@ async function crawlTick() {
 
 // ── Start ──────────────────────────────────────────────────────────────────
 
-// Poll every 2 minutes during operating hours (06:00–21:54 VN).
+// Poll every 60 seconds during operating hours (06:00–21:54 VN).
 // crawlTick() is a no-op outside those hours — saves compute between 21:54 and 06:00.
-// 159 draws/day at ~6-minute intervals; polling 2 min gives <1 draw lag on average.
-const CRAWL_INTERVAL_MS = 2 * 60_000
+// 159 draws/day at ~6-minute intervals (~1 per 6min = ~10 per hour);
+// polling 60s gives very responsive detection (~0.5-1 min lag on average).
+// Rate limiting: respects target site with courteous request spacing.
+const CRAWL_INTERVAL_MS = 60_000          // poll every 60s (balanced for responsiveness + rate limiting)
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Bingo AI API  →  http://localhost:${PORT}`)
@@ -682,7 +725,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`SSE stream    →  http://localhost:${PORT}/events`)
   console.log(`Crawl interval: every ${CRAWL_INTERVAL_MS / 1000}s`)
 
-  // Startup crawl immediately, then poll every 2 minutes
+  // Startup crawl immediately, then continue at the configured interval
   crawlTick().catch(err => console.error('[crawler] startup error:', err.message))
   setInterval(crawlTick, CRAWL_INTERVAL_MS)
 })

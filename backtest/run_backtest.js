@@ -18,9 +18,10 @@ const WINDOW = 10        // minimum records needed before first prediction
 
 async function runBacktest() {
   const data = await fs.readJSON(HISTORY_FILE).catch(() => [])
+  const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
 
-  if (data.length < WINDOW + 1) {
-    console.error(`[backtest] Need at least ${WINDOW + 1} records, got ${data.length}.`)
+  if (chron.length < WINDOW + 1) {
+    console.error(`[backtest] Need at least ${WINDOW + 1} records, got ${chron.length}.`)
     console.error('           Run: node crawler/crawl.js')
     process.exit(1)
   }
@@ -28,16 +29,16 @@ async function runBacktest() {
   let top1Correct = 0
   let top3Correct = 0
   let top10Correct = 0
-  const tested = data.length - WINDOW
+  const tested = chron.length - WINDOW
 
-  for (let i = WINDOW; i < data.length; i++) {
-    const slice = data.slice(0, i)
+  for (let i = WINDOW; i < chron.length; i++) {
+    const slice = chron.slice(0, i)
     // Use predict.ranked() — same pipeline as production (diversity cap + triple boost)
     const ranked = predict.ranked(slice)
-    if (!ranked || ranked.length === 0) continue
+    if (!ranked || !ranked.top10 || ranked.top10.length === 0) continue
 
-    const actual = `${data[i].n1}-${data[i].n2}-${data[i].n3}`
-    const top = ranked.map(r => r.combo)
+    const actual = `${chron[i].n1}-${chron[i].n2}-${chron[i].n3}`
+    const top = ranked.top10.map(r => r.combo)
 
     if (top[0] === actual) top1Correct++
     if (top.slice(0, 3).some(c => c === actual)) top3Correct++
@@ -51,7 +52,7 @@ async function runBacktest() {
   const RANDOM = { top1: 1 / 216, top3: 3 / 216, top10: 10 / 216 }
 
   console.log('── Backtest Results ──────────────────────')
-  console.log(`   Records in dataset : ${data.length}`)
+  console.log(`   Records in dataset : ${chron.length}`)
   console.log(`   Rounds tested      : ${tested}`)
   console.log(`   Top-1  accuracy    : ${(top1Acc * 100).toFixed(2)}%  (${top1Correct}/${tested})  baseline=${(RANDOM.top1 * 100).toFixed(2)}%`)
   console.log(`   Top-3  accuracy    : ${(top3Acc * 100).toFixed(2)}%  (${top3Correct}/${tested})  baseline=${(RANDOM.top3 * 100).toFixed(2)}%`)
@@ -60,7 +61,7 @@ async function runBacktest() {
 
   const report = {
     date: new Date().toISOString(),
-    totalRecords: data.length,
+    totalRecords: chron.length,
     window: WINDOW,
     tested,
     top1Correct,
@@ -83,7 +84,7 @@ async function runBacktest() {
   // Append to backtest history — track accuracy over time as dataset grows.
   const btEntry = {
     ts: report.date,
-    N: data.length,
+    N: chron.length,
     top1: +top1Acc.toFixed(4),
     top3: +top3Acc.toFixed(4),
     top10: +top10Acc.toFixed(4),

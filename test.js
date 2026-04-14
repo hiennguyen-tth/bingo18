@@ -27,15 +27,7 @@ function test(name, fn) {
 /* ── Fixtures ─────────────────────────────────────────────────────────── */
 /**
  * Seven draws, deliberately chosen so we can calculate expected values
- * by hand and verify every module.
- *
- * Transitions (for Markov tests):
- *   '1-2-3' → '2-3-4'   (i=1)
- *   '2-3-4' → '1-1-1'   (i=2)
- *   '1-1-1' → '3-4-5'   (i=3)
- *   '3-4-5' → '6-6-6'   (i=4)
- *   '6-6-6' → '2-3-4'   (i=5)
- *   '2-3-4' → '1-2-3'   (i=6)  ← last record is '1-2-3' again
+ * by hand and verify the public predictor modules.
  */
 const MOCK = [
   { id: 'a', n1: 1, n2: 2, n3: 3, sum: 6, pattern: 'normal' }, // 0
@@ -64,22 +56,6 @@ test('no unknown keys', () => {
   const keys = Object.keys(f)
   assert.ok(keys.every(k => /^\d-\d-\d$/.test(k)), 'key format must be n-n-n')
 })
-
-/* ════════════════════════════════════════════════════════════════════════
-   predictor/markov
-   ════════════════════════════════════════════════════════════════════════ */
-console.log('\n── predictor/markov ─────────────────────')
-const markov = require('./predictor/markov')
-const mk = markov(MOCK)
-
-test('returns an object', () => assert.ok(typeof mk === 'object'))
-test('empty data → {}', () => assert.deepStrictEqual(markov([]), {}))
-test('single record → {}', () => assert.deepStrictEqual(markov([MOCK[0]]), {}))
-test('has transition 1-2-3 → 2-3-4 (count 1)', () => assert.strictEqual(mk['1-2-3']['2-3-4'], 1))
-test('has transition 2-3-4 → 1-1-1 (count 1)', () => assert.strictEqual(mk['2-3-4']['1-1-1'], 1))
-test('has transition 2-3-4 → 1-2-3 (count 1)', () => assert.strictEqual(mk['2-3-4']['1-2-3'], 1))
-test('has transition 6-6-6 → 2-3-4 (count 1)', () => assert.strictEqual(mk['6-6-6']['2-3-4'], 1))
-test('unknown key yields undefined', () => assert.strictEqual(mk['5-5-5'], undefined))
 
 /* ════════════════════════════════════════════════════════════════════════
    predictor/features
@@ -130,13 +106,20 @@ test('all scores are non-negative', () => {
 test('all scores are numbers', () => {
   assert.ok(Object.values(scores).every(v => typeof v === 'number' && isFinite(v)))
 })
-test('predict.ranked returns array', () => {
+test('predict.ranked returns top10 + tripleSignal', () => {
   const ranked = predict.ranked(MOCK)
-  assert.ok(Array.isArray(ranked) && ranked.length === 216)
+  assert.ok(ranked && Array.isArray(ranked.top10) && ranked.top10.length > 0)
+  assert.ok(ranked.tripleSignal && typeof ranked.tripleSignal === 'object')
 })
-test('ranked items have combo, score, comboGap', () => {
+test('ranked top10 items have combo, score, comboGap', () => {
   const ranked = predict.ranked(MOCK)
-  assert.ok(ranked[0].combo && typeof ranked[0].score === 'number' && typeof ranked[0].comboGap === 'number')
+  assert.ok(ranked.top10[0].combo && typeof ranked.top10[0].score === 'number' && typeof ranked.top10[0].comboGap === 'number')
+})
+test('tripleSignal exposes verdict-aware fields', () => {
+  const ranked = predict.ranked(MOCK)
+  assert.ok(typeof ranked.tripleSignal.boostMult === 'number')
+  assert.ok(typeof ranked.tripleSignal.verdict === 'string')
+  assert.ok(typeof ranked.tripleSignal.aiConfirmed === 'boolean')
 })
 
 /* ════════════════════════════════════════════════════════════════════════

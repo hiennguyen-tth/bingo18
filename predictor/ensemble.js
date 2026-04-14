@@ -42,6 +42,7 @@
 const path = require('path')
 const fs = require('fs')
 const modelD = require('./model_d')
+const { runStatTests } = require('./stats_tests')
 
 const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
 const WEIGHTS_FILE = path.join(__dirname, '../dataset/model.json')
@@ -131,6 +132,8 @@ for (let a = 1; a <= 6; a++)
   for (let b = 1; b <= 6; b++)
     for (let c = 1; c <= 6; c++)
       ALL_COMBOS.push([a, b, c])
+
+const ALPHA = 0.5  // Laplace smoothing constant for Markov model B
 
 /**
  * Rank-percentile normalize a score map {key: number} → {key: [0,1]}.
@@ -306,6 +309,10 @@ function modelA(chron) {
 
     const baseScore = Math.max(0, Math.min(4, z))
 
+    // Sample-size decay: shrink modelA influence when data is sparse.
+    // log(N)/log(5000) reaches 1.0 at 5000 draws; below that, caps overconfident z-scores.
+    const sampleDecay = Math.min(1, Math.log(Math.max(N, 2)) / Math.log(5000))
+
     // S3 & S4 — can add up to 30% + 15% for strong signals
     const s3 = 1 + sumDev[a + b + c] * 0.30
     const digits = a === b && b === c ? [a] : a === b ? [a, c] : a === c ? [a, b] : b === c ? [b, a] : [a, b, c]
@@ -327,7 +334,7 @@ function modelA(chron) {
       s6 = pRatio > 1 ? 1 + Math.min(0.07, (pRatio - 1) * 0.04) : 1
     }
 
-    scores[k] = baseScore * s3 * s4 * s5 * s6
+    scores[k] = baseScore * sampleDecay * s3 * s4 * s5 * s6
   }
   return { scores, zMap, gapMeta }
 }
@@ -348,8 +355,10 @@ function buildMarkov2(chron) {
 }
 
 /**
- * Model B: Markov order-2 with fallback chain:
- *   order-2 (≥5 observations) → order-1 → uniform 1/216
+ * Model B: Markov order-2 with Laplace smoothing (α=0.5) and fallback chain:
+ *   order-2 (any observations) → order-1 → Laplace-uniform = 1/216
+ * Laplace smoothing: P(k|ctx) = (count(k,ctx) + α) / (total(ctx) + α×216)
+ * Eliminates zero probabilities and removes ≥5-obs threshold — handles sparse contexts.
  */
 function modelB(chron) {
   const N = chron.length
@@ -369,14 +378,12 @@ function modelB(chron) {
     const trans2 = mk2[`${p2k}|${p1k}`]
     if (trans2) {
       const total2 = Object.values(trans2).reduce((s, v) => s + v, 0)
-      if (total2 >= 5) {
-        const sc = {}
-        for (const [a, b, c] of ALL_COMBOS) {
-          const k = key(a, b, c)
-          sc[k] = (trans2[k] || 0) / total2
-        }
-        return sc
+      const sc = {}
+      for (const [a, b, c] of ALL_COMBOS) {
+        const k = key(a, b, c)
+        sc[k] = ((trans2[k] || 0) + ALPHA) / (total2 + ALPHA * 216)
       }
+      return sc
     }
   }
 
@@ -391,17 +398,15 @@ function modelB(chron) {
   const trans1 = mk1[p1k]
   if (trans1) {
     const total1 = Object.values(trans1).reduce((s, v) => s + v, 0)
-    if (total1 > 0) {
-      const sc = {}
-      for (const [a, b, c] of ALL_COMBOS) {
-        const k = key(a, b, c)
-        sc[k] = (trans1[k] || 0) / total1
-      }
-      return sc
+    const sc = {}
+    for (const [a, b, c] of ALL_COMBOS) {
+      const k = key(a, b, c)
+      sc[k] = ((trans1[k] || 0) + ALPHA) / (total1 + ALPHA * 216)
     }
+    return sc
   }
 
-  // Final fallback: uniform
+  // Final fallback: Laplace-uniform = 1/216 (equivalent since no context observed)
   return uniform()
 }
 
@@ -443,18 +448,17 @@ function modelC(chron, now) {
 // ── S2: Triple streak boost (applied AFTER ensemble) ─────────────────────
 
 /**
- * Returns a multiplier for triple combos — but ONLY when the drought is
- * longer than the expected average gap (36 draws = 1/36 chance per draw).
+ * Returns a conservative multiplier for triple combos.
  *
- *   ratio = sinceTriple / 36
- *   ratio ≤ 1.0 → no boost (drought is ordinary)
- *   ratio = 1.5 → boost ≈ 1.25×
- *   ratio ≥ 2.0 → max boost 1.5×
+ * Rules:
+ *   - no_pattern      → no boost at all
+ *   - weak_pattern    → tiny boost only after clear drought
+ *   - pattern_detected→ gentle boost, never dominant
  *
- * Previous formula (210/216)^N fired immediately (1.65× after just 14 draws),
- * causing 2 triples to dominate top positions even during a normal no-triple run.
+ * This keeps triples informational instead of letting them dominate the top-10
+ * while the model is still learning on a near-random game.
  */
-function tripleBoostMult(chron) {
+function tripleBoostMult(chron, verdict = 'weak_pattern') {
   let sinceTriple = 0
   for (let i = chron.length - 1; i >= 0; i--) {
     const pat = chron[i].pattern || classify(chron[i].n1, chron[i].n2, chron[i].n3)
@@ -463,13 +467,26 @@ function tripleBoostMult(chron) {
   }
   const EXPECTED_GAP = 36     // 1-in-36 draws is a triple
   const ratio = sinceTriple / EXPECTED_GAP
-  if (ratio <= 1) return 1.0  // within normal range → no boost
-  return Math.min(1.5, 1 + (ratio - 1) * 0.5)
+  if (verdict === 'no_pattern') return 1.0
+  if (ratio <= 1.15) return 1.0
+
+  if (verdict === 'pattern_detected') {
+    return Math.min(1.12, 1 + (ratio - 1.15) * 0.08)
+  }
+
+  return Math.min(1.06, 1 + (ratio - 1.15) * 0.04)
 }
 
 // ── ENSEMBLE ──────────────────────────────────────────────────────────────
 
 function ensembleAll(chron, now) {
+  // Reality-aware weight shrinking: when statistical tests find no detectable pattern,
+  // shrink pattern-detection model weights (A, B, D) toward zero so the ensemble
+  // produces more uniform predictions — intellectually honest for a near-random game.
+  const statRes = runStatTests(chron)
+  const SHRINK_MAP = { no_pattern: 0.5, weak_pattern: 0.75, pattern_detected: 1.0 }
+  const shrink = SHRINK_MAP[statRes.verdict] ?? 0.75
+
   const { scores: rawA, zMap, gapMeta } = modelA(chron)  // gapMeta built in same O(N) pass
   const rawB = modelB(chron)
   const rawC = modelC(chron, now)
@@ -499,7 +516,7 @@ function ensembleAll(chron, now) {
   const wD_fixed = hasD ? 0.20 : 0
   // E not used in fixed fallback — requires trained weight to avoid guessing
 
-  const tripleBoost = tripleBoostMult(chron)
+  const tripleBoost = tripleBoostMult(chron, statRes.verdict)
 
   const results = {}
   for (const [a, b, c] of ALL_COMBOS) {
@@ -521,7 +538,8 @@ function ensembleAll(chron, now) {
     let score
     if (lw) {
       const wE = lw.wE ?? 0
-      score = sigmoid(lw.wA * sA + lw.wB * sB + lw.wC * sC + lw.wD * sD + wE * sE + lw.bias)
+      // Apply shrinkFactor to pattern-detecting models (A, B, D); leave session (C) and GBM (E) unchanged
+      score = sigmoid((lw.wA * shrink) * sA + (lw.wB * shrink) * sB + lw.wC * sC + (lw.wD * shrink) * sD + wE * sE + lw.bias)
     } else {
       score = wA_fixed * sA + wB_fixed * sB + wC_fixed * sC + wD_fixed * sD
     }
@@ -569,19 +587,10 @@ function selectTop10(results) {
   const top10 = []
   const chosen = new Set()
 
-  // Pass 0: bypass — force top-3 MOST OVERDUE combos (z > 2.5) into top-10
-  // Sort by z-score DESC so the truly most-overdue always get the slots,
-  // not just the highest-scoring ones (which Markov might dominate).
-  // Require at least comboGap data to trust the z-score (min 3 gaps = 4 appearances).
-  const overdueByZ = sorted
-    .filter(r => r.z !== null && r.z > 2.5 && r.currentGap != null)
-    .sort((a, b) => b.z - a.z)
-  for (const r of overdueByZ) {
-    if (top10.length >= 3) break
-    top10.push(r); chosen.add(r.combo); countPat[r.pat]++
-    const digits = [...new Set(r.combo.split('-').map(Number))]
-    digits.forEach(d => digitCnt[d]++)
-  }
+  // Pure score-based ranking — no forced overrides.
+  // Triples get boost via tripleBoostMult() applied earlier in ensembleAll();
+  // if they score high enough they rise naturally. Forcing them in by z-score
+  // produced artificial top-1 placements that reduced overall accuracy.
 
   // Pass 1: full diversity constraints
   for (const r of sorted) {
@@ -618,6 +627,7 @@ function predictRanked(data) {
   if (!data || data.length < 2) return { top10: [], tripleSignal: null }
   const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
   const now = new Date()
+  const statRes = runStatTests(chron)
   const all = ensembleAll(chron, now)
   const top10 = selectTop10(all)
 
@@ -640,14 +650,12 @@ function predictRanked(data) {
     ? +(tripleGaps.reduce((a, b) => a + b, 0) / tripleGaps.length).toFixed(1)
     : EXPECTED_GAP
 
-  // Compute boost multiplier inline (same formula as tripleBoostMult)
-  const boostRatio = sinceTriple / EXPECTED_GAP
-  const boostMult = boostRatio <= 1 ? 1.0 : Math.min(1.5, 1 + (boostRatio - 1) * 0.5)
-  // Rank all 6 triples by their model score
-  const allSorted = Object.values(all).sort((a, b) => b.score - a.score)
-  const hotTriples = allSorted
-    .filter(r => r.pat === 'triple')
-    .slice(0, 3)
+  const boostMult = tripleBoostMult(chron, statRes.verdict)
+
+  // Only show triples that both survived top10 selection and are strong enough
+  // on the final score scale. Otherwise the card stays informational only.
+  const hotTriples = top10
+    .filter(r => r.pat === 'triple' && (r.scoreRankPct ?? 0) >= 70)
     .map(r => r.combo)
 
   const tripleSignal = {
@@ -657,6 +665,8 @@ function predictRanked(data) {
     overdueRatio: +overdueRatio.toFixed(2),
     boostMult: +boostMult.toFixed(2),
     appeared: tripleCount,
+    verdict: statRes.verdict,
+    aiConfirmed: hotTriples.length > 0,
     hotTriples,
   }
 

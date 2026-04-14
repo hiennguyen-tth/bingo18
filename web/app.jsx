@@ -18,6 +18,15 @@ function fmtTime(iso) {
   return `${hh}:${mi} ${dd}/${mo}/${yy}`
 }
 
+function predsSignature(preds) {
+  return preds.map(p => `${p.combo}:${p.score}:${p.confidence}`).join('|')
+}
+
+function historySignature(records) {
+  if (!records || records.length === 0) return '0'
+  return `${records.length}:${records[0]?.ky || '0'}`
+}
+
 /* ─────────────────────────── Styles ───────────────────────────────────── */
 const C = {
   app: { minHeight: '100vh', background: '#0f172a', color: '#e2e8f0', fontFamily: 'system-ui,-apple-system,sans-serif' },
@@ -46,7 +55,7 @@ function getRankingBadge(normScore) {
   return { label: '❄️ COLD', color: '#6B7280', bg: 'rgba(107,114,128,0.12)', border: 'rgba(107,114,128,0.35)' }
 }
 
-const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability, zScore, statNorm, mk2Norm, sessNorm, confidence: confFromServer }) {
+const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability, zScore, statNorm, mk2Norm, sessNorm, confidence: confFromServer, calBuckets }) {
   const nums = combo.split('-')
   const normScore = maxScore > 0 ? Math.round((score / maxScore) * 100) : 0
   const badge = getRankingBadge(normScore)
@@ -54,6 +63,8 @@ const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxSc
   // Falls back to rank-based estimate if not provided
   const confidence = confFromServer != null ? confFromServer
     : Math.max(35, Math.round(80 - rank * 4.5))
+  // Calibrated hit rate at this rank position from walk-forward backtest
+  const calHitPct = calBuckets ? calBuckets.find(b => b.rank === rank + 1)?.hitPct : null
 
   const patLabel = { triple: '♦ Triple', pair: '◆ Pair', normal: '◇ Normal' }[pat] || pat || '◇ Normal'
   const patColor = { triple: '#c4b5fd', pair: '#7dd3fc', normal: '#94a3b8' }[pat] || '#94a3b8'
@@ -141,7 +152,7 @@ const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxSc
       {/* Row 5: confidence bar */}
       <div>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#64748b', marginBottom: 4 }}>
-          <span>confidence</span>
+          <span>confidence{calHitPct != null ? <span style={{ color: '#475569', fontWeight: 400 }}> · lịch sử: {calHitPct}%</span> : ''}</span>
           <span style={{ color: badge.color, fontWeight: 700 }}>{confidence}%</span>
         </div>
         <div style={{ height: 5, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden' }}>
@@ -378,7 +389,7 @@ const AccuracyPanel = memo(function AccuracyPanel({ stats, loading }) {
 /* ─────────────────────────── TripleSignalCard ──────────────────────────── */
 const TripleSignalCard = memo(function TripleSignalCard({ signal, anyTriple }) {
   if (!signal) return null
-  const { sinceLastTriple, expectedGap, avgGap, overdueRatio, boostMult, hotTriples } = signal
+  const { sinceLastTriple, expectedGap, avgGap, overdueRatio, boostMult, hotTriples, verdict, aiConfirmed } = signal
 
   const level = overdueRatio >= 2 ? 'HIGH' : overdueRatio >= 1 ? 'MED' : 'LOW'
   const levelColor = { HIGH: '#f87171', MED: '#fbbf24', LOW: '#34d399' }[level]
@@ -389,10 +400,10 @@ const TripleSignalCard = memo(function TripleSignalCard({ signal, anyTriple }) {
     <div style={{
       background: levelBg,
       border: `1px solid ${levelColor}44`,
-      borderRadius: 12, padding: '14px 18px', marginBottom: 16,
+      borderRadius: 12, padding: '12px 16px', marginBottom: 16,
       display: 'grid',
-      gridTemplateColumns: '1fr 1fr 1fr',
-      gap: '12px 24px',
+      gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+      gap: '10px 20px',
       alignItems: 'start',
     }}>
       {/* Tín hiệu hoa */}
@@ -452,8 +463,11 @@ const TripleSignalCard = memo(function TripleSignalCard({ signal, anyTriple }) {
           </div>
         ) : (
           <div style={{ fontSize: 12, color: '#475569' }}>
-            {level === 'LOW' ? 'Chưa đến lúc' : 'Đang tính…'}
+            {verdict === 'no_pattern' ? 'AI chưa xác nhận combo hoa đủ mạnh' : level === 'LOW' ? 'Chưa đến lúc' : 'Đang tính…'}
           </div>
+        )}
+        {!aiConfirmed && (
+          <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>Hoa chỉ hiện khi điểm cuối cùng đủ mạnh, không còn bị ưu tiên ép lên top.</div>
         )}
         {level === 'LOW' && (
           <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>Khả năng ra hoa chưa cao, chờ thêm {Math.round((expectedGap - sinceLastTriple))} kỳ</div>
@@ -525,12 +539,12 @@ function NewDrawToast({ info, onDismiss }) {
   if (!info) return null
   return (
     <div style={{
-      position: 'fixed', top: 18, right: 18, zIndex: 9999,
+      position: 'fixed', top: 18, right: 12, left: 12, zIndex: 9999,
       background: 'linear-gradient(135deg,#065f46,#047857)',
       color: '#ecfdf5', borderRadius: 12, padding: '14px 20px',
       boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
       border: '1px solid rgba(52,211,153,0.4)',
-      maxWidth: 320, animation: 'fadeIn 0.3s ease',
+      maxWidth: 320, width: 'min(320px, calc(100vw - 24px))', marginLeft: 'auto', animation: 'fadeIn 0.3s ease',
       cursor: 'pointer',
     }} onClick={onDismiss}>
       <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 4 }}>
@@ -549,6 +563,9 @@ function App() {
   const [sumStats, setSumStats] = useState([])
   const [maxScore, setMaxScore] = useState(1)
   const [history, setHistory] = useState([])
+  // Refs store cheap signatures instead of whole payloads.
+  const predsRef = React.useRef('')
+  const historyRef = React.useRef('')
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -596,19 +613,34 @@ function App() {
         fetch('/predict', { cache: 'no-store' }).then(r => { if (!r.ok) throw new Error(`API ${r.status}`); return r.json() }),
         fetch('/history?limit=500', { cache: 'no-store' }).then(r => r.json()),
       ])
-      setPreds(pRes.next || [])
-      setTripleSignal(pRes.tripleSignal || null)
-      setSumStats(pRes.sumStats || [])
-      setMaxScore(pRes.maxScore || 1)
-      setTotal(pRes.total || 0)
-      setHistory(hRes.records || [])
-      setUpdated(new Date().toLocaleTimeString('vi-VN'))
+      const newPreds = pRes.next || []
+      const newHistory = hRes.records || []
+      const nextPredsSig = predsSignature(newPreds)
+      const nextHistorySig = historySignature(newHistory)
+      const predsChanged = nextPredsSig !== predsRef.current
+      const historyChanged = nextHistorySig !== historyRef.current
+
+      if (predsChanged) {
+        predsRef.current = nextPredsSig
+        setPreds(newPreds)
+        setMaxScore(pRes.maxScore || 1)
+        setTripleSignal(pRes.tripleSignal || null)
+        setSumStats(pRes.sumStats || [])
+      }
+      if (historyChanged) {
+        historyRef.current = nextHistorySig
+        setHistory(newHistory)
+      }
+      if (predsChanged || historyChanged || !silent) {
+        setTotal(pRes.total || 0)
+        setUpdated(new Date().toLocaleTimeString('vi-VN'))
+      }
     } catch (e) {
       setError(e.message)
     } finally {
       if (!silent) setLoading(false)
     }
-  }, [])
+  }, [])  // stable — state comparison uses refs, not closure values
 
   // Use refs so SSE handler always calls latest version of load functions
   const loadRef = React.useRef(load)
@@ -663,7 +695,7 @@ function App() {
 
   // ── Periodic data refresh ──
   // - Skip all fetches when the browser tab is hidden (saves mobile battery + server CPU)
-  // - predict+history: every 30s during operating hours (06:00–21:54 VN), else every 5min
+  // - predict+history: every 60s during operating hours (06:00–21:54 VN), else every 5min
   // - stats+overdue:   every 5 minutes (heavy O(N²) backtest, changes slowly)
   // SSE handles instant updates when a new draw appears; polling is just a safety net.
   useEffect(() => {
@@ -677,8 +709,9 @@ function App() {
     loadOverdue()
     const tFast = setInterval(() => {
       if (document.hidden) return          // tab not visible — skip
+      if (!isOperatingHours()) return      // no new draws outside hours
       load(true)
-    }, 30_000)
+    }, 60_000)
     const tSlow = setInterval(() => {
       if (document.hidden) return          // tab not visible — skip
       if (!isOperatingHours()) return      // no new draws outside hours
@@ -739,6 +772,11 @@ function App() {
         </div>
       </div>
 
+      {/* ―― Disclaimer ―― */}
+      <div style={{ background: 'rgba(15,23,42,0.8)', borderBottom: '1px solid rgba(99,102,241,0.15)', padding: '7px 24px', textAlign: 'center', fontSize: 11, color: '#64748b' }}>
+        ⚠️ Đây là công cụ thống kê giải trí. Bingo18 là xổ số ngẫu nhiên — không có mô hình AI nào có thể dự đoán chính xác kết quả. Chơi có trách nhiệm.
+      </div>
+
       <div style={{ maxWidth: 1120, margin: '0 auto', padding: 'clamp(12px,3vw,28px) clamp(12px,3vw,20px)' }}>
 
         {/* ── Error banner ── */}
@@ -778,7 +816,7 @@ function App() {
                 pat={p.pat} stability={p.stability}
                 zScore={p.zScore} statNorm={p.statNorm ?? p.coreNorm}
                 mk2Norm={p.mk2Norm} sessNorm={p.sessNorm}
-                confidence={p.confidence} />
+                confidence={p.confidence} calBuckets={stats?.calBuckets} />
             ))}
           </div>
         </div>
