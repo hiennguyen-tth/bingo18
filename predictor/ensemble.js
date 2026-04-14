@@ -448,17 +448,20 @@ function modelC(chron, now) {
 // ── S2: Triple streak boost (applied AFTER ensemble) ─────────────────────
 
 /**
- * Returns a conservative multiplier for triple combos.
+ * Graduated overdue multiplier for triple combos.
  *
- * Rules:
- *   - no_pattern      → no boost at all
- *   - weak_pattern    → tiny boost only after clear drought
- *   - pattern_detected→ gentle boost, never dominant
+ * The ensemble score range across all top-10 combos is typically ~0.015–0.025,
+ * so each rank position is worth only ~0.002 in score. This means even a 1%
+ * boost can shift a combo 3–5 rank positions. The slope MUST be very gentle.
  *
- * This keeps triples informational instead of letting them dominate the top-10
- * while the model is still learning on a near-random game.
+ * Design targets (starting from the natural rank of ~7–8 when slightly overdue):
+ *   ratio 1.5–2.0  (54–72 draws)   → top-5 to top-7   (+0.3–0.5%)
+ *   ratio 3.0      (108 draws ~10h) → top-3 to top-5   (+1.0%)
+ *   ratio 5.0+     (180+ draws)     → can reach top-1–2 (+2.0%, capped)
+ *
+ *   formula: min(1.020, 1 + (ratio − 1.0) × 0.005)
  */
-function tripleBoostMult(chron, verdict = 'weak_pattern') {
+function tripleBoostMult(chron) {
   let sinceTriple = 0
   for (let i = chron.length - 1; i >= 0; i--) {
     const pat = chron[i].pattern || classify(chron[i].n1, chron[i].n2, chron[i].n3)
@@ -467,14 +470,8 @@ function tripleBoostMult(chron, verdict = 'weak_pattern') {
   }
   const EXPECTED_GAP = 36     // 1-in-36 draws is a triple
   const ratio = sinceTriple / EXPECTED_GAP
-  if (verdict === 'no_pattern') return 1.0
-  if (ratio <= 1.15) return 1.0
-
-  if (verdict === 'pattern_detected') {
-    return Math.min(1.12, 1 + (ratio - 1.15) * 0.08)
-  }
-
-  return Math.min(1.06, 1 + (ratio - 1.15) * 0.04)
+  if (ratio <= 1.0) return 1.0
+  return Math.min(1.020, 1 + (ratio - 1.0) * 0.005)
 }
 
 // ── ENSEMBLE ──────────────────────────────────────────────────────────────
@@ -516,7 +513,7 @@ function ensembleAll(chron, now) {
   const wD_fixed = hasD ? 0.20 : 0
   // E not used in fixed fallback — requires trained weight to avoid guessing
 
-  const tripleBoost = tripleBoostMult(chron, statRes.verdict)
+  const tripleBoost = tripleBoostMult(chron)
 
   const results = {}
   for (const [a, b, c] of ALL_COMBOS) {
@@ -650,12 +647,12 @@ function predictRanked(data) {
     ? +(tripleGaps.reduce((a, b) => a + b, 0) / tripleGaps.length).toFixed(1)
     : EXPECTED_GAP
 
-  const boostMult = tripleBoostMult(chron, statRes.verdict)
+  const boostMult = tripleBoostMult(chron)
 
-  // Only show triples that both survived top10 selection and are strong enough
-  // on the final score scale. Otherwise the card stays informational only.
+  // Show all triples that made it into top10 — if a triple is here it earned
+  // its place via the overdue boost proportional to kỳ chưa về.
   const hotTriples = top10
-    .filter(r => r.pat === 'triple' && (r.scoreRankPct ?? 0) >= 70)
+    .filter(r => r.pat === 'triple')
     .map(r => r.combo)
 
   const tripleSignal = {

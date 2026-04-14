@@ -82,28 +82,48 @@ function parseBlocks($) {
   return results
 }
 
-/** Fetch and parse the live page — primary source, with fallback + rate limiting. */
+/** Fetch and parse the live page — THREE sources concurrently, merge by ky.
+ *  Sources:
+ *    A) xoso.net.vn HTML live page
+ *    B) xoso.net.vn AJAX endpoint (page 1) — different CDN cache tier, often fresher
+ *    C) xomo.com HTML page — independent source, catches draws A/B miss briefly
+ *
+ *  Cache-busting: appending _t=<timestamp> forces a fresh fetch past CDN edge caches
+ *  that ignore Cache-Control headers.  Merge by ky (lower ky = older; first wins).
+ */
 async function crawl() {
-  // Try primary source first (xoso.net.vn)
-  try {
-    const res = await axios.get(LIVE_URL, { timeout: 10_000, headers: HEADERS })
-    const result = parseBlocks(cheerio.load(res.data))
-    // Rate limit: 300ms delay after successful fetch to respect target site
-    await new Promise(r => setTimeout(r, 300))
-    return result
-  } catch (err) {
-    console.warn(`[crawl] Primary source failed (${err.message}), trying backup...`)
-    // Fallback to xomo.com if primary fails (with shorter wait)
-    try {
-      const res = await axios.get(SOURCES.backup.liveUrl, { timeout: 8_000, headers: HEADERS })
-      const result = parseBlocks(cheerio.load(res.data))
-      await new Promise(r => setTimeout(r, 200))
-      return result
-    } catch (errBackup) {
-      console.error(`[crawl] Backup source also failed: ${errBackup.message}`)
-      return []
-    }
+  const ts = Date.now()
+  const bust = `_t=${ts}`   // CDN cache-buster
+
+  const fetchHtml = (url, timeout, label) =>
+    axios.get(`${url}?${bust}`, { timeout, headers: HEADERS })
+      .then(r => parseBlocks(cheerio.load(r.data)))
+      .catch(err => { console.warn(`[crawl] ${label} failed: ${err.message}`); return [] })
+
+  const fetchAjax = () =>
+    axios.get(MORE_URL, { params: { pageIndex: 1, _t: ts }, timeout: 10_000, headers: HEADERS })
+      .then(r => (r.data && r.data.trim().length > 50 ? parseBlocks(cheerio.load(r.data)) : []))
+      .catch(err => { console.warn(`[crawl] AJAX failed: ${err.message}`); return [] })
+
+  const [primaryRecs, ajaxRecs, backupRecs] = await Promise.all([
+    fetchHtml(LIVE_URL, 10_000, SOURCES.primary.name),
+    fetchAjax(),
+    fetchHtml(SOURCES.backup.liveUrl, 10_000, SOURCES.backup.name),
+  ])
+
+  // Merge: deduplicate by ky — primary HTML first (most complete), then AJAX, then backup
+  const byKy = new Map()
+  for (const r of [...primaryRecs, ...ajaxRecs, ...backupRecs]) {
+    if (!byKy.has(r.ky)) byKy.set(r.ky, r)
   }
+
+  const combined = Array.from(byKy.values())
+  const maxKy = combined.length ? Math.max(...combined.map(r => Number(r.ky))) : '—'
+  console.log(`[crawl] html:${primaryRecs.length} ajax:${ajaxRecs.length} backup:${backupRecs.length} merged:${combined.length} maxKy:${maxKy}`)
+
+  // Polite delay after parallel fetch
+  await new Promise(r => setTimeout(r, 150))
+  return combined
 }
 
 /** Fetch one paginated page of history (pageIndex = 1, 2, 3…). Used by crawlAll().

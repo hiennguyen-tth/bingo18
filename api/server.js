@@ -712,12 +712,12 @@ async function crawlTick() {
 
 // ── Start ──────────────────────────────────────────────────────────────────
 
-// Poll every 60 seconds during operating hours (06:00–21:54 VN).
+// Poll every 30 seconds during operating hours (06:00–21:54 VN).
 // crawlTick() is a no-op outside those hours — saves compute between 21:54 and 06:00.
 // 159 draws/day at ~6-minute intervals (~1 per 6min = ~10 per hour);
-// polling 60s gives very responsive detection (~0.5-1 min lag on average).
-// Rate limiting: respects target site with courteous request spacing.
-const CRAWL_INTERVAL_MS = 60_000          // poll every 60s (balanced for responsiveness + rate limiting)
+// polling 30s gives fast detection (~15s average lag after source posts result).
+// Both sources are queried in parallel so we capture whichever updates first.
+const CRAWL_INTERVAL_MS = 30_000          // poll every 30s — concurrent dual-source
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Bingo AI API  →  http://localhost:${PORT}`)

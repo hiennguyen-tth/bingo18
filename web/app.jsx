@@ -463,11 +463,11 @@ const TripleSignalCard = memo(function TripleSignalCard({ signal, anyTriple }) {
           </div>
         ) : (
           <div style={{ fontSize: 12, color: '#475569' }}>
-            {verdict === 'no_pattern' ? 'AI chưa xác nhận combo hoa đủ mạnh' : level === 'LOW' ? 'Chưa đến lúc' : 'Đang tính…'}
+            {level === 'LOW' ? `Chưa đến lúc (${sinceLastTriple}/${expectedGap} kỳ)` : 'Đang tính…'}
           </div>
         )}
         {!aiConfirmed && (
-          <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>Hoa chỉ hiện khi điểm cuối cùng đủ mạnh, không còn bị ưu tiên ép lên top.</div>
+          <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>Hoa lên top tự nhiên khi kỳ chưa về vượt mức trung bình.</div>
         )}
         {level === 'LOW' && (
           <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>Khả năng ra hoa chưa cao, chờ thêm {Math.round((expectedGap - sinceLastTriple))} kỳ</div>
