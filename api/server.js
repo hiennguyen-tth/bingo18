@@ -1,73 +1,91 @@
 'use strict'
 
-// ── Global safeguards — MUST be first, before any require that could throw ──────
-process.on('uncaughtException', (err) => {
-  console.error('[FATAL] uncaughtException:', err.message, err.stack)
-  process.exit(1)  // exit(1) so Fly/PM2 restarts the container
-})
-process.on('unhandledRejection', (reason) => {
-  console.error('[FATAL] unhandledRejection:', reason)
-  process.exit(1)
-})
+// ── Global safeguards — MUST be first ─────────────────────────────────────
+process.on('uncaughtException',  (err)    => { console.error('[FATAL] uncaughtException:',  err.message, err.stack); process.exit(1) })
+process.on('unhandledRejection', (reason) => { console.error('[FATAL] unhandledRejection:', reason);                 process.exit(1) })
 
 console.log('[startup] loading modules...')
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') })
+
 /**
- * api/server.js
- * Express REST API + Server-Sent Events for real-time push.
- *
- * Crawler runs inside this process every CRAWL_INTERVAL ms.
- * When new draws arrive, all SSE clients get a "new-draw" event
- * and the React dashboard reloads its data automatically.
+ * api/server.js — Bingo18 AI Prediction API
  *
  * Routes:
- *   GET /         → index.html (with ADSENSE_PUBLISHER_ID injected)
- *   GET /events   → SSE stream
- *   GET /predict  → top-10 combo scores + sum distribution
- *   GET /history  → last N records  (?limit=50)
- *   GET /overdue  → overdue stats for triples/pairs/sums
- *   GET /stats    → walk-forward backtest accuracy
- *   POST /crawl   → manual crawl trigger
- *   GET /health   → liveness probe
- *
- * Usage: node api/server.js
+ *   GET  /         → index.html (ADSENSE injected)
+ *   GET  /predict  → top-10 combos            (disk-cached, instant on cold restart)
+ *   GET  /history  → last N draws             (?limit=500)
+ *   GET  /overdue  → overdue stats            (disk-cached, instant on cold restart)
+ *   GET  /stats    → walk-forward backtest    (disk-cached, stale-while-revalidate)
+ *   GET  /events   → SSE stream              (new-draw push)
+ *   POST /crawl    → manual crawl trigger
+ *   GET  /health   → liveness probe
  */
-const express = require('express')
-const cors = require('cors')
-const path = require('path')
-const fs = require('fs-extra')
+
+const express     = require('express')
+const cors        = require('cors')
+const path        = require('path')
+const fs          = require('fs-extra')
 const compression = require('compression')
 
-const predict = require('../predictor/ensemble')
-const frequency = require('../predictor/frequency')
-const features = require('../predictor/features')
+const predict          = require('../predictor/ensemble')
+const frequency        = require('../predictor/frequency')
+const features         = require('../predictor/features')
 const { runStatTests } = require('../predictor/stats_tests')
 const { run: crawlRun } = require('../crawler/crawl')
 
-const app = express()
+const app  = express()
 const PORT = parseInt(process.env.PORT) || 8080
 const ADSENSE_PUBLISHER_ID = process.env.ADSENSE_PUBLISHER_ID || ''
-const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
 
-// Read index.html once at startup; inject ADSENSE_PUBLISHER_ID per request
+const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
+const WEB_DIR      = path.join(__dirname, '../web')
+
+// All three heavy caches persist to disk — instant responses even after cold restart
+const STATS_CACHE_FILE   = path.join(__dirname, '../dataset/stats_cache.json')
+const PREDICT_CACHE_FILE = path.join(__dirname, '../dataset/predict_cache.json')
+const OVERDUE_CACHE_FILE = path.join(__dirname, '../dataset/overdue_cache.json')
+
+// index.html template — read once, ADSENSE injected per request
 const INDEX_TPL = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8')
 
-// ── History file watcher: invalidate cache on ANY external change ────────
-// Belt-and-suspenders: covers manual edits, dedup runs, or missed crawl events.
-// Also broadcasts SSE so clients reload immediately — needed when crawl runs
-// in a separate process (e.g. node crawler/realtime.js in dev).
+// ── In-memory cache ────────────────────────────────────────────────────────
+const apiCache = new Map()  // key → { data, ts }
+
+// ── Disk cache state ───────────────────────────────────────────────────────
+let _statsCache      = null
+let _statsComputing  = false
+let _prewarmRunning  = false
+let _invalidateTimer = null
+
+// ── Load all disk caches at startup in parallel ────────────────────────────
+// predict, overdue, and stats all survive container restarts this way.
+;(async () => {
+  const [stats, pred, over] = await Promise.all([
+    fs.readJSON(STATS_CACHE_FILE).catch(() => null),
+    fs.readJSON(PREDICT_CACHE_FILE).catch(() => null),
+    fs.readJSON(OVERDUE_CACHE_FILE).catch(() => null),
+  ])
+  if (stats) {
+    _statsCache = stats
+    console.log('[stats]   disk cache loaded, computed:', new Date(stats._computedAt || 0).toISOString())
+  } else {
+    console.log('[stats]   no disk cache — will compute after startup')
+    setTimeout(() => _computeStatsBackground(), 3_000)
+  }
+  if (pred) { apiCache.set('predict', pred); console.log('[predict] disk cache loaded, ts:', new Date(pred.ts || 0).toISOString()) }
+  if (over) { apiCache.set('overdue', over); console.log('[overdue] disk cache loaded, ts:', new Date(over.ts || 0).toISOString()) }
+})()
+
+// ── History file watcher — invalidate on external change ──────────────────
 fs.watchFile(HISTORY_FILE, { interval: 3000, persistent: false }, (curr, prev) => {
   if (curr.mtime > prev.mtime) {
     console.log('[cache] history.json changed externally — invalidating + SSE')
     invalidateCache()
-    // Small delay to ensure file write is fully flushed before we broadcast
-    setTimeout(() => {
-      broadcast('new-draw', { added: 0, latestKy: '?', total: 0, ts: new Date().toISOString(), source: 'watcher' })
-    }, 500)
+    setTimeout(() => broadcast('new-draw', { added: 0, latestKy: '?', total: 0, ts: new Date().toISOString(), source: 'watcher' }), 500)
   }
 })
 
-// ── SSE client registry ───────────────────────────────────────────────────
+// ── SSE registry ───────────────────────────────────────────────────────────
 const sseClients = new Set()
 
 function broadcast(eventName, data) {
@@ -77,46 +95,17 @@ function broadcast(eventName, data) {
   }
 }
 
-// ── In-memory cache (invalidated when crawl finds new data) ───────────────
-const apiCache = new Map()  // key → { data, ts }
-
-// ── Persistent stats cache (non-blocking background computation) ──────────
-// Walk-forward backtest takes ~19s synchronously on CPU — instead we compute
-// in background using setImmediate yielding and save result to disk so it
-// survives restarts. Clients always get an instant response (stale-while-revalidate).
-const STATS_CACHE_FILE = path.join(__dirname, '../dataset/stats_cache.json')
-let _statsCache = null      // last computed result (in-memory)
-let _statsComputing = false  // guard: prevent concurrent computes
-let _invalidateTimer = null  // debounce handle for invalidateCache()
-
-  // Load disk cache at startup so first /stats request is instant
-  ; (async () => {
-    try {
-      _statsCache = await fs.readJSON(STATS_CACHE_FILE)
-      console.log('[stats] loaded disk cache, computed:', new Date(_statsCache._computedAt || 0).toISOString())
-    } catch (_) {
-      console.log('[stats] no disk stats cache — will compute after server starts')
-      // Kick off initial compute so data is ready quickly
-      setTimeout(() => _computeStatsBackground(), 3000)
-    }
-  })()
-
+// ── Cache helpers ──────────────────────────────────────────────────────────
 function invalidateCache() {
   apiCache.clear()
-  // Pre-warm predict + overdue immediately (takes ~50ms) so the next HTTP request
-  // finds a hot cache instead of blocking the event loop for 400ms.
-  _prewarmCaches()
-  // Debounce stats: crawlTick() calls invalidateCache(), then fs.watchFile fires
-  // again within ~3s detecting the same write — collapse both into one stats compute.
+  _prewarmCaches()   // recompute predict + overdue immediately (~50ms) and persist to disk
   clearTimeout(_invalidateTimer)
-  _invalidateTimer = setTimeout(() => _computeStatsBackground(), 3_500)
+  _invalidateTimer = setTimeout(() => _computeStatsBackground(), 3_500)  // debounce stats
 }
 
 /**
- * Wraps an async handler with a simple in-memory cache.
- * @param {string}   key    - cache key
- * @param {number}   ttlMs  - hard TTL (safety net); 0 = rely on invalidation only
- * @param {Function} fn     - async (req) => data to cache
+ * Wrap a route with in-memory cache + ETag.
+ * predict/overdue are always pre-warmed so cold misses should never occur in practice.
  */
 function withCache(key, ttlMs, fn) {
   return async (req, res) => {
@@ -144,11 +133,175 @@ function withCache(key, ttlMs, fn) {
   }
 }
 
+// ── Pure compute functions (no I/O) ───────────────────────────────────────
+// Single source of truth — used by both route handlers and _prewarmCaches().
+
+/** Build /predict response payload from history array (newest-first). */
+function buildPredictPayload(data) {
+  if (data.length < 2) {
+    return { next: [], sumStats: [], total: data.length, message: 'Not enough data — run: node crawler/crawl.js' }
+  }
+  const { top10, tripleSignal, effectiveWeights } = predict.ranked(data)
+  const top10Total  = top10.reduce((s, r) => s + r.score, 0) || 1
+  const maxScore    = top10[0]?.score || 1
+  const minScore    = top10[top10.length - 1]?.score || 0
+  const scoreSpread = maxScore - minScore || 1
+
+  const next = top10.map(r => ({
+    combo:        r.combo,
+    score:        +r.score.toFixed(3),
+    pct:          +(r.score / top10Total * 100).toFixed(1),
+    confidence:   Math.round(35 + ((r.score - minScore) / scoreSpread) * 45),
+    overdueRatio: r.overdueRatio != null ? +r.overdueRatio.toFixed(2) : null,
+    comboGap:     r.comboGap,
+    sumOD:        +(r.sumOD ?? 0).toFixed(2),
+    pat:          r.pat,
+    stability:    r.stability != null ? +r.stability.toFixed(2) : null,
+    zScore:       r.zScore != null ? +r.zScore.toFixed(2) : null,
+    statNorm:     r.statNorm ?? 0,
+    mk2Norm:      r.mk2Norm ?? 0,
+    sessNorm:     r.sessNorm ?? 0,
+    mlNorm:       r.mlNorm ?? 0,
+    coreNorm:     r.coreNorm ?? 0,  // legacy compat
+    chiNorm:      0,
+  }))
+
+  const sumBucket = {}
+  for (const d of data) sumBucket[d.sum] = (sumBucket[d.sum] || 0) + 1
+  const sumStats = Object.entries(sumBucket)
+    .map(([sum, cnt]) => ({ sum: +sum, pct: +(cnt / data.length * 100).toFixed(2) }))
+    .sort((a, b) => b.pct - a.pct)
+
+  return { next, tripleSignal, modelContrib: effectiveWeights, sumStats, total: data.length, maxScore: +maxScore.toFixed(3) }
+}
+
+/** Build /overdue response payload from history array (newest-first). */
+function buildOverduePayload(data) {
+  if (data.length === 0) return { triples: [], pairs: [], sums: [] }
+
+  const chron = [...data].reverse()  // chronological for interval calc
+  const N     = chron.length
+
+  function computeStats(keyFn, labelFn) {
+    const lastSeen = {}, counts = {}, gaps = {}
+    chron.forEach((r, i) => {
+      const raw  = keyFn(r)
+      const keys = Array.isArray(raw) ? raw : (raw ? [raw] : [])
+      for (const key of keys) {
+        counts[key] = (counts[key] || 0) + 1
+        if (lastSeen[key] !== undefined) (gaps[key] ??= []).push(i - lastSeen[key])
+        lastSeen[key] = i
+      }
+    })
+    return Object.keys(counts).map(key => {
+      const kySince = lastSeen[key] !== undefined ? (N - 1 - lastSeen[key]) : N
+      const avgGap  = gaps[key]?.length
+        ? +(gaps[key].reduce((a, b) => a + b, 0) / gaps[key].length).toFixed(1)
+        : N
+      return { key, label: labelFn ? labelFn(key) : key, appeared: counts[key], kySinceLast: kySince, avgInterval: avgGap, overdueScore: +(kySince / (avgGap || 1)).toFixed(2) }
+    }).sort((a, b) => b.overdueScore - a.overdueScore)
+  }
+
+  // Triples (1-1-1 to 6-6-6)
+  const TRIPLES   = ['1-1-1', '2-2-2', '3-3-3', '4-4-4', '5-5-5', '6-6-6']
+  const tripleRaw = computeStats(
+    r => { const k = `${r.n1}-${r.n2}-${r.n3}`; return TRIPLES.includes(k) ? k : null },
+    k => k.replace(/-/g, '')
+  )
+  const tripleKeys = new Set(tripleRaw.map(t => t.key))
+  const triples = [
+    ...tripleRaw,
+    ...TRIPLES.filter(k => !tripleKeys.has(k)).map(k => ({ key: k, label: k.replace(/-/g, ''), appeared: 0, kySinceLast: N, avgInterval: N, overdueScore: 1 })),
+  ].sort((a, b) => b.overdueScore - a.overdueScore)
+
+  // Any-triple aggregate
+  let lastTripleIdx = -1
+  const anyTripleGaps = []
+  chron.forEach((r, i) => {
+    if (r.pattern === 'triple' || (r.n1 === r.n2 && r.n2 === r.n3)) {
+      if (lastTripleIdx >= 0) anyTripleGaps.push(i - lastTripleIdx)
+      lastTripleIdx = i
+    }
+  })
+  const sinceAnyTriple  = lastTripleIdx >= 0 ? N - 1 - lastTripleIdx : N
+  const avgAnyTripleGap = anyTripleGaps.length
+    ? +(anyTripleGaps.reduce((a, b) => a + b, 0) / anyTripleGaps.length).toFixed(1)
+    : 36
+  const anyTriple = {
+    key: 'any-triple', label: 'XXX',
+    appeared:    triples.reduce((s, t) => s + t.appeared, 0),
+    kySinceLast: sinceAnyTriple,
+    avgInterval: avgAnyTripleGap,
+    overdueScore: +(sinceAnyTriple / (avgAnyTripleGap || 36)).toFixed(2),
+  }
+
+  // Pairs (11, 22, 33, 44, 55, 66)
+  const pairRaw = computeStats(
+    r => {
+      if (r.n1 === r.n2 || r.n1 === r.n3) return `pair-${r.n1}`
+      if (r.n2 === r.n3) return `pair-${r.n2}`
+      return null
+    },
+    k => { const v = k.replace('pair-', ''); return `${v}${v}` }
+  )
+  const pairKeys = new Set(pairRaw.map(p => p.key))
+  const pairs = [
+    ...pairRaw,
+    ...[1, 2, 3, 4, 5, 6].filter(v => !pairKeys.has(`pair-${v}`)).map(v => ({ key: `pair-${v}`, label: `${v}${v}`, appeared: 0, kySinceLast: N, avgInterval: N, overdueScore: 1 })),
+  ].sort((a, b) => b.overdueScore - a.overdueScore)
+
+  // Sums (3-18)
+  const sumRaw  = computeStats(r => `sum-${r.sum}`, k => k.replace('sum-', ''))
+  const sumKeys = new Set(sumRaw.map(s => s.key))
+  const sums = [
+    ...sumRaw,
+    ...Array.from({ length: 16 }, (_, i) => `sum-${i + 3}`)
+      .filter(k => !sumKeys.has(k))
+      .map(k => ({ key: k, label: k.replace('sum-', ''), appeared: 0, kySinceLast: N, avgInterval: N, overdueScore: 1 })),
+  ].sort((a, b) => b.overdueScore - a.overdueScore)
+
+  return { total: N, triples, anyTriple, pairs, sums }
+}
+
+// ── Background tasks ───────────────────────────────────────────────────────
+
 /**
- * Walk-forward backtest in background — never blocks the event loop.
- * Uses setImmediate between batches so health/predict/SSE always respond.
- * Samples every SAMPLE_EVERY draw (default 3) for 3× speedup; results still
- * statistically representative. Saves result to disk for restart persistence.
+ * Pre-warm /predict and /overdue — runs in ~50ms.
+ * Result goes to in-memory cache AND disk so cold restarts are also instant.
+ * Called immediately on invalidateCache() and once at startup.
+ */
+async function _prewarmCaches() {
+  if (_prewarmRunning) return
+  _prewarmRunning = true
+  const t0 = Date.now()
+  try {
+    const data = await loadHistory()
+    if (data.length < 2) return
+
+    const ts        = Date.now()
+    const predictPl = buildPredictPayload(data)
+    const overduePl = buildOverduePayload(data)
+
+    apiCache.set('predict', { data: predictPl, ts })
+    apiCache.set('overdue', { data: overduePl, ts })
+
+    // Persist to disk in parallel (non-blocking)
+    await Promise.all([
+      fs.writeJSON(PREDICT_CACHE_FILE, { data: predictPl, ts }),
+      fs.writeJSON(OVERDUE_CACHE_FILE, { data: overduePl, ts }),
+    ])
+    console.log(`[prewarm] predict + overdue cached + persisted in ${Date.now() - t0}ms`)
+  } catch (err) {
+    console.error('[prewarm]', err.message)
+  } finally {
+    _prewarmRunning = false
+  }
+}
+
+/**
+ * Walk-forward backtest — never blocks event loop (yields with setImmediate).
+ * SAMPLE_EVERY=3 gives 3x speedup; results still statistically representative.
+ * Persisted to disk for restart continuity; serves stale while recomputing.
  */
 async function _computeStatsBackground() {
   if (_statsComputing) return
@@ -156,7 +309,7 @@ async function _computeStatsBackground() {
   const t0 = Date.now()
   console.log('[stats] background backtest starting...')
   try {
-    const data = await loadHistory()
+    const data   = await loadHistory()
     const WINDOW = 10
     if (data.length < WINDOW + 2) {
       _statsCache = { message: 'Need more data', total: data.length, needed: WINDOW + 2, _computedAt: Date.now() }
@@ -164,69 +317,65 @@ async function _computeStatsBackground() {
       return
     }
 
-    const chron = [...data].reverse()
-    const N = chron.length
+    const chron    = [...data].reverse()
+    const N        = chron.length
     const trainEnd = Math.floor(N * 0.6)
     const validEnd = Math.floor(N * 0.8)
 
     let top1 = 0, top3 = 0, top10 = 0, tested = 0
     const rankHits = new Array(10).fill(0)
     const seg = {
-      train: { top1: 0, top3: 0, top10: 0, tested: 0 },
-      valid: { top1: 0, top3: 0, top10: 0, tested: 0 },
+      train:   { top1: 0, top3: 0, top10: 0, tested: 0 },
+      valid:   { top1: 0, top3: 0, top10: 0, tested: 0 },
       forward: { top1: 0, top3: 0, top10: 0, tested: 0 },
     }
 
-    // Yield every YIELD_EVERY iterations so health check + SSE stay responsive.
-    // SAMPLE_EVERY=3 → test every 3rd draw (~3× faster, still unbiased estimate).
-    const YIELD_EVERY = 10
+    const YIELD_EVERY  = 10
     const SAMPLE_EVERY = 3
     let batchCount = 0
 
     for (let i = WINDOW; i < N; i += SAMPLE_EVERY) {
-      if (batchCount++ % YIELD_EVERY === 0) {
-        await new Promise(resolve => setImmediate(resolve))
-      }
+      if (batchCount++ % YIELD_EVERY === 0) await new Promise(resolve => setImmediate(resolve))
       const slice = chron.slice(0, i)
       const { top10: tp } = predict.ranked(slice)
       if (!tp || tp.length === 0) continue
 
       const actual = `${chron[i].n1}-${chron[i].n2}-${chron[i].n3}`
       const combos = tp.map(r => r.combo)
-      const hit1 = combos[0] === actual
-      const hit3 = combos.slice(0, 3).some(c => c === actual)
-      const hit10 = combos.some(c => c === actual)
+      const hit1   = combos[0] === actual
+      const hit3   = combos.slice(0, 3).some(c => c === actual)
+      const hit10  = combos.some(c => c === actual)
 
       for (let r = 0; r < Math.min(tp.length, 10); r++) {
         if (tp[r].combo === actual) { rankHits[r]++; break }
       }
-      if (hit1) top1++
-      if (hit3) top3++
+      if (hit1)  top1++
+      if (hit3)  top3++
       if (hit10) top10++
       tested++
 
       const segKey = i < trainEnd ? 'train' : i < validEnd ? 'valid' : 'forward'
       seg[segKey].tested++
-      if (hit1) seg[segKey].top1++
-      if (hit3) seg[segKey].top3++
+      if (hit1)  seg[segKey].top1++
+      if (hit3)  seg[segKey].top3++
       if (hit10) seg[segKey].top10++
     }
 
-    const baseline = { top1: +(1 / 216 * 100).toFixed(2), top3: +(3 / 216 * 100).toFixed(2), top10: +(10 / 216 * 100).toFixed(2) }
+    const baseline = { top1: +(1/216*100).toFixed(2), top3: +(3/216*100).toFixed(2), top10: +(10/216*100).toFixed(2) }
 
     function _normCDF(z) {
-      const t = 1 / (1 + 0.2316419 * Math.abs(z))
+      const t  = 1 / (1 + 0.2316419 * Math.abs(z))
       const d2 = 0.3989423 * Math.exp(-z * z / 2)
-      const p = d2 * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))))
+      const p  = d2 * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))))
       return z > 0 ? 1 - p : p
     }
-    const p_hat10 = tested > 0 ? top10 / tested : 0
-    const p_base10 = 10 / 216
-    const se_test = Math.sqrt(p_base10 * (1 - p_base10) / Math.max(tested, 1))
-    const z_vs_base = (p_hat10 - p_base10) / (se_test || 1)
+    const p_hat10          = tested > 0 ? top10 / tested : 0
+    const p_base10         = 10 / 216
+    const se_test          = Math.sqrt(p_base10 * (1 - p_base10) / Math.max(tested, 1))
+    const z_vs_base        = (p_hat10 - p_base10) / (se_test || 1)
     const pValueVsBaseline = +(2 * (1 - _normCDF(Math.abs(z_vs_base)))).toFixed(4)
-    const se_ci = Math.sqrt(p_hat10 * (1 - p_hat10) / Math.max(tested, 1))
-    const ci95 = {
+    const se_ci            = Math.sqrt(p_hat10 * (1 - p_hat10) / Math.max(tested, 1))
+    const ci95             = {
       lower: +(Math.max(0, p_hat10 - 1.96 * se_ci) * 100).toFixed(2),
       upper: +((p_hat10 + 1.96 * se_ci) * 100).toFixed(2),
     }
@@ -234,18 +383,18 @@ async function _computeStatsBackground() {
     const segments = {}
     for (const [name, s] of Object.entries(seg)) {
       const t = s.tested
-      segments[name] = { tested: t, top1: t ? +(s.top1 / t * 100).toFixed(2) : 0, top3: t ? +(s.top3 / t * 100).toFixed(2) : 0, top10: t ? +(s.top10 / t * 100).toFixed(2) : 0 }
+      segments[name] = { tested: t, top1: t ? +(s.top1/t*100).toFixed(2) : 0, top3: t ? +(s.top3/t*100).toFixed(2) : 0, top10: t ? +(s.top10/t*100).toFixed(2) : 0 }
     }
 
-    const statTests = runStatTests(chron)
+    const statTests  = runStatTests(chron)
     const calBuckets = tested > 0 ? rankHits.map((h, i) => ({ rank: i + 1, hitPct: +(h / tested * 100).toFixed(3) })) : []
 
     _statsCache = {
       tested, total: N,
       accuracy: {
-        top1: tested ? +(top1 / tested * 100).toFixed(2) : 0,
-        top3: tested ? +(top3 / tested * 100).toFixed(2) : 0,
-        top10: tested ? +(top10 / tested * 100).toFixed(2) : 0,
+        top1:  tested ? +(top1/tested*100).toFixed(2)  : 0,
+        top3:  tested ? +(top3/tested*100).toFixed(2)  : 0,
+        top10: tested ? +(top10/tested*100).toFixed(2) : 0,
         top10CI95: ci95,
         top10PValueVsBaseline: pValueVsBaseline,
         top10SignificantVsBaseline: pValueVsBaseline < 0.05,
@@ -264,114 +413,17 @@ async function _computeStatsBackground() {
   }
 }
 
-/**
- * Pre-warm /predict and /overdue caches in the background.
- * Called at startup and after invalidateCache() (debounced) so the first
- * HTTP request to either endpoint after a new draw is always cache-HIT (<5ms)
- * instead of a cold-miss that blocks the event loop for 200–400ms.
- */
-let _prewarmRunning = false
-async function _prewarmCaches() {
-  if (_prewarmRunning) return
-  _prewarmRunning = true
-  const t0 = Date.now()
-  try {
-    const data = await loadHistory()
-    if (data.length < 2) return
-
-    // ── Pre-warm /predict ──────────────────────────────────────────────
-    const { top10, tripleSignal, effectiveWeights } = predict.ranked(data)
-    const top10Total = top10.reduce((s, r) => s + r.score, 0) || 1
-    const maxScore = top10[0]?.score || 1
-    const minScore = top10[top10.length - 1]?.score || 0
-    const scoreSpread = maxScore - minScore || 1
-    const next = top10.map(r => ({
-      combo: r.combo,
-      score: +r.score.toFixed(3),
-      pct: +(r.score / top10Total * 100).toFixed(1),
-      confidence: Math.round(35 + ((r.score - minScore) / scoreSpread) * 45),
-      overdueRatio: r.overdueRatio != null ? +r.overdueRatio.toFixed(2) : null,
-      comboGap: r.comboGap,
-      sumOD: +(r.sumOD ?? 0).toFixed(2),
-      pat: r.pat,
-      stability: r.stability != null ? +r.stability.toFixed(2) : null,
-      zScore: r.zScore != null ? +r.zScore.toFixed(2) : null,
-      statNorm: r.statNorm ?? 0,
-      mk2Norm: r.mk2Norm ?? 0,
-      sessNorm: r.sessNorm ?? 0,
-      mlNorm: r.mlNorm ?? 0,
-      coreNorm: r.coreNorm ?? 0,
-      chiNorm: 0,
-    }))
-    const sumBucket = {}
-    for (const d of data) sumBucket[d.sum] = (sumBucket[d.sum] || 0) + 1
-    const sumStats = Object.entries(sumBucket)
-      .map(([sum, cnt]) => ({ sum: +sum, pct: +(cnt / data.length * 100).toFixed(2) }))
-      .sort((a, b) => b.pct - a.pct)
-    apiCache.set('predict', {
-      data: { next, tripleSignal, modelContrib: effectiveWeights, sumStats, total: data.length, maxScore: +maxScore.toFixed(3) },
-      ts: Date.now(),
-    })
-
-    // ── Pre-warm /overdue ──────────────────────────────────────────────
-    // (reuse the same data array, no extra file read)
-    const chron = [...data].reverse()
-    const N = chron.length
-    function computeStats(keyFn, labelFn) {
-      const lastSeen = {}, counts = {}, gaps = {}
-      chron.forEach((r, i) => {
-        const k = keyFn(r)
-        const ks = Array.isArray(k) ? k : [k]
-        ks.forEach(key => {
-          counts[key] = (counts[key] || 0) + 1
-          if (lastSeen[key] !== undefined) { if (!gaps[key]) gaps[key] = []; gaps[key].push(i - lastSeen[key]) }
-          lastSeen[key] = i
-        })
-      })
-      return Object.keys(counts).map(key => {
-        const appeared = counts[key]
-        const kySince = lastSeen[key] !== undefined ? (N - 1 - lastSeen[key]) : N
-        const avgGap = gaps[key]?.length ? +(gaps[key].reduce((a, b) => a + b, 0) / gaps[key].length).toFixed(1) : N
-        return { key, label: labelFn ? labelFn(key) : key, appeared, kySinceLast: kySince, avgInterval: avgGap, overdueScore: +(kySince / (avgGap || 1)).toFixed(2) }
-      }).sort((a, b) => b.overdueScore - a.overdueScore)
-    }
-    const TRIPLES = ['1-1-1', '2-2-2', '3-3-3', '4-4-4', '5-5-5', '6-6-6']
-    const tripleStats = computeStats(r => { const k = `${r.n1}-${r.n2}-${r.n3}`; return TRIPLES.includes(k) ? [k] : [] }, k => k.replace(/-/g, ''))
-    const tripleKeys = new Set(tripleStats.map(t => t.key))
-    const tripleResult = [...tripleStats, ...TRIPLES.filter(k => !tripleKeys.has(k)).map(k => ({ key: k, label: k.replace(/-/g, ''), appeared: 0, kySinceLast: N, avgInterval: N, overdueScore: 1 }))].sort((a, b) => b.overdueScore - a.overdueScore)
-    let lastTripleIdx = -1; const anyTripleGaps = []
-    chron.forEach((r, i) => { const pat = r.pattern || (r.n1 === r.n2 && r.n2 === r.n3 ? 'triple' : 'other'); if (pat === 'triple') { if (lastTripleIdx >= 0) anyTripleGaps.push(i - lastTripleIdx); lastTripleIdx = i } })
-    const sinceAnyTriple = lastTripleIdx >= 0 ? N - 1 - lastTripleIdx : N
-    const avgAnyTripleGap = anyTripleGaps.length ? +(anyTripleGaps.reduce((a, b) => a + b, 0) / anyTripleGaps.length).toFixed(1) : 36
-    const anyTriple = { key: 'any-triple', label: 'XXX', appeared: tripleResult.reduce((s, t) => s + t.appeared, 0), kySinceLast: sinceAnyTriple, avgInterval: avgAnyTripleGap, overdueScore: +(sinceAnyTriple / (avgAnyTripleGap || 36)).toFixed(2) }
-    const pairStats = computeStats(r => { if (r.n1 === r.n2 || r.n1 === r.n3) return [`pair-${r.n1}`]; if (r.n2 === r.n3) return [`pair-${r.n2}`]; return [] }, k => { const v = k.replace('pair-', ''); return `${v}${v}` })
-    const pairKeys = new Set(pairStats.map(p => p.key))
-    const pairResult = [...pairStats, ...[1,2,3,4,5,6].filter(v => !pairKeys.has(`pair-${v}`)).map(v => ({ key: `pair-${v}`, label: `${v}${v}`, appeared: 0, kySinceLast: N, avgInterval: N, overdueScore: 1 }))].sort((a, b) => b.overdueScore - a.overdueScore)
-    const sumStats2 = computeStats(r => [`sum-${r.sum}`], k => k.replace('sum-', ''))
-    const sumKeys = new Set(sumStats2.map(s => s.key))
-    const sumResult = [...sumStats2, ...Array.from({ length: 16 }, (_, i) => `sum-${i + 3}`).filter(k => !sumKeys.has(k)).map(k => ({ key: k, label: k.replace('sum-', ''), appeared: 0, kySinceLast: N, avgInterval: N, overdueScore: 1 }))].sort((a, b) => b.overdueScore - a.overdueScore)
-    apiCache.set('overdue', { data: { total: N, triples: tripleResult, anyTriple, pairs: pairResult, sums: sumResult }, ts: Date.now() })
-
-    console.log(`[prewarm] predict + overdue cached in ${Date.now() - t0}ms`)
-  } catch (err) {
-    console.error('[prewarm]', err.message)
-  } finally {
-    _prewarmRunning = false
-  }
-}
-
 // ── Middleware ─────────────────────────────────────────────────────────────
-// Skip compression for SSE — gzip buffering breaks real-time streaming
-app.use(compression({
-  filter: (req, res) => {
-    if (req.path === '/events') return false
-    return compression.filter(req, res)
-  }
-}))
+app.use(compression({ filter: (req, res) => req.path !== '/events' && compression.filter(req, res) }))
 app.use(cors())
 app.use(express.json())
 
-// Inject ADSENSE placeholders and return the processed HTML
+// ── Helpers ────────────────────────────────────────────────────────────────
+async function loadHistory() {
+  const data = await fs.readJSON(HISTORY_FILE).catch(() => [])
+  return Array.isArray(data) && data.length > 0 ? data : []
+}
+
 function renderIndex() {
   const adScript = ADSENSE_PUBLISHER_ID
     ? `<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${ADSENSE_PUBLISHER_ID}" crossorigin="anonymous"></script>`
@@ -381,209 +433,100 @@ function renderIndex() {
     .replace('{{ADSENSE_SCRIPT}}', adScript)
 }
 
-// Serve index.html with placeholders injected — covers both / and /index.html
-// Must come BEFORE express.static so static never serves the raw template
+// ── Static / SEO pages ─────────────────────────────────────────────────────
 app.get(['/', '/index.html'], (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8')
   res.send(renderIndex())
 })
 
-// ── SEO / Content pages — clean URL routes ────────────────────────────────
-const WEB_DIR = path.join(__dirname, '../web')
-
-app.get('/about', (_req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8')
-  res.sendFile(path.join(WEB_DIR, 'about.html'))
-})
-
-app.get('/how-it-works', (_req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8')
-  res.sendFile(path.join(WEB_DIR, 'how-it-works.html'))
-})
-
-app.get('/blog/what-is-bingo18', (_req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8')
-  res.sendFile(path.join(WEB_DIR, 'blog/what-is-bingo18.html'))
-})
-
-app.get('/blog/best-strategy-2026', (_req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8')
-  res.sendFile(path.join(WEB_DIR, 'blog/best-strategy-2026.html'))
-})
-
-app.get('/privacy-policy', (_req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8')
-  res.sendFile(path.join(WEB_DIR, 'privacy-policy.html'))
-})
-
-app.get('/sitemap.xml', (_req, res) => {
-  res.setHeader('Content-Type', 'application/xml; charset=utf-8')
-  res.sendFile(path.join(WEB_DIR, 'sitemap.xml'))
-})
-
-app.get('/ads.txt', (_req, res) => {
-  res.setHeader('Content-Type', 'text/plain; charset=utf-8')
-  res.sendFile(path.join(WEB_DIR, 'ads.txt'))
-})
-
-// Static assets (app.jsx, heatmap.jsx, css…) — index.html excluded above
-app.use(express.static(path.join(__dirname, '../web'), { index: false }))
-
-// ── Helper ─────────────────────────────────────────────────────────────────
-async function loadHistory() {
-  const data = await fs.readJSON(HISTORY_FILE).catch(() => [])
-  // Guard against corruption: must be a non-empty array of draw objects
-  if (!Array.isArray(data) || data.length === 0) return []
-  return data
+const _staticPages = {
+  '/about':                   'about.html',
+  '/how-it-works':            'how-it-works.html',
+  '/blog/what-is-bingo18':    'blog/what-is-bingo18.html',
+  '/blog/best-strategy-2026': 'blog/best-strategy-2026.html',
+  '/privacy-policy':          'privacy-policy.html',
 }
+for (const [route, file] of Object.entries(_staticPages)) {
+  app.get(route, (_req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8')
+    res.sendFile(path.join(WEB_DIR, file))
+  })
+}
+app.get('/sitemap.xml', (_req, res) => { res.setHeader('Content-Type', 'application/xml; charset=utf-8'); res.sendFile(path.join(WEB_DIR, 'sitemap.xml')) })
+app.get('/ads.txt',     (_req, res) => { res.setHeader('Content-Type', 'text/plain; charset=utf-8');      res.sendFile(path.join(WEB_DIR, 'ads.txt')) })
 
-// ── Routes ─────────────────────────────────────────────────────────────────
+// Static assets (app.js, heatmap.js, etc.) — index.html excluded above
+app.use(express.static(WEB_DIR, { index: false }))
 
-/** GET /predict — ensemble prediction scores + sum distribution */
-app.get('/predict', withCache('predict', 5 * 60_000, async () => {
-  const data = await loadHistory()
+// ── API Routes ─────────────────────────────────────────────────────────────
 
-  if (data.length < 2) {
-    return {
-      next: [],
-      sumStats: [],
-      total: data.length,
-      message: 'Not enough data — run: node crawler/crawl.js',
-    }
-  }
+/** GET /predict — top-10 ensemble predictions (disk-persisted, always warm) */
+app.get('/predict', withCache('predict', 5 * 60_000,
+  async () => buildPredictPayload(await loadHistory())
+))
 
-  // Ranked predictions with full breakdown
-  const { top10, tripleSignal, effectiveWeights } = predict.ranked(data)
+/** GET /overdue — overdue stats for triples/pairs/sums (disk-persisted, always warm) */
+app.get('/overdue', withCache('overdue', 5 * 60_000,
+  async () => buildOverduePayload(await loadHistory())
+))
 
-  // pct = share within top-10 so they sum to 100%
-  const top10Total = top10.reduce((s, r) => s + r.score, 0) || 1
-  const maxScore = top10[0]?.score || 1
-  const minScore = top10[top10.length - 1]?.score || 0
-  const scoreSpread = maxScore - minScore || 1
-
-  const next = top10.map(r => ({
-    combo: r.combo,
-    score: +r.score.toFixed(3),
-    // pct = share of top-10 total score (uncapped — display as-is)
-    pct: +(r.score / top10Total * 100).toFixed(1),
-    // confidence = calibrated [35–80%] based on score spread within top-10
-    // Rank 1 → ~78%, Rank 10 → ~35%; varies meaningfully by model strength
-    confidence: Math.round(35 + ((r.score - minScore) / scoreSpread) * 45),
-    overdueRatio: r.overdueRatio != null ? +r.overdueRatio.toFixed(2) : null,
-    comboGap: r.comboGap,
-    sumOD: +(r.sumOD ?? 0).toFixed(2),
-    pat: r.pat,
-    stability: r.stability != null ? +r.stability.toFixed(2) : null,
-    // 4-model breakdown (v5)
-    zScore: r.zScore != null ? +r.zScore.toFixed(2) : null,
-    statNorm: r.statNorm ?? 0,
-    mk2Norm: r.mk2Norm ?? 0,
-    sessNorm: r.sessNorm ?? 0,
-    mlNorm: r.mlNorm ?? 0,
-    // legacy compat
-    coreNorm: r.coreNorm ?? 0,
-    chiNorm: 0,
-  }))
-
-  // Sum distribution
-  const sumBucket = {}
-  for (const d of data) sumBucket[d.sum] = (sumBucket[d.sum] || 0) + 1
-  const sumStats = Object.entries(sumBucket)
-    .map(([sum, cnt]) => ({ sum: +sum, pct: +(cnt / data.length * 100).toFixed(2) }))
-    .sort((a, b) => b.pct - a.pct)
-
-  return { next, tripleSignal, modelContrib: effectiveWeights, sumStats, total: data.length, maxScore: +maxScore.toFixed(3) }
-}))
-
-/** GET /ml-status — Model D (k-NN) readiness + dataset stats */
-app.get('/ml-status', async (_req, res) => {
-  try {
-    const data = await loadHistory()
-    const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
-    const N = chron.length
-    // Model D needs WINDOW(8) + K_MIN(15) + 1 = 24 draws minimum
-    const ML_MIN = 24
-    res.json({
-      modelD: {
-        name: 'k-NN Temporal Similarity',
-        active: N >= ML_MIN,
-        records: N,
-        minRequired: ML_MIN,
-        kNeighbors: Math.min(60, Math.max(15, Math.floor((N - 9) * 0.05))),
-        window: 8,
-      },
-      pythonGBM: {
-        name: 'Gradient Boosting (offline)',
-        script: 'python python/ml_predictor.py',
-        note: 'Run locally to generate python/ml_output.json for hybrid scoring',
-      },
-    })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-/** GET /history — raw records (?limit=50), newest first */
+/** GET /history — raw draws, newest first (?limit=500) */
 app.get('/history', async (req, res) => {
   try {
-    const data = await loadHistory()
+    const data  = await loadHistory()
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 500)
-
-    // ETag: fingerprint from total count + newest draw id (cheap, no hashing)
-    const etag = `"${data.length}-${data[0]?.ky || '0'}"`
-    res.set('Cache-Control', 'no-cache')  // store but validate before reuse
+    const etag  = `"${data.length}-${data[0]?.ky || '0'}"`
+    res.set('Cache-Control', 'no-cache')
     res.set('ETag', etag)
-    if (req.headers['if-none-match'] === etag) {
-      return res.status(304).end()
-    }
-
+    if (req.headers['if-none-match'] === etag) return res.status(304).end()
     res.json({ records: data.slice(0, limit), total: data.length })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
 })
 
-/** GET /frequency — sorted combo hit-count table */
-app.get('/frequency', withCache('frequency', 5 * 60_000, async () => {
-  const data = await loadHistory()
-  if (data.length === 0) return { freq: {}, total: 0 }
-
-  const freq = frequency(data)
-  const sorted = Object.entries(freq)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 30)
-
-  return { freq: Object.fromEntries(sorted), total: data.length }
-}))
-
 /**
- * GET /stats — walk-forward backtest accuracy + statistical reality check.
- *
- * Stale-while-revalidate: always responds instantly from _statsCache.
- * Background recompute runs via _computeStatsBackground() (non-blocking).
- * Result is persisted to dataset/stats_cache.json so it survives restarts.
+ * GET /stats — walk-forward backtest (stale-while-revalidate).
+ * Always responds instantly from disk/memory cache.
+ * Background recompute fires after each new draw (debounced 3.5s).
  */
 app.get('/stats', (req, res) => {
   if (_statsCache) {
-    const ts = _statsCache._computedAt || 0
+    const ts   = _statsCache._computedAt || 0
     const etag = `"${ts}"`
     res.set('ETag', etag)
     res.set('Last-Modified', new Date(ts).toUTCString())
     res.set('X-Cache', _statsComputing ? 'STALE' : 'HIT')
     res.set('X-Stats-Computing', _statsComputing ? '1' : '0')
-    // 304 only when not mid-recompute (stale data still valid, just serve it)
     if (req.headers['if-none-match'] === etag && !_statsComputing) return res.status(304).end()
-    // Trigger fresh compute if cache is older than 15 minutes
-    if (!_statsComputing) {
-      const age = Date.now() - ts
-      if (age > 15 * 60_000) _computeStatsBackground()
-    }
+    if (!_statsComputing && Date.now() - ts > 15 * 60_000) _computeStatsBackground()
     return res.json(_statsCache)
   }
-  // No cache yet: return "computing" status and trigger compute
   if (!_statsComputing) _computeStatsBackground()
   res.set('X-Cache', 'MISS')
-  res.json({ computing: true, message: 'Đang tính toán lần đầu, vui lòng thử lại sau 30 giây…', total: 0 })
+  res.json({ computing: true, message: 'Dang tinh toan lan dau, vui long thu lai sau 30 giay...', total: 0 })
+})
+
+/** GET /frequency — top-30 combo frequency table */
+app.get('/frequency', withCache('frequency', 5 * 60_000, async () => {
+  const data = await loadHistory()
+  if (data.length === 0) return { freq: {}, total: 0 }
+  const freq   = frequency(data)
+  const sorted = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 30)
+  return { freq: Object.fromEntries(sorted), total: data.length }
+}))
+
+/** GET /ml-status — model readiness info */
+app.get('/ml-status', async (_req, res) => {
+  try {
+    const data   = await loadHistory()
+    const N      = data.length
+    const ML_MIN = 24
+    res.json({
+      modelD: { name: 'k-NN Temporal Similarity', active: N >= ML_MIN, records: N, minRequired: ML_MIN, kNeighbors: Math.min(60, Math.max(15, Math.floor((N - 9) * 0.05))), window: 8 },
+      pythonGBM: { name: 'Gradient Boosting (offline)', script: 'python python/ml_predictor.py', note: 'Run locally to generate python/ml_output.json' },
+    })
+  } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
 /** GET /features — last 20 feature vectors */
@@ -592,308 +535,102 @@ app.get('/features', async (req, res) => {
     const data = await loadHistory()
     const feat = features(data)
     res.json({ features: feat.slice(-20), total: feat.length })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+  } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-/**
- * GET /overdue — overdue statistics for triples, pairs, and sums (cached)
- */
-app.get('/overdue', withCache('overdue', 5 * 60_000, async () => {
-  const data = await loadHistory()
-  if (data.length === 0) return { triples: [], pairs: [], sums: [] }
-
-  // Data is newest-first; reverse to get chronological order for interval calc
-  const chron = [...data].reverse()
-  const N = chron.length
-
-  // ── Helper: compute stats for an arbitrary key function ───────────────
-  function computeStats(keyFn, labelFn) {
-    const lastSeen = {}  // key → index of last appearance (chronological)
-    const counts = {}
-    const gaps = {}  // key → array of intervals between appearances
-
-    chron.forEach((r, i) => {
-      const k = keyFn(r)
-      if (!Array.isArray(k)) {
-        const ks = [k]
-        ks.forEach(key => {
-          counts[key] = (counts[key] || 0) + 1
-          if (lastSeen[key] !== undefined) {
-            if (!gaps[key]) gaps[key] = []
-            gaps[key].push(i - lastSeen[key])
-          }
-          lastSeen[key] = i
-        })
-      } else {
-        k.forEach(key => {
-          counts[key] = (counts[key] || 0) + 1
-          if (lastSeen[key] !== undefined) {
-            if (!gaps[key]) gaps[key] = []
-            gaps[key].push(i - lastSeen[key])
-          }
-          lastSeen[key] = i
-        })
-      }
-    })
-
-    return Object.keys(counts).map(key => {
-      const appeared = counts[key]
-      const kySince = lastSeen[key] !== undefined ? (N - 1 - lastSeen[key]) : N
-      const avgGap = gaps[key]?.length
-        ? +(gaps[key].reduce((a, b) => a + b, 0) / gaps[key].length).toFixed(1)
-        : N   // never repeated → use full history as avg
-      const overdueScore = kySince / (avgGap || 1)   // > 1 means overdue
-      return {
-        key,
-        label: labelFn ? labelFn(key) : key,
-        appeared,
-        kySinceLast: kySince,
-        avgInterval: avgGap,
-        overdueScore: +overdueScore.toFixed(2),
-      }
-    }).sort((a, b) => b.overdueScore - a.overdueScore)
-  }
-
-  // ── Triples: 1-1-1 … 6-6-6 ───────────────────────────────────────────
-  const TRIPLES = ['1-1-1', '2-2-2', '3-3-3', '4-4-4', '5-5-5', '6-6-6']
-  const tripleStats = computeStats(
-    r => {
-      const k = `${r.n1}-${r.n2}-${r.n3}`
-      return TRIPLES.includes(k) ? [k] : []
-    },
-    k => k.replace(/-/g, '')
-  )
-  // Ensure all 6 triples appear even if never seen
-  const tripleKeys = new Set(tripleStats.map(t => t.key))
-  const tripleResult = [
-    ...tripleStats,
-    ...TRIPLES.filter(k => !tripleKeys.has(k)).map(k => ({
-      key: k, label: k.replace(/-/g, ''), appeared: 0,
-      kySinceLast: N, avgInterval: N, overdueScore: 1,
-    }))
-  ].sort((a, b) => b.overdueScore - a.overdueScore)
-
-  // ── "Any triple" aggregate row \u2014 tracks when ANY triple last appeared ────────
-  let sinceAnyTriple = 0
-  let lastTripleIdx = -1
-  const anyTripleGaps = []
-  chron.forEach((r, i) => {
-    const pat = r.pattern || (r.n1 === r.n2 && r.n2 === r.n3 ? 'triple' : 'other')
-    if (pat === 'triple') {
-      if (lastTripleIdx >= 0) anyTripleGaps.push(i - lastTripleIdx)
-      lastTripleIdx = i
-    }
-  })
-  sinceAnyTriple = lastTripleIdx >= 0 ? N - 1 - lastTripleIdx : N
-  const avgAnyTripleGap = anyTripleGaps.length
-    ? +(anyTripleGaps.reduce((a, b) => a + b, 0) / anyTripleGaps.length).toFixed(1)
-    : 36
-  const anyTriple = {
-    key: 'any-triple',
-    label: 'XXX',
-    appeared: tripleResult.reduce((s, t) => s + t.appeared, 0),
-    kySinceLast: sinceAnyTriple,
-    avgInterval: avgAnyTripleGap,
-    overdueScore: +(sinceAnyTriple / (avgAnyTripleGap || 36)).toFixed(2),
-  }
-
-  // ── Pairs: 11, 22, 33, 44, 55, 66 ────────────────────────────────────
-  // A draw contributes to pair "VV" if at least two of its numbers equal V.
-  // Triples (1-1-1) also count as pair 11.
-  const PAIR_VALS = [1, 2, 3, 4, 5, 6]
-  const pairStats = computeStats(
-    r => {
-      if (r.n1 === r.n2 || r.n1 === r.n3) return [`pair-${r.n1}`]
-      if (r.n2 === r.n3) return [`pair-${r.n2}`]
-      return []
-    },
-    k => {
-      const v = k.replace('pair-', '')
-      return `${v}${v}`
-    }
-  )
-  // Ensure all 6 pairs appear
-  const pairKeys = new Set(pairStats.map(p => p.key))
-  const pairResult = [
-    ...pairStats,
-    ...PAIR_VALS.filter(v => !pairKeys.has(`pair-${v}`)).map(v => ({
-      key: `pair-${v}`, label: `${v}${v}`, appeared: 0,
-      kySinceLast: N, avgInterval: N, overdueScore: 1,
-    }))
-  ].sort((a, b) => b.overdueScore - a.overdueScore)
-
-  // ── Sums 3-18 ─────────────────────────────────────────────────────────
-  const sumStats = computeStats(r => [`sum-${r.sum}`], k => k.replace('sum-', ''))
-  // Ensure all sums appear
-  const sumKeys = new Set(sumStats.map(s => s.key))
-  const sumResult = [
-    ...sumStats,
-    ...Array.from({ length: 16 }, (_, i) => `sum-${i + 3}`)
-      .filter(k => !sumKeys.has(k))
-      .map(k => ({
-        key: k, label: k.replace('sum-', ''), appeared: 0,
-        kySinceLast: N, avgInterval: N, overdueScore: 1,
-      }))
-  ].sort((a, b) => b.overdueScore - a.overdueScore)
-
-  return {
-    total: N,
-    triples: tripleResult,
-    anyTriple,
-    pairs: pairResult,
-    sums: sumResult,
-  }
-}))
-
-/** GET /events — SSE stream */
+/** GET /events — SSE stream (new-draw push) */
 app.get('/events', (req, res) => {
   res.set({
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-store, no-cache, must-revalidate',
-    'Pragma': 'no-cache',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no',
+    'Content-Type':              'text/event-stream; charset=utf-8',
+    'Cache-Control':             'no-store, no-cache, must-revalidate',
+    'Pragma':                    'no-cache',
+    'Connection':                'keep-alive',
+    'X-Accel-Buffering':         'no',
     'Access-Control-Allow-Origin': '*',
   })
   res.flushHeaders()
-
-  // Heartbeat to keep connection alive through proxies (every 15s)
-  const hb = setInterval(() => {
-    try { res.write(': heartbeat\n\n') } catch (_) { clearInterval(hb) }
-  }, 15_000)
-
+  const hb = setInterval(() => { try { res.write(': heartbeat\n\n') } catch (_) { clearInterval(hb) } }, 15_000)
   sseClients.add(res)
   console.log(`[SSE] +1 client (total: ${sseClients.size})`)
-
-  req.on('close', () => {
-    clearInterval(hb)
-    sseClients.delete(res)
-    console.log(`[SSE] -1 client (total: ${sseClients.size})`)
-  })
+  req.on('close', () => { clearInterval(hb); sseClients.delete(res); console.log(`[SSE] -1 client (total: ${sseClients.size})`) })
 })
 
-/** GET /health — detailed liveness probe */
+/** GET /health — liveness probe */
 app.get('/health', async (_req, res) => {
   try {
-    const data = await loadHistory()
-    const newest = data[0]  // history is stored newest-first
+    const data     = await loadHistory()
+    const newest   = data[0]
     const drawTime = newest?.drawTime ?? newest?.draw_time ?? null
-    const dataFreshness = drawTime
-      ? Math.floor((Date.now() - new Date(drawTime).getTime()) / 1000)
-      : null
-
     let modelFreshness = null
-    try {
-      const wStat = fs.statSync(path.join(__dirname, '../dataset/model.json'))
-      modelFreshness = Math.floor((Date.now() - wStat.mtimeMs) / 1000)
-    } catch (_) { }
-
+    try { modelFreshness = Math.floor((Date.now() - fs.statSync(path.join(__dirname, '../dataset/model.json')).mtimeMs) / 1000) } catch (_) {}
     res.json({
-      status: 'ok',
-      historySize: data.length,
-      lastDrawAt: drawTime,
-      dataFreshness,           // seconds since newest draw
-      modelFreshness,          // seconds since model.json last updated
-      crawlerStatus: isOperatingHours() ? 'operating' : 'offline',
+      status:             'ok',
+      historySize:        data.length,
+      lastDrawAt:         drawTime,
+      dataFreshness:      drawTime ? Math.floor((Date.now() - new Date(drawTime).getTime()) / 1000) : null,
+      modelFreshness,
+      crawlerStatus:      isOperatingHours() ? 'operating' : 'offline',
       lastCrawlAttemptAt: lastCrawlAttempt ? new Date(lastCrawlAttempt).toISOString() : null,
-      uptime: Math.floor(process.uptime()),
-      sseClients: sseClients.size,
-      cacheKeys: [...apiCache.keys()],
+      uptime:             Math.floor(process.uptime()),
+      sseClients:         sseClients.size,
+      cacheKeys:          [...apiCache.keys()],
     })
-  } catch (err) {
-    res.status(500).json({ status: 'error', error: err.message, uptime: Math.floor(process.uptime()) })
-  }
+  } catch (err) { res.status(500).json({ status: 'error', error: err.message, uptime: Math.floor(process.uptime()) }) }
 })
 
-/** POST /crawl — trigger manual crawl immediately */
+/** POST /crawl — manual crawl trigger */
 let crawling = false
 app.post('/crawl', async (_req, res) => {
-  if (crawling) return res.json({ ok: false, message: 'Đang crawl, vui lòng đợi…' })
+  if (crawling) return res.json({ ok: false, message: 'Dang crawl, vui long doi...' })
   crawling = true
-  try {
-    await crawlTick()
-    res.json({ ok: true, message: 'Crawl xong' })
-  } catch (err) {
-    res.status(500).json({ ok: false, message: err.message })
-  } finally {
-    crawling = false
-  }
+  try { await crawlTick(); res.json({ ok: true, message: 'Crawl xong' }) }
+  catch (err) { res.status(500).json({ ok: false, message: err.message }) }
+  finally { crawling = false }
 })
 
-// ── Integrated crawler loop ────────────────────────────────────────────────
-// Track last known total so we can detect file changes even if crawler returns +0
-let lastKnownTotal = 0
+// ── Crawler loop ───────────────────────────────────────────────────────────
+let lastKnownTotal   = 0
 let lastCrawlAttempt = 0
 
-/**
- * Returns true when Bingo18 is operating (06:00–21:54 Vietnam time, UTC+7).
- * 159 draws/day at ~6-minute intervals; no draws published outside this window.
- * Skipping crawls outside hours saves CPU and network on Fly.io.
- */
 function isOperatingHours() {
-  const now = new Date()
-  // Convert UTC → VN local time (UTC+7) without moment/luxon dependency
-  const vnMinutes = ((now.getUTCHours() + 7) % 24) * 60 + now.getUTCMinutes()
-  // 06:00 = 360 min, 21:54 = 1314 min
-  return vnMinutes >= 360 && vnMinutes <= 1314
+  const vnMinutes = ((new Date().getUTCHours() + 7) % 24) * 60 + new Date().getUTCMinutes()
+  return vnMinutes >= 360 && vnMinutes <= 1314  // 06:00-21:54 VN
 }
 
 async function crawlTick() {
-  if (!isOperatingHours()) {
-    console.log('[crawler] off-hours (Bingo18 06:00–21:54 VN) — skipping')
-    return
-  }
+  if (!isOperatingHours()) { console.log('[crawler] off-hours (06:00-21:54 VN) -- skipping'); return }
   lastCrawlAttempt = Date.now()
-  const ts = new Date().toLocaleTimeString('vi-VN')
-  console.log(`[crawler] ${ts} — crawling…`)
+  console.log(`[crawler] ${new Date().toLocaleTimeString('vi-VN')} -- crawling...`)
   try {
     const { total, added, newRecords } = await crawlRun()
-    // Always invalidate cache if total changed (covers external file mutations)
     if (added > 0 || total !== lastKnownTotal) {
       const latestKy = newRecords[0]?.ky || '?'
       if (added > 0) {
-        console.log(`[crawler] ${added} kỳ mới (latest: #${latestKy}) — push SSE → ${sseClients.size} client(s)`)
+        console.log(`[crawler] ${added} ky moi (latest: #${latestKy}) -- push SSE -> ${sseClients.size} client(s)`)
         invalidateCache()
-        broadcast('new-draw', {
-          added,
-          latestKy,
-          total,
-          ts: new Date().toISOString(),
-        })
+        broadcast('new-draw', { added, latestKy, total, ts: new Date().toISOString() })
       } else {
-        console.log(`[crawler] total changed ${lastKnownTotal}→${total} — invalidating cache`)
+        console.log(`[crawler] total changed ${lastKnownTotal}->${total} -- invalidating cache`)
         invalidateCache()
       }
       lastKnownTotal = total
     }
-  } catch (err) {
-    console.error('[crawler] ERROR:', err.message)
-  }
+  } catch (err) { console.error('[crawler] ERROR:', err.message) }
 }
 
 // ── Start ──────────────────────────────────────────────────────────────────
-
-// Poll every 30 seconds during operating hours (06:00–21:54 VN).
-// crawlTick() is a no-op outside those hours — saves compute between 21:54 and 06:00.
-// 159 draws/day at ~6-minute intervals (~1 per 6min = ~10 per hour);
-// polling 30s gives fast detection (~15s average lag after source posts result).
-// Both sources are queried in parallel so we capture whichever updates first.
-const CRAWL_INTERVAL_MS = 30_000          // poll every 30s — concurrent dual-source
+const CRAWL_INTERVAL_MS = 30_000  // poll every 30s during operating hours
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Bingo AI API  →  http://localhost:${PORT}`)
-  console.log(`Dashboard     →  http://localhost:${PORT}/`)
-  console.log(`SSE stream    →  http://localhost:${PORT}/events`)
+  console.log(`Bingo AI API  ->  http://localhost:${PORT}`)
+  console.log(`Dashboard     ->  http://localhost:${PORT}/`)
+  console.log(`SSE stream    ->  http://localhost:${PORT}/events`)
   console.log(`Crawl interval: every ${CRAWL_INTERVAL_MS / 1000}s`)
 
-  // Startup crawl immediately, then continue at the configured interval
   crawlTick().catch(err => console.error('[crawler] startup error:', err.message))
   setInterval(crawlTick, CRAWL_INTERVAL_MS)
 
-  // Pre-warm predict + overdue caches so first HTTP request is always fast.
-  // Delay 1.5s so the stats disk cache loads first (IIFE above) and history
-  // file is stable before we read it.
+  // Pre-warm after 1.5s: fills any missing disk caches and ensures freshness.
+  // If disk caches were already loaded from startup IIFE, this just refreshes them.
   setTimeout(() => _prewarmCaches(), 1_500)
 })
