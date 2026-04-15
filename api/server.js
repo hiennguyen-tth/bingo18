@@ -1,8 +1,8 @@
 'use strict'
 
 // ── Global safeguards — MUST be first ─────────────────────────────────────
-process.on('uncaughtException',  (err)    => { console.error('[FATAL] uncaughtException:',  err.message, err.stack); process.exit(1) })
-process.on('unhandledRejection', (reason) => { console.error('[FATAL] unhandledRejection:', reason);                 process.exit(1) })
+process.on('uncaughtException', (err) => { console.error('[FATAL] uncaughtException:', err.message, err.stack); process.exit(1) })
+process.on('unhandledRejection', (reason) => { console.error('[FATAL] unhandledRejection:', reason); process.exit(1) })
 
 console.log('[startup] loading modules...')
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') })
@@ -21,27 +21,27 @@ require('dotenv').config({ path: require('path').join(__dirname, '../.env') })
  *   GET  /health   → liveness probe
  */
 
-const express     = require('express')
-const cors        = require('cors')
-const path        = require('path')
-const fs          = require('fs-extra')
+const express = require('express')
+const cors = require('cors')
+const path = require('path')
+const fs = require('fs-extra')
 const compression = require('compression')
 
-const predict          = require('../predictor/ensemble')
-const frequency        = require('../predictor/frequency')
-const features         = require('../predictor/features')
+const predict = require('../predictor/ensemble')
+const frequency = require('../predictor/frequency')
+const features = require('../predictor/features')
 const { runStatTests } = require('../predictor/stats_tests')
 const { run: crawlRun } = require('../crawler/crawl')
 
-const app  = express()
+const app = express()
 const PORT = parseInt(process.env.PORT) || 8080
 const ADSENSE_PUBLISHER_ID = process.env.ADSENSE_PUBLISHER_ID || ''
 
 const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
-const WEB_DIR      = path.join(__dirname, '../web')
+const WEB_DIR = path.join(__dirname, '../web')
 
 // All three heavy caches persist to disk — instant responses even after cold restart
-const STATS_CACHE_FILE   = path.join(__dirname, '../dataset/stats_cache.json')
+const STATS_CACHE_FILE = path.join(__dirname, '../dataset/stats_cache.json')
 const PREDICT_CACHE_FILE = path.join(__dirname, '../dataset/predict_cache.json')
 const OVERDUE_CACHE_FILE = path.join(__dirname, '../dataset/overdue_cache.json')
 
@@ -52,32 +52,41 @@ const INDEX_TPL = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'ut
 const apiCache = new Map()  // key → { data, ts }
 
 // ── Disk cache state ───────────────────────────────────────────────────────
-let _statsCache        = null
-let _statsComputing    = false
-let _prewarmRunning    = false
-let _prewarmTimer      = null   // debounced prewarm (avoid cascade)
-let _invalidateTimer   = null   // debounced stats recompute
-let _lastStatsCompute  = 0      // epoch ms — rate-limit to 1/10min
-let _lastInvalidateAt  = 0      // epoch ms — watcher cooldown
+let _statsCache = null
+let _statsComputing = false
+let _prewarmRunning = false
+let _prewarmTimer = null   // debounced prewarm (avoid cascade)
+let _invalidateTimer = null   // debounced stats recompute
+let _lastStatsCompute = 0      // epoch ms — rate-limit to 1/10min
+let _lastStatsTotal   = 0      // N at last compute — detect large data jumps
+let _lastInvalidateAt = 0      // epoch ms — watcher cooldown
 
-// ── Load all disk caches at startup in parallel ────────────────────────────
-// predict, overdue, and stats all survive container restarts this way.
-;(async () => {
-  const [stats, pred, over] = await Promise.all([
-    fs.readJSON(STATS_CACHE_FILE).catch(() => null),
-    fs.readJSON(PREDICT_CACHE_FILE).catch(() => null),
-    fs.readJSON(OVERDUE_CACHE_FILE).catch(() => null),
-  ])
-  if (stats) {
-    _statsCache = stats
-    console.log('[stats]   disk cache loaded, computed:', new Date(stats._computedAt || 0).toISOString())
-  } else {
-    console.log('[stats]   no disk cache — will compute after startup')
-    setTimeout(() => _computeStatsBackground(), 3_000)
-  }
-  if (pred) { apiCache.set('predict', pred); console.log('[predict] disk cache loaded, ts:', new Date(pred.ts || 0).toISOString()) }
-  if (over) { apiCache.set('overdue', over); console.log('[overdue] disk cache loaded, ts:', new Date(over.ts || 0).toISOString()) }
-})()
+  // ── Load all disk caches at startup in parallel ────────────────────────────
+  // predict, overdue, and stats all survive container restarts this way.
+  ; (async () => {
+    const [stats, pred, over] = await Promise.all([
+      fs.readJSON(STATS_CACHE_FILE).catch(() => null),
+      fs.readJSON(PREDICT_CACHE_FILE).catch(() => null),
+      fs.readJSON(OVERDUE_CACHE_FILE).catch(() => null),
+    ])
+    if (stats) {
+      _statsCache = stats
+      _lastStatsTotal = stats.total || 0
+      const predTotal = pred?.data?.total ?? 0
+      console.log('[stats]   disk cache loaded, computed:', new Date(stats._computedAt || 0).toISOString(), `(N=${_lastStatsTotal})`)
+      // If predict cache shows significantly more records (>10%), data was imported externally.
+      // Bypass rate limit and recompute immediately so stats reflect the new dataset.
+      if (predTotal > 0 && predTotal > Math.max(_lastStatsTotal, 100) * 1.1) {
+        console.log(`[stats]   data grew ${_lastStatsTotal} → ${predTotal} — recomputing immediately (bypassing rate limit)`)
+        setTimeout(() => _computeStatsBackground(), 5_000)
+      }
+    } else {
+      console.log('[stats]   no disk cache — will compute after startup')
+      setTimeout(() => _computeStatsBackground(), 3_000)
+    }
+    if (pred) { apiCache.set('predict', pred); console.log('[predict] disk cache loaded, ts:', new Date(pred.ts || 0).toISOString()) }
+    if (over) { apiCache.set('overdue', over); console.log('[overdue] disk cache loaded, ts:', new Date(over.ts || 0).toISOString()) }
+  })()
 
 // ── History file watcher — invalidate on external change ──────────────────
 // 10-second cooldown prevents cascade when crawl writes file repeatedly.
@@ -110,11 +119,17 @@ function invalidateCache() {
   clearTimeout(_prewarmTimer)
   _prewarmTimer = setTimeout(() => _prewarmCaches(), 800)
   // Rate-limited stats recompute: at most once per 10 minutes.
+  // Exception: bypass rate limit if dataset grew significantly (e.g. bulk import).
   clearTimeout(_invalidateTimer)
   const msSinceLastStats = Date.now() - _lastStatsCompute
-  const statsDelay = msSinceLastStats < 10 * 60_000
-    ? (10 * 60_000 - msSinceLastStats)  // wait out the remainder
-    : 5_000                             // first time: 5s debounce
+  const currentN = apiCache.get('predict')?.data?.total ?? 0
+  const cachedN  = Math.max(_lastStatsTotal, _statsCache?.total ?? 0)
+  const nGrew    = currentN > 0 && cachedN > 0 && currentN > cachedN * 1.1
+  const statsDelay = nGrew ? 2_000            // data changed significantly — bypass rate limit
+    : msSinceLastStats < 10 * 60_000
+      ? (10 * 60_000 - msSinceLastStats)      // wait out the remainder
+      : 5_000                                 // first time: 5s debounce
+  if (nGrew) console.log(`[stats] N grew ${cachedN} → ${currentN} — bypassing rate limit, recomputing in 2s`)
   _invalidateTimer = setTimeout(() => _computeStatsBackground(), statsDelay)
 }
 
@@ -157,28 +172,28 @@ function buildPredictPayload(data) {
     return { next: [], sumStats: [], total: data.length, message: 'Not enough data — run: node crawler/crawl.js' }
   }
   const { top10, tripleSignal, effectiveWeights } = predict.ranked(data)
-  const top10Total  = top10.reduce((s, r) => s + r.score, 0) || 1
-  const maxScore    = top10[0]?.score || 1
-  const minScore    = top10[top10.length - 1]?.score || 0
+  const top10Total = top10.reduce((s, r) => s + r.score, 0) || 1
+  const maxScore = top10[0]?.score || 1
+  const minScore = top10[top10.length - 1]?.score || 0
   const scoreSpread = maxScore - minScore || 1
 
   const next = top10.map(r => ({
-    combo:        r.combo,
-    score:        +r.score.toFixed(3),
-    pct:          +(r.score / top10Total * 100).toFixed(1),
-    confidence:   Math.round(35 + ((r.score - minScore) / scoreSpread) * 45),
+    combo: r.combo,
+    score: +r.score.toFixed(3),
+    pct: +(r.score / top10Total * 100).toFixed(1),
+    confidence: Math.round(35 + ((r.score - minScore) / scoreSpread) * 45),
     overdueRatio: r.overdueRatio != null ? +r.overdueRatio.toFixed(2) : null,
-    comboGap:     r.comboGap,
-    sumOD:        +(r.sumOD ?? 0).toFixed(2),
-    pat:          r.pat,
-    stability:    r.stability != null ? +r.stability.toFixed(2) : null,
-    zScore:       r.zScore != null ? +r.zScore.toFixed(2) : null,
-    statNorm:     r.statNorm ?? 0,
-    mk2Norm:      r.mk2Norm ?? 0,
-    sessNorm:     r.sessNorm ?? 0,
-    mlNorm:       r.mlNorm ?? 0,
-    coreNorm:     r.coreNorm ?? 0,  // legacy compat
-    chiNorm:      0,
+    comboGap: r.comboGap,
+    sumOD: +(r.sumOD ?? 0).toFixed(2),
+    pat: r.pat,
+    stability: r.stability != null ? +r.stability.toFixed(2) : null,
+    zScore: r.zScore != null ? +r.zScore.toFixed(2) : null,
+    statNorm: r.statNorm ?? 0,
+    mk2Norm: r.mk2Norm ?? 0,
+    sessNorm: r.sessNorm ?? 0,
+    mlNorm: r.mlNorm ?? 0,
+    coreNorm: r.coreNorm ?? 0,  // legacy compat
+    chiNorm: 0,
   }))
 
   const sumBucket = {}
@@ -195,12 +210,12 @@ function buildOverduePayload(data) {
   if (data.length === 0) return { triples: [], pairs: [], sums: [] }
 
   const chron = [...data].reverse()  // chronological for interval calc
-  const N     = chron.length
+  const N = chron.length
 
   function computeStats(keyFn, labelFn) {
     const lastSeen = {}, counts = {}, gaps = {}
     chron.forEach((r, i) => {
-      const raw  = keyFn(r)
+      const raw = keyFn(r)
       const keys = Array.isArray(raw) ? raw : (raw ? [raw] : [])
       for (const key of keys) {
         counts[key] = (counts[key] || 0) + 1
@@ -210,7 +225,7 @@ function buildOverduePayload(data) {
     })
     return Object.keys(counts).map(key => {
       const kySince = lastSeen[key] !== undefined ? (N - 1 - lastSeen[key]) : N
-      const avgGap  = gaps[key]?.length
+      const avgGap = gaps[key]?.length
         ? +(gaps[key].reduce((a, b) => a + b, 0) / gaps[key].length).toFixed(1)
         : N
       return { key, label: labelFn ? labelFn(key) : key, appeared: counts[key], kySinceLast: kySince, avgInterval: avgGap, overdueScore: +(kySince / (avgGap || 1)).toFixed(2) }
@@ -218,7 +233,7 @@ function buildOverduePayload(data) {
   }
 
   // Triples (1-1-1 to 6-6-6)
-  const TRIPLES   = ['1-1-1', '2-2-2', '3-3-3', '4-4-4', '5-5-5', '6-6-6']
+  const TRIPLES = ['1-1-1', '2-2-2', '3-3-3', '4-4-4', '5-5-5', '6-6-6']
   const tripleRaw = computeStats(
     r => { const k = `${r.n1}-${r.n2}-${r.n3}`; return TRIPLES.includes(k) ? k : null },
     k => k.replace(/-/g, '')
@@ -238,13 +253,13 @@ function buildOverduePayload(data) {
       lastTripleIdx = i
     }
   })
-  const sinceAnyTriple  = lastTripleIdx >= 0 ? N - 1 - lastTripleIdx : N
+  const sinceAnyTriple = lastTripleIdx >= 0 ? N - 1 - lastTripleIdx : N
   const avgAnyTripleGap = anyTripleGaps.length
     ? +(anyTripleGaps.reduce((a, b) => a + b, 0) / anyTripleGaps.length).toFixed(1)
     : 36
   const anyTriple = {
     key: 'any-triple', label: 'XXX',
-    appeared:    triples.reduce((s, t) => s + t.appeared, 0),
+    appeared: triples.reduce((s, t) => s + t.appeared, 0),
     kySinceLast: sinceAnyTriple,
     avgInterval: avgAnyTripleGap,
     overdueScore: +(sinceAnyTriple / (avgAnyTripleGap || 36)).toFixed(2),
@@ -266,7 +281,7 @@ function buildOverduePayload(data) {
   ].sort((a, b) => b.overdueScore - a.overdueScore)
 
   // Sums (3-18)
-  const sumRaw  = computeStats(r => `sum-${r.sum}`, k => k.replace('sum-', ''))
+  const sumRaw = computeStats(r => `sum-${r.sum}`, k => k.replace('sum-', ''))
   const sumKeys = new Set(sumRaw.map(s => s.key))
   const sums = [
     ...sumRaw,
@@ -293,7 +308,7 @@ async function _prewarmCaches() {
     const data = await loadHistory()
     if (data.length < 2) return
 
-    const ts        = Date.now()
+    const ts = Date.now()
     const predictPl = buildPredictPayload(data)
     const overduePl = buildOverduePayload(data)
 
@@ -324,7 +339,7 @@ async function _computeStatsBackground() {
   const t0 = Date.now()
   console.log('[stats] background backtest starting...')
   try {
-    const data   = await loadHistory()
+    const data = await loadHistory()
     const WINDOW = 10
     if (data.length < WINDOW + 2) {
       _statsCache = { message: 'Need more data', total: data.length, needed: WINDOW + 2, _computedAt: Date.now() }
@@ -332,16 +347,16 @@ async function _computeStatsBackground() {
       return
     }
 
-    const chron    = [...data].reverse()
-    const N        = chron.length
+    const chron = [...data].reverse()
+    const N = chron.length
     const trainEnd = Math.floor(N * 0.6)
     const validEnd = Math.floor(N * 0.8)
 
     let top1 = 0, top3 = 0, top10 = 0, tested = 0
     const rankHits = new Array(10).fill(0)
     const seg = {
-      train:   { top1: 0, top3: 0, top10: 0, tested: 0 },
-      valid:   { top1: 0, top3: 0, top10: 0, tested: 0 },
+      train: { top1: 0, top3: 0, top10: 0, tested: 0 },
+      valid: { top1: 0, top3: 0, top10: 0, tested: 0 },
       forward: { top1: 0, top3: 0, top10: 0, tested: 0 },
     }
 
@@ -349,7 +364,7 @@ async function _computeStatsBackground() {
     // Yield after EVERY iteration so health-check (/health) is never blocked > 200ms.
     const SAMPLE_EVERY = Math.max(1, Math.floor(N / 300))
     // Start from 30% mark — early windows have too little training data.
-    const START_I      = Math.max(WINDOW, Math.floor(N * 0.3))
+    const START_I = Math.max(WINDOW, Math.floor(N * 0.3))
 
     for (let i = START_I; i < N; i += SAMPLE_EVERY) {
       await new Promise(resolve => setImmediate(resolve))  // yield EVERY iteration
@@ -359,40 +374,40 @@ async function _computeStatsBackground() {
 
       const actual = `${chron[i].n1}-${chron[i].n2}-${chron[i].n3}`
       const combos = tp.map(r => r.combo)
-      const hit1   = combos[0] === actual
-      const hit3   = combos.slice(0, 3).some(c => c === actual)
-      const hit10  = combos.some(c => c === actual)
+      const hit1 = combos[0] === actual
+      const hit3 = combos.slice(0, 3).some(c => c === actual)
+      const hit10 = combos.some(c => c === actual)
 
       for (let r = 0; r < Math.min(tp.length, 10); r++) {
         if (tp[r].combo === actual) { rankHits[r]++; break }
       }
-      if (hit1)  top1++
-      if (hit3)  top3++
+      if (hit1) top1++
+      if (hit3) top3++
       if (hit10) top10++
       tested++
 
       const segKey = i < trainEnd ? 'train' : i < validEnd ? 'valid' : 'forward'
       seg[segKey].tested++
-      if (hit1)  seg[segKey].top1++
-      if (hit3)  seg[segKey].top3++
+      if (hit1) seg[segKey].top1++
+      if (hit3) seg[segKey].top3++
       if (hit10) seg[segKey].top10++
     }
 
-    const baseline = { top1: +(1/216*100).toFixed(2), top3: +(3/216*100).toFixed(2), top10: +(10/216*100).toFixed(2) }
+    const baseline = { top1: +(1 / 216 * 100).toFixed(2), top3: +(3 / 216 * 100).toFixed(2), top10: +(10 / 216 * 100).toFixed(2) }
 
     function _normCDF(z) {
-      const t  = 1 / (1 + 0.2316419 * Math.abs(z))
+      const t = 1 / (1 + 0.2316419 * Math.abs(z))
       const d2 = 0.3989423 * Math.exp(-z * z / 2)
-      const p  = d2 * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))))
+      const p = d2 * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))))
       return z > 0 ? 1 - p : p
     }
-    const p_hat10          = tested > 0 ? top10 / tested : 0
-    const p_base10         = 10 / 216
-    const se_test          = Math.sqrt(p_base10 * (1 - p_base10) / Math.max(tested, 1))
-    const z_vs_base        = (p_hat10 - p_base10) / (se_test || 1)
+    const p_hat10 = tested > 0 ? top10 / tested : 0
+    const p_base10 = 10 / 216
+    const se_test = Math.sqrt(p_base10 * (1 - p_base10) / Math.max(tested, 1))
+    const z_vs_base = (p_hat10 - p_base10) / (se_test || 1)
     const pValueVsBaseline = +(2 * (1 - _normCDF(Math.abs(z_vs_base)))).toFixed(4)
-    const se_ci            = Math.sqrt(p_hat10 * (1 - p_hat10) / Math.max(tested, 1))
-    const ci95             = {
+    const se_ci = Math.sqrt(p_hat10 * (1 - p_hat10) / Math.max(tested, 1))
+    const ci95 = {
       lower: +(Math.max(0, p_hat10 - 1.96 * se_ci) * 100).toFixed(2),
       upper: +((p_hat10 + 1.96 * se_ci) * 100).toFixed(2),
     }
@@ -400,18 +415,18 @@ async function _computeStatsBackground() {
     const segments = {}
     for (const [name, s] of Object.entries(seg)) {
       const t = s.tested
-      segments[name] = { tested: t, top1: t ? +(s.top1/t*100).toFixed(2) : 0, top3: t ? +(s.top3/t*100).toFixed(2) : 0, top10: t ? +(s.top10/t*100).toFixed(2) : 0 }
+      segments[name] = { tested: t, top1: t ? +(s.top1 / t * 100).toFixed(2) : 0, top3: t ? +(s.top3 / t * 100).toFixed(2) : 0, top10: t ? +(s.top10 / t * 100).toFixed(2) : 0 }
     }
 
-    const statTests  = runStatTests(chron)
+    const statTests = runStatTests(chron)
     const calBuckets = tested > 0 ? rankHits.map((h, i) => ({ rank: i + 1, hitPct: +(h / tested * 100).toFixed(3) })) : []
 
     _statsCache = {
       tested, total: N,
       accuracy: {
-        top1:  tested ? +(top1/tested*100).toFixed(2)  : 0,
-        top3:  tested ? +(top3/tested*100).toFixed(2)  : 0,
-        top10: tested ? +(top10/tested*100).toFixed(2) : 0,
+        top1: tested ? +(top1 / tested * 100).toFixed(2) : 0,
+        top3: tested ? +(top3 / tested * 100).toFixed(2) : 0,
+        top10: tested ? +(top10 / tested * 100).toFixed(2) : 0,
         top10CI95: ci95,
         top10PValueVsBaseline: pValueVsBaseline,
         top10SignificantVsBaseline: pValueVsBaseline < 0.05,
@@ -422,6 +437,7 @@ async function _computeStatsBackground() {
       _sampleEvery: SAMPLE_EVERY,
     }
     _lastStatsCompute = Date.now()
+    _lastStatsTotal   = N
     await fs.writeJSON(STATS_CACHE_FILE, _statsCache)
     console.log(`[stats] backtest done in ${((Date.now() - t0) / 1000).toFixed(1)}s, tested=${tested}/${N} draws (every ${SAMPLE_EVERY})`)
   } catch (err) {
@@ -458,11 +474,11 @@ app.get(['/', '/index.html'], (_req, res) => {
 })
 
 const _staticPages = {
-  '/about':                   'about.html',
-  '/how-it-works':            'how-it-works.html',
-  '/blog/what-is-bingo18':    'blog/what-is-bingo18.html',
+  '/about': 'about.html',
+  '/how-it-works': 'how-it-works.html',
+  '/blog/what-is-bingo18': 'blog/what-is-bingo18.html',
   '/blog/best-strategy-2026': 'blog/best-strategy-2026.html',
-  '/privacy-policy':          'privacy-policy.html',
+  '/privacy-policy': 'privacy-policy.html',
 }
 for (const [route, file] of Object.entries(_staticPages)) {
   app.get(route, (_req, res) => {
@@ -471,7 +487,7 @@ for (const [route, file] of Object.entries(_staticPages)) {
   })
 }
 app.get('/sitemap.xml', (_req, res) => { res.setHeader('Content-Type', 'application/xml; charset=utf-8'); res.sendFile(path.join(WEB_DIR, 'sitemap.xml')) })
-app.get('/ads.txt',     (_req, res) => { res.setHeader('Content-Type', 'text/plain; charset=utf-8');      res.sendFile(path.join(WEB_DIR, 'ads.txt')) })
+app.get('/ads.txt', (_req, res) => { res.setHeader('Content-Type', 'text/plain; charset=utf-8'); res.sendFile(path.join(WEB_DIR, 'ads.txt')) })
 
 // Static assets (app.js, heatmap.js, etc.) — index.html excluded above
 app.use(express.static(WEB_DIR, { index: false }))
@@ -493,10 +509,10 @@ app.get('/overdue', withCache('overdue', 5 * 60_000,
  * Cache is cleared by invalidateCache() → apiCache.clear() when new draws arrive. */
 app.get('/history', async (req, res) => {
   try {
-    const limit   = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 1_000)
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 1_000)
     const cacheKey = `history-${limit}`
-    const now      = Date.now()
-    const hit      = apiCache.get(cacheKey)
+    const now = Date.now()
+    const hit = apiCache.get(cacheKey)
     if (hit && now - hit.ts < 60_000) {
       const etag = `"${hit.ts}"`
       res.set('X-Cache', 'HIT')
@@ -504,7 +520,7 @@ app.get('/history', async (req, res) => {
       if (req.headers['if-none-match'] === etag) return res.status(304).end()
       return res.json(hit.data)
     }
-    const data    = await loadHistory()
+    const data = await loadHistory()
     const payload = { records: data.slice(0, limit), total: data.length }
     apiCache.set(cacheKey, { data: payload, ts: now })
     const etag = `"${now}"`
@@ -523,7 +539,7 @@ app.get('/history', async (req, res) => {
  */
 app.get('/stats', (req, res) => {
   if (_statsCache) {
-    const ts   = _statsCache._computedAt || 0
+    const ts = _statsCache._computedAt || 0
     const etag = `"${ts}"`
     res.set('ETag', etag)
     res.set('Last-Modified', new Date(ts).toUTCString())
@@ -542,7 +558,7 @@ app.get('/stats', (req, res) => {
 app.get('/frequency', withCache('frequency', 5 * 60_000, async () => {
   const data = await loadHistory()
   if (data.length === 0) return { freq: {}, total: 0 }
-  const freq   = frequency(data)
+  const freq = frequency(data)
   const sorted = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 30)
   return { freq: Object.fromEntries(sorted), total: data.length }
 }))
@@ -550,8 +566,8 @@ app.get('/frequency', withCache('frequency', 5 * 60_000, async () => {
 /** GET /ml-status — model readiness info */
 app.get('/ml-status', async (_req, res) => {
   try {
-    const data   = await loadHistory()
-    const N      = data.length
+    const data = await loadHistory()
+    const N = data.length
     const ML_MIN = 24
     res.json({
       modelD: { name: 'k-NN Temporal Similarity', active: N >= ML_MIN, records: N, minRequired: ML_MIN, kNeighbors: Math.min(60, Math.max(15, Math.floor((N - 9) * 0.05))), window: 8 },
@@ -572,11 +588,11 @@ app.get('/features', async (req, res) => {
 /** GET /events — SSE stream (new-draw push) */
 app.get('/events', (req, res) => {
   res.set({
-    'Content-Type':              'text/event-stream; charset=utf-8',
-    'Cache-Control':             'no-store, no-cache, must-revalidate',
-    'Pragma':                    'no-cache',
-    'Connection':                'keep-alive',
-    'X-Accel-Buffering':         'no',
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+    'Pragma': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
     'Access-Control-Allow-Origin': '*',
   })
   res.flushHeaders()
@@ -589,17 +605,17 @@ app.get('/events', (req, res) => {
 /** GET /health — liveness probe (fast: uses in-memory predict cache instead of re-reading full file) */
 app.get('/health', (_req, res) => {
   try {
-    const predictHit   = apiCache.get('predict')
+    const predictHit = apiCache.get('predict')
     const historyTotal = predictHit?.data?.total ?? 0
     res.json({
-      status:             'ok',
-      historySize:        historyTotal,
-      statsComputing:     _statsComputing,
-      crawlerStatus:      isOperatingHours() ? 'operating' : 'offline',
+      status: 'ok',
+      historySize: historyTotal,
+      statsComputing: _statsComputing,
+      crawlerStatus: isOperatingHours() ? 'operating' : 'offline',
       lastCrawlAttemptAt: lastCrawlAttempt ? new Date(lastCrawlAttempt).toISOString() : null,
-      uptime:             Math.floor(process.uptime()),
-      sseClients:         sseClients.size,
-      cacheKeys:          [...apiCache.keys()],
+      uptime: Math.floor(process.uptime()),
+      sseClients: sseClients.size,
+      cacheKeys: [...apiCache.keys()],
     })
   } catch (err) { res.status(500).json({ status: 'error', error: err.message, uptime: Math.floor(process.uptime()) }) }
 })
@@ -615,7 +631,7 @@ app.post('/crawl', async (_req, res) => {
 })
 
 // ── Crawler loop ───────────────────────────────────────────────────────────
-let lastKnownTotal   = 0
+let lastKnownTotal = 0
 let lastCrawlAttempt = 0
 
 function isOperatingHours() {
@@ -667,7 +683,7 @@ app.listen(PORT, '0.0.0.0', () => {
       console.log('[stats] startup: no recent cache — scheduling initial compute in 10s')
       setTimeout(() => _computeStatsBackground(), 10_000)
     } else {
-      console.log(`[stats] startup: cache age ${Math.round(age/60000)}min — skipping initial recompute`)
+      console.log(`[stats] startup: cache age ${Math.round(age / 60000)}min — skipping initial recompute`)
     }
   }, 3_000)
 })

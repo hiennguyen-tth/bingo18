@@ -692,7 +692,7 @@ const AccuracyPanel = memo(function AccuracyPanel({
   }, "(train\u2212forward top10: ", overfit > 0 ? '+' : '', overfit, "%)")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'grid',
-      gridTemplateColumns: '1fr 1fr 1fr',
+      gridTemplateColumns: 'repeat(auto-fit,minmax(100px,1fr))',
       gap: 8
     }
   }, [{
@@ -775,11 +775,16 @@ const AccuracyPanel = memo(function AccuracyPanel({
       color: '#64748b',
       marginBottom: 8
     }
-  }, "p < 0.05 = c\xF3 \xFD ngh\u0129a th\u1ED1ng k\xEA (reject H0). N\u1EBFu t\u1EA5t c\u1EA3 p > 0.05 \u2192 game random \u2192 model A/B/D c\xF3 th\u1EC3 ch\u1EC9 fit noise."), /*#__PURE__*/React.createElement("table", {
+  }, "p < 0.05 = c\xF3 \xFD ngh\u0129a th\u1ED1ng k\xEA (reject H0). N\u1EBFu t\u1EA5t c\u1EA3 p > 0.05 \u2192 game random \u2192 model A/B/D c\xF3 th\u1EC3 ch\u1EC9 fit noise."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: 'auto'
+    }
+  }, /*#__PURE__*/React.createElement("table", {
     style: {
       width: '100%',
       borderCollapse: 'collapse',
-      fontSize: 11
+      fontSize: 11,
+      minWidth: 360
     }
   }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ['Test', 'Stat', 'p-value', 'Ý nghĩa'].map(h => /*#__PURE__*/React.createElement("th", {
     key: h,
@@ -835,7 +840,7 @@ const AccuracyPanel = memo(function AccuracyPanel({
     style: {
       color: '#475569'
     }
-  }, "Chu\u1ED7i tr\xEAn/d\u01B0\u1EDBi trung v\u1ECB ng\u1EABu nhi\xEAn?")))), /*#__PURE__*/React.createElement("div", {
+  }, "Chu\u1ED7i tr\xEAn/d\u01B0\u1EDBi trung v\u1ECB ng\u1EABu nhi\xEAn?"))))), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 8,
       color: '#475569',
@@ -1897,8 +1902,6 @@ function App() {
       maxPct: maxSumPct
     }));
   })()), /*#__PURE__*/React.createElement("div", {
-    className: "hide-mobile"
-  }, /*#__PURE__*/React.createElement("div", {
     style: {
       ...C.card,
       marginBottom: 28
@@ -1908,7 +1911,9 @@ function App() {
       display: 'flex',
       justifyContent: 'space-between',
       alignItems: 'baseline',
-      marginBottom: 16
+      marginBottom: 16,
+      flexWrap: 'wrap',
+      gap: 6
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: C.label
@@ -1916,15 +1921,20 @@ function App() {
     style: {
       fontSize: 11,
       color: '#475569'
-    }
+    },
+    className: "hide-mobile"
   }, "Walk-forward backtest \u2014 hu\u1EA5n luy\u1EC7n tr\xEAn data qu\xE1 kh\u1EE9, ki\u1EC3m tra tr\xEAn k\u1EF3 ti\u1EBFp theo")), /*#__PURE__*/React.createElement(AccuracyPanel, {
     stats: stats,
     loading: statsLoading
   })), /*#__PURE__*/React.createElement("div", {
-    style: C.card
+    className: "hide-mobile",
+    style: {
+      ...C.card,
+      marginBottom: 28
+    }
   }, /*#__PURE__*/React.createElement(Heatmap, {
     history: history
-  })))), /*#__PURE__*/React.createElement("footer", {
+  }))), /*#__PURE__*/React.createElement("footer", {
     style: {
       borderTop: '1px solid rgba(255,255,255,0.06)',
       padding: '28px 24px',

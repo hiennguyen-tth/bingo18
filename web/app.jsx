@@ -338,7 +338,7 @@ const AccuracyPanel = memo(function AccuracyPanel({ stats, loading }) {
               </span>
             )}
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(100px,1fr))', gap: 8 }}>
             {[
               { key: 'train', label: 'Train (60%)', color: '#60a5fa' },
               { key: 'valid', label: 'Valid (20%)', color: '#a78bfa' },
@@ -379,7 +379,8 @@ const AccuracyPanel = memo(function AccuracyPanel({ stats, loading }) {
               <div style={{ color: '#64748b', marginBottom: 8 }}>
                 p &lt; 0.05 = có ý nghĩa thống kê (reject H0). Nếu tất cả p &gt; 0.05 → game random → model A/B/D có thể chỉ fit noise.
               </div>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+              <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11, minWidth: 360 }}>
                 <thead>
                   <tr>
                     {['Test', 'Stat', 'p-value', 'Ý nghĩa'].map(h => (
@@ -408,6 +409,7 @@ const AccuracyPanel = memo(function AccuracyPanel({ stats, loading }) {
                   </tr>
                 </tbody>
               </table>
+              </div>
               <div style={{ marginTop: 8, color: '#475569', fontSize: 10, lineHeight: 1.5 }}>
                 * Ý nghĩa thống kê ≠ khả năng dự đoán. Chi-square có thể reject H0 chỉ vì tần suất không hoàn toàn phẳng, không có nghĩa là combo cụ thể nào có thể dự đoán được.
               </div>
@@ -1017,18 +1019,17 @@ function App() {
           </div>
         )}
 
-        {/* ── Accuracy + Heatmap (desktop only — complex layout) ── */}
-        <div className="hide-mobile">
-          <div style={{ ...C.card, marginBottom: 28 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
-              <div style={C.label}>Độ chính xác dự đoán</div>
-              <div style={{ fontSize: 11, color: '#475569' }}>Walk-forward backtest — huấn luyện trên data quá khứ, kiểm tra trên kỳ tiếp theo</div>
-            </div>
-            <AccuracyPanel stats={stats} loading={statsLoading} />
+        {/* ── Accuracy (all screens) ── */}
+        <div style={{ ...C.card, marginBottom: 28 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16, flexWrap: 'wrap', gap: 6 }}>
+            <div style={C.label}>Độ chính xác dự đoán</div>
+            <div style={{ fontSize: 11, color: '#475569' }} className="hide-mobile">Walk-forward backtest — huấn luyện trên data quá khứ, kiểm tra trên kỳ tiếp theo</div>
           </div>
-          <div style={C.card}>
-            <Heatmap history={history} />
-          </div>
+          <AccuracyPanel stats={stats} loading={statsLoading} />
+        </div>
+        {/* ── Heatmap (desktop only — canvas layout doesn't adapt to small screens) ── */}
+        <div className="hide-mobile" style={{ ...C.card, marginBottom: 28 }}>
+          <Heatmap history={history} />
         </div>
 
       </div>
