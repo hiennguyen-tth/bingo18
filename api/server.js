@@ -1,8 +1,12 @@
 'use strict'
 
 // ── Global safeguards — MUST be first ─────────────────────────────────────
+// uncaughtException: process is in an undefined state — must exit (Node.js docs)
 process.on('uncaughtException', (err) => { console.error('[FATAL] uncaughtException:', err.message, err.stack); process.exit(1) })
-process.on('unhandledRejection', (reason) => { console.error('[FATAL] unhandledRejection:', reason); process.exit(1) })
+// unhandledRejection: recoverable — log and continue. Most are network timeouts
+// from crawl/fetch that don't affect server state. Exiting here caused 30-min
+// outages whenever any async operation failed under load.
+process.on('unhandledRejection', (reason) => { console.error('[WARN] unhandledRejection (non-fatal):', reason) })
 
 console.log('[startup] loading modules...')
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') })
@@ -46,7 +50,15 @@ const PREDICT_CACHE_FILE = path.join(__dirname, '../dataset/predict_cache.json')
 const OVERDUE_CACHE_FILE = path.join(__dirname, '../dataset/overdue_cache.json')
 
 // index.html template — read once, ADSENSE injected per request
-const INDEX_TPL = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8')
+// Wrapped in try/catch: crash before app.listen() would leave the port unbound,
+// causing health checks to fail indefinitely until next deploy.
+let INDEX_TPL
+try {
+  INDEX_TPL = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8')
+} catch (e) {
+  console.error('[startup] WARNING: web/index.html missing —', e.message)
+  INDEX_TPL = '<!DOCTYPE html><html><head><title>Bingo18 AI</title></head><body><h1>Bingo18 AI</h1><p>Đang khởi động...</p></body></html>'
+}
 
 // ── In-memory cache ────────────────────────────────────────────────────────
 const apiCache = new Map()  // key → { data, ts }
@@ -554,7 +566,9 @@ app.get('/stats', (req, res) => {
     res.set('X-Cache', _statsComputing ? 'STALE' : 'HIT')
     res.set('X-Stats-Computing', _statsComputing ? '1' : '0')
     if (req.headers['if-none-match'] === etag && !_statsComputing) return res.status(304).end()
-    if (!_statsComputing && Date.now() - ts > 15 * 60_000) _computeStatsBackground()
+    // Auto-refresh when cache is stale — but also respect the 10-min rate limit
+    // to prevent cascading recomputes when multiple clients hit /stats simultaneously.
+    if (!_statsComputing && Date.now() - ts > 15 * 60_000 && Date.now() - _lastStatsCompute > 10 * 60_000) _computeStatsBackground()
     return res.json(_statsCache)
   }
   if (!_statsComputing) _computeStatsBackground()

@@ -547,10 +547,11 @@ function ensembleAll(chron, now) {
   const rawB = modelB(chron)
   const rawC = modelC(chron, now)
 
-  // Auto-disable Model D (k-NN) when learned weights penalize it (wD < 0)
-  // — avoids spending compute on a model that currently adds noise.
+  // Auto-disable Model D (k-NN) when learned weight wD ≤ 0 (zero or negative).
+  // wD=0 means the model contributes nothing to the ensemble score; running it
+  // is pure wasted compute (k-NN on 40k records is O(N²) per predict call).
   const lw = _learnedWeights
-  const killD = lw !== null && (lw.wD ?? 0) < 0
+  const killD = lw !== null && (lw.wD ?? 0) <= 0
   const rawD = killD ? {} : modelD(chron)
 
   // Model E: Python GBM prior (loaded from python/ml_output.json, if present & fresh)
