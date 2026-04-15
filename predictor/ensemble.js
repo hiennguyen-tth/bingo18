@@ -1,6 +1,6 @@
 'use strict'
 /**
- * predictor/ensemble.js — v8
+ * predictor/ensemble.js — v9
  *
  * 5-model sigmoid ensemble. Each model normalised to [0,1] via rank-percentile,
  * then combined through sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias).
@@ -8,8 +8,7 @@
  *
  *   MODEL A — Statistical z-score + 4 auxiliary signals (S3–S6)
  *     z-score = gap overdueness; S3 sum deviation; S4 digit momentum;
- *     S5 sum-bucket overdue (+0–7% gentle nudge);
- *     S6 pair-digit overdue (+0–7% gentle nudge — applies to pair/triple only)
+ *     S5/S6 mutually exclusive tie-breaker (+0–5% max, additive).
  *     ALL signals merged in a SINGLE O(N) pass for performance.
  *
  *   MODEL B — Markov order-2 (transition probability)
@@ -17,7 +16,8 @@
  *
  *   MODEL C — Time-of-day session model (frequency ratio)
  *     morning 6–12h / afternoon 12–18h / evening 18–6h
- *     When < 20 draws in session → weight=0, redistribute to A+B.
+ *     HARD-DISABLED when N < 5000 (insufficient data for session signal;
+ *     ~339 draws/session → 1.57 appearances/combo → variance too high).
  *
  *   MODEL D — k-NN Temporal Similarity (pure-JS ML)
  *     Auto-disabled when learned weight wD < 0.
@@ -25,14 +25,40 @@
  *   MODEL E — Python GBM prior (offline, from python/ml_output.json)
  *     Active when file present AND dataset grew ≤ 200 records since training.
  *
+ * v9 changes vs v8:
+ *   P1: z=0 for unseen combos (was z=2, gambler’s fallacy fix).
+ *   P2: S3–S6 additive (was multiplicative; prevents non-linear inflation).
+ *   P3: Model C hard-disabled at N<5000 (was only session<20 check).
+ *   P4: effectiveWeights returned from predictRanked for UI transparency.
+ *   P0: CI95 + p-value vs baseline added in /stats endpoint.
+ *   Dir 3+4: Bayesian p-value shrink (no_pattern → shrink=0).
+ *   Dir 1+2: Portfolio coverage selection (λ=0.10).
+ *   Cooldown penalty (z<0 → score×exp(z)).
+ *
  * S2 Triple streak boost — applied AFTER ensemble:
  *   ratio = sinceTriple / 36;  ratio ≤ 1 → no boost;  max 1.5× at ratio ≥ 2
  *   Only fires when clearly overdue (not within normal variance of 36-draw gap).
  *
  * S5/S6 design note:
- *   These are gentle tie-breakers, NOT dominant signals.
- *   Max +7% each (combined ≤ +14.5%) prevents compounding bias from inflating
- *   triple scores above high-z normal combos.
+ *   Mutually exclusive tie-breakers — only the LARGER of the two fires.
+ *   Max +5% (single), so combined contribution ≤ +5%, preventing compounding.
+ *   This stops the case where a triple scores high purely because both its sum
+ *   AND its pair-digit happen to be overdue simultaneously.
+ *
+ * Cooldown penalty (bug fix — h6 re-suggest):
+ *   After ensemble, if z < 0 (combo appeared more recently than its own average),
+ *   score × exp(max(-3, z)). At z=-1.5: ×0.22. Prevents Markov/session models
+ *   from overriding the clear z-score signal that the combo is not overdue.
+ *
+ * Direction 3+4 — Bayesian shrink via p-value:
+ *   no_pattern (0 tests significant) → shrink=0 → wA=wB=wD effectively zeroed;
+ *     fallback to session(C) + GBM(E) + near-uniform → portfolio drives diversity.
+ *   weak/strong pattern → shrink ∝ 1/pMin continuously (0.5 → 1.0).
+ *
+ * Direction 1+2 — Portfolio coverage selection (replaces pass-based cap):
+ *   Greedy slot-by-slot: argmax_k [score_k − λ×avgDigitOverlap(k, selected)]
+ *   λ=0.10; maximises P(hit ≥ 1) = coverage rather than P(combo_i correct).
+ *   When shrink=0: near-uniform scores → purely diversity-driven selection.
  *
  * Diversity cap (selectTop10):
  *   max 2 triple, 4 pair, 4 normal per top-10.
@@ -165,17 +191,17 @@ function rankNorm(scoreMap) {
  *
  *   z = (currentGap – avgGap) / stdGap  [clamped to 0–4]
  *   z ≤ 0 → score = 0 (recently appeared, no boost)
- *   Never seen → z = 2.0 (moderately overdue default)
+ *   Never seen → z = 0  (no position; IID random has no memory—assigning
+ *                         z=2 was Gambler's Fallacy hardcoded into the prior)
  *
- * Auxiliary signals (applied as multipliers on baseScore):
+ * Auxiliary signals (ADDITIVE, not multiplicative):
  *   S3 (+0–30%) sum-bucket observed short vs expected (last-200 draws)
  *   S4 (+0–15%) digit momentum (last-30 draws)
- *   S5 (+0–7%)  sum-bucket overdue ratio — gentle tie-breaker only
- *   S6 (+0–7%)  pair-digit overdue ratio — pairs/triples only; gentle nudge
+ *   S5/S6 mutually exclusive (+0–5% max): only the larger of the two fires
  *
- * S5/S6 are intentionally capped at +7% each (combined ≤ +14.5%):
- *   They should NOT be strong enough to push a triple to rank #1 by themselves.
- *   Triples have 1/36 base rate; boosting them aggressively amplifies gambler's fallacy.
+ * Additive form prevents non-linear score inflation when multiple signals
+ * are simultaneously strong (e.g. S3+S4 combined can be at most +45% vs
+ * the old multiplicative +49.5%).
  */
 function modelA(chron) {
   const N = chron.length
@@ -297,7 +323,8 @@ function modelA(chron) {
     } else if (avg !== null) {
       z = Math.max(-2, Math.min(2, (curGap - avg) / avg))
     } else {
-      z = 2.0  // never seen — treat as moderately overdue
+      z = 0  // never seen — IID game has no memory; unseen ≠ overdue
+      // (was z=2.0 which hardcoded Gambler's Fallacy as prior)
     }
 
     zMap[k] = z
@@ -319,22 +346,24 @@ function modelA(chron) {
     const avgHot = digits.reduce((acc, d) => acc + digitHot[d], 0) / digits.length
     const s4 = 1 + avgHot * 0.15
 
-    // S5 — gentle sum-overdue nudge: max +7%
+    // S5 & S6 — mutually exclusive (only the stronger one fires, max +5%).
     const sumRatio = sumOD[a + b + c] || 1
-    const s5 = sumRatio > 1 ? 1 + Math.min(0.07, (sumRatio - 1) * 0.05) : 1
+    const s5raw = sumRatio > 1 ? Math.min(0.05, (sumRatio - 1) * 0.04) : 0
 
-    // S6 — gentle pair-digit-overdue nudge: max +7%, pairs/triples only
-    // Triples are rare (1/36 per draw); capping S6 prevents them being
-    // inflated to rank #1 purely by pair overdue signal.
-    let s6 = 1
     const pat = classify(a, b, c)
+    let s6raw = 0
     if (pat === 'pair' || pat === 'triple') {
       const pairDigit = (a === b || a === c) ? a : b
       const pRatio = pairOD[pairDigit] || 1
-      s6 = pRatio > 1 ? 1 + Math.min(0.07, (pRatio - 1) * 0.04) : 1
+      s6raw = pRatio > 1 ? Math.min(0.05, (pRatio - 1) * 0.03) : 0
     }
 
-    scores[k] = baseScore * sampleDecay * s3 * s4 * s5 * s6
+    // ADDITIVE combination: 1 + (s3 contrib) + (s4 contrib) + (s5/s6 contrib)
+    // Max total boost: 1 + 0.30 + 0.15 + 0.05 = 1.50× (vs old multiplicative ≈1.57×)
+    // Prevents non-linear inflation from simultaneous strong signals.
+    const auxBoost = 1 + sumDev[a + b + c] * 0.30 + avgHot * 0.15 + Math.max(s5raw, s6raw)
+
+    scores[k] = baseScore * sampleDecay * auxBoost
   }
   return { scores, zMap, gapMeta }
 }
@@ -423,9 +452,12 @@ function getSession(hoursOrDateStr) {
 
 /**
  * Model C: frequency ratio for the current day-part session.
- * Returns {} when < 20 draws in session (caller redistributes weight to A+B).
+ * Returns {} when N < 5000 (hard disable — ~339 draws/session gives ~1.57
+ * appearances per combo, variance too high for reliable signal; wC=-0.10 confirms).
+ * Also returns {} when < 20 draws in session after threshold met.
  */
 function modelC(chron, now) {
+  if (chron.length < 5000) return {}  // hard-disable: insufficient data
   const cur = getSession(now.getHours())
   const sessData = chron.filter(r => r.drawTime && getSession(r.drawTime) === cur)
   if (sessData.length < 20) return {}
@@ -481,8 +513,27 @@ function ensembleAll(chron, now) {
   // shrink pattern-detection model weights (A, B, D) toward zero so the ensemble
   // produces more uniform predictions — intellectually honest for a near-random game.
   const statRes = runStatTests(chron)
-  const SHRINK_MAP = { no_pattern: 0.5, weak_pattern: 0.75, pattern_detected: 1.0 }
-  const shrink = SHRINK_MAP[statRes.verdict] ?? 0.75
+
+  // Direction 3+4: Bayesian shrink via signal confidence derived from p-values.
+  //   no_pattern (sigCount=0) → shrink=0 → kill A, B, D; fallback to session+GBM+uniform
+  //   weak/strong pattern     → shrink ∝ min(p-values): continuous ramp 0.5 → 1.0
+  const sigCount = [
+    statRes.chiSquare.significant,
+    statRes.autocorr.significant,
+    statRes.runs.significant,
+  ].filter(Boolean).length
+
+  let shrink
+  if (sigCount === 0) {
+    shrink = 0.0   // no detectable pattern: wA=wB=wD effectively zeroed
+  } else {
+    const pVals = [statRes.chiSquare, statRes.autocorr, statRes.runs]
+      .filter(t => t.pValue !== null)
+      .map(t => t.pValue)
+    const pMin = Math.min(...pVals)
+    // pMin≈0.05 → shrink≈1.0;  pMin≈0.49 → shrink→0.5 (clamped minimum)
+    shrink = Math.max(0.5, Math.min(1.0, (0.5 - pMin) / 0.45))
+  }
 
   const { scores: rawA, zMap, gapMeta } = modelA(chron)  // gapMeta built in same O(N) pass
   const rawB = modelB(chron)
@@ -528,21 +579,30 @@ function ensembleAll(chron, now) {
     // GBM prior: fixed distribution over combos from Python offline training
     const sE = hasE ? (E[k] ?? 0.5) : 0
 
-    // Sigmoid ensemble (learned) vs fixed linear (fallback)
-    // NOTE: sC=0/sD=0/sE=0 when inactive → learned weights auto-degrade.
-    //       Sigmoid is monotone → same ranking as linear; benefit is learned
-    //       weights that can be negative (penalise noisy models).
     let score
     if (lw) {
       const wE = lw.wE ?? 0
       // Apply shrinkFactor to pattern-detecting models (A, B, D); leave session (C) and GBM (E) unchanged
       score = sigmoid((lw.wA * shrink) * sA + (lw.wB * shrink) * sB + lw.wC * sC + (lw.wD * shrink) * sD + wE * sE + lw.bias)
     } else {
-      score = wA_fixed * sA + wB_fixed * sB + wC_fixed * sC + wD_fixed * sD
+      // Apply shrink to pattern-detecting models in fixed-weight fallback too.
+      // When shrink=0 (no_pattern) and no session data → pure uniform (0.5).
+      if (shrink === 0 && !hasC) {
+        score = 0.5
+      } else {
+        score = wA_fixed * shrink * sA + wB_fixed * shrink * sB + wC_fixed * sC + wD_fixed * shrink * sD
+      }
     }
 
     // Apply triple streak boost AFTER ensemble combination
     if (pat === 'triple') score *= tripleBoost
+
+    // Cooldown penalty: suppress recently-appeared combos across all models.
+    // When z < 0, the combo appeared sooner than its own historical average.
+    // Even if Markov/session models vote for it, we respect the z-signal:
+    //   z=-1.0 → ×0.37;  z=-1.5 → ×0.22;  z=-3.0 → ×0.05 (near-zero).
+    const zVal = zMap[k]
+    if (zVal < 0) score *= Math.exp(Math.max(-3, zVal))
 
     results[k] = {
       combo: k,
@@ -571,50 +631,103 @@ function ensembleAll(chron, now) {
       : 50
   }
 
-  return results
+  // P4: Compute effective model contributions as % of total absolute weight
+  // Shows the user what fraction of the scoring each model truly accounts for.
+  // Only include models that are actively producing non-uniform scores.
+  let effectiveWeights
+  if (lw) {
+    const items = [
+      { name: 'stat', w: Math.abs(lw.wA * shrink) },
+      { name: 'mk2', w: Math.abs(lw.wB * shrink) },
+      { name: 'sess', w: hasC ? Math.abs(lw.wC) : 0 },           // 0 if C hard-disabled
+      { name: 'knn', w: hasD ? Math.abs((lw.wD ?? 0) * shrink) : 0 },
+      { name: 'gbm', w: hasE ? Math.abs(lw.wE ?? 0) : 0 },
+    ]
+    const total = items.reduce((s, m) => s + m.w, 0) || 0
+    effectiveWeights = { _uniform: total === 0 }  // all-zero → pure portfolio diversity
+    for (const { name, w } of items) effectiveWeights[name] = total > 0 ? +(w / total * 100).toFixed(1) : 0
+  } else {
+    const items = [
+      { name: 'stat', w: wA_fixed * shrink },
+      { name: 'mk2', w: wB_fixed * shrink },
+      { name: 'sess', w: hasC ? wC_fixed : 0 },
+      { name: 'knn', w: hasD ? wD_fixed * shrink : 0 },
+      { name: 'gbm', w: 0 },
+    ]
+    const total = items.reduce((s, m) => s + m.w, 0) || 0
+    effectiveWeights = { _uniform: total === 0 }
+    for (const { name, w } of items) effectiveWeights[name] = total > 0 ? +(w / total * 100).toFixed(1) : 0
+  }
+
+  return { results, effectiveWeights }
 }
 
-// ── Diversity cap + top-10 selection ─────────────────────────────────────
+// ── Portfolio-based top-10 selection ──────────────────────────────────────
 
+/**
+ * Jaccard digit-overlap between two combo strings (unique-digit sets).
+ *   "1-2-3" vs "1-2-4" → shared={1,2}, maxSize=3 → 0.667
+ *   "1-1-1" vs "2-2-2" → shared=∅              → 0.000
+ * Used to estimate correlation between two combo picks in the portfolio.
+ */
+function comboDigitOverlap(comboKeyA, comboKeyB) {
+  const aSet = new Set(comboKeyA.split('-').map(Number))
+  const bSet = new Set(comboKeyB.split('-').map(Number))
+  let shared = 0
+  for (const d of aSet) if (bSet.has(d)) shared++
+  return shared / Math.max(aSet.size, bSet.size)
+}
+
+/**
+ * Portfolio top-10 selection — maximizes expected coverage P(hit ≥ 1).
+ *
+ * Greedy slot-by-slot objective:
+ *   argmax_k [ score_k − λ × avgDigitOverlap(k, already_selected) ]
+ *
+ * Compared to pure top-by-score:
+ *   - Equivalent to portfolio theory: penalises correlated bets, rewards spread.
+ *   - When shrink=0 (no_pattern): scores are near-uniform → selection is purely
+ *     diversity-driven → maximum digit-space coverage with zero false confidence.
+ *
+ * λ = 0.10  (diversity penalty weight).
+ * Pattern caps preserved: max 2 triple, 4 pair, 4 normal.
+ * Pass 0: with pattern cap.  Pass 1: uncapped fallback (fill remaining slots).
+ */
 function selectTop10(results) {
+  const DIVERSITY_LAMBDA = 0.10
   const sorted = Object.values(results).sort((a, b) => b.score - a.score)
   const capPat = { triple: 2, pair: 4, normal: 4 }
   const countPat = { triple: 0, pair: 0, normal: 0 }
-  const digitCnt = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 }
-  const top10 = []
-  const chosen = new Set()
+  const selected = []
+  const chosenKeys = new Set()
 
-  // Pure score-based ranking — no forced overrides.
-  // Triples get boost via tripleBoostMult() applied earlier in ensembleAll();
-  // if they score high enough they rise naturally. Forcing them in by z-score
-  // produced artificial top-1 placements that reduced overall accuracy.
+  for (let pass = 0; pass < 2 && selected.length < 10; pass++) {
+    const useCap = pass === 0
+    while (selected.length < 10) {
+      let bestItem = null
+      let bestPS = -Infinity
 
-  // Pass 1: full diversity constraints
-  for (const r of sorted) {
-    if (top10.length >= 10) break
-    if (chosen.has(r.combo)) continue
-    if (countPat[r.pat] >= capPat[r.pat]) continue
-    const digits = [...new Set(r.combo.split('-').map(Number))]
-    if (digits.some(d => digitCnt[d] >= 2)) continue
-    top10.push(r); chosen.add(r.combo); countPat[r.pat]++
-    digits.forEach(d => digitCnt[d]++)
-  }
+      for (const r of sorted) {
+        if (chosenKeys.has(r.combo)) continue
+        if (useCap && countPat[r.pat] >= capPat[r.pat]) continue
 
-  // Pass 2: relax digit-sharing, keep pattern cap
-  for (const r of sorted) {
-    if (top10.length >= 10) break
-    if (!chosen.has(r.combo) && countPat[r.pat] < capPat[r.pat]) {
-      top10.push(r); chosen.add(r.combo); countPat[r.pat]++
+        const avgOverlap = selected.length > 0
+          ? selected.reduce((sum, s) => sum + comboDigitOverlap(r.combo, s.combo), 0) / selected.length
+          : 0
+
+        const ps = r.score - DIVERSITY_LAMBDA * avgOverlap
+        if (ps > bestPS) { bestPS = ps; bestItem = r }
+      }
+
+      if (!bestItem) break  // no candidates left in this pass
+
+      selected.push(bestItem)
+      chosenKeys.add(bestItem.combo)
+      countPat[bestItem.pat]++
     }
   }
 
-  // Pass 3: no constraints
-  for (const r of sorted) {
-    if (top10.length >= 10) break
-    if (!chosen.has(r.combo)) { top10.push(r); chosen.add(r.combo) }
-  }
-
-  return top10.sort((a, b) => b.score - a.score)
+  return selected.sort((a, b) => b.score - a.score)
 }
 
 /**
@@ -657,7 +770,7 @@ function predictRanked(data) {
   const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
   const now = new Date()
   const statRes = runStatTests(chron)
-  const all = ensembleAll(chron, now)
+  const { results: all, effectiveWeights } = ensembleAll(chron, now)
 
   // ── Triple signal: single O(N) pass for all triple stats ────────────
   const EXPECTED_GAP = 36 // 6/216 — one triple every 36 draws on average
@@ -720,7 +833,7 @@ function predictRanked(data) {
     chiNorm: 0,
   }))
 
-  return { top10: mapped, tripleSignal }
+  return { top10: mapped, tripleSignal, effectiveWeights }
 }
 
 /** Score map for all 216 combos — used by /stats backtest. */
@@ -729,7 +842,7 @@ function predict(data) {
   if (!data || data.length < 2) return {}
   const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
   const now = new Date()
-  const all = ensembleAll(chron, now)
+  const { results: all } = ensembleAll(chron, now)
   const out = {}
   for (const [k, v] of Object.entries(all)) out[k] = v.score
   return out

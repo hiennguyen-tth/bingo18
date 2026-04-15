@@ -214,7 +214,14 @@ const AccuracyPanel = memo(function AccuracyPanel({ stats, loading }) {
   const [showReality, setShowReality] = React.useState(false)
 
   if (loading) return (
-    <div style={{ color: '#475569', fontSize: 13, padding: '20px 0' }}>Đang tính độ chính xác…</div>
+    <div style={{ color: '#475569', fontSize: 13, padding: '20px 0' }}>Đang tải…</div>
+  )
+  // Server is computing backtest for the first time — show message, not infinite spinner
+  if (stats?.computing) return (
+    <div style={{ color: '#fbbf24', fontSize: 12, lineHeight: 1.8, padding: '8px 0' }}>
+      ⏳ Đang tính backtest lần đầu (khoảng 30–60 giây)…<br />
+      <span style={{ color: '#475569' }}>Trang sẽ tự làm mới sau 1 phút. Bạn có thể tiếp tục xem dự đoán bình thường.</span>
+    </div>
   )
   if (!stats || stats.message || stats.error || !stats.accuracy) return (
     <div style={{ color: '#fcd34d', fontSize: 12, lineHeight: 1.6 }}>
@@ -240,6 +247,11 @@ const AccuracyPanel = memo(function AccuracyPanel({ stats, loading }) {
       </span>
     )
   }
+
+  // P0: CI95 and p-value badge for top10 accuracy
+  const ci = accuracy.top10CI95
+  const pVal = accuracy.top10PValueVsBaseline
+  const isSig = accuracy.top10SignificantVsBaseline
 
   // Reality check rendering
   const verdictMeta = statTests && {
@@ -291,6 +303,27 @@ const AccuracyPanel = memo(function AccuracyPanel({ stats, loading }) {
           <div style={{ fontSize: 10, color: '#475569', marginTop: 3 }}>
             Đúng {hits[r.key]}/{tested} kỳ
           </div>
+          {/* P0: CI95 + significance badge — only shown for top10 */}
+          {r.key === 'top10' && ci && (
+            <div style={{
+              marginTop: 6, padding: '5px 8px', borderRadius: 6,
+              background: isSig ? 'rgba(52,211,153,0.07)' : 'rgba(248,113,113,0.07)',
+              border: `1px solid ${isSig ? 'rgba(52,211,153,0.25)' : 'rgba(248,113,113,0.25)'}`,
+              fontSize: 10, lineHeight: 1.55,
+            }}>
+              <span style={{ color: isSig ? '#34d399' : '#f87171', fontWeight: 700 }}>
+                {isSig ? '✓ Có ý nghĩa thống kê' : '⚠ Chưa có ý nghĩa thống kê'}
+              </span>
+              <span style={{ color: '#64748b', marginLeft: 6 }}>
+                p={pVal} · 95% CI [{ci.lower}% – {ci.upper}%]
+              </span>
+              {!isSig && (
+                <div style={{ color: '#475569', marginTop: 2 }}>
+                  Margin nằm trong noise ({accuracy.top10}% vs baseline {baseline.top10}%). Đừng hiểu là "beat random" khi p &gt; 0.05.
+                </div>
+              )}
+            </div>
+          )}
         </div>
       ))}
 
@@ -566,6 +599,12 @@ function App() {
   // Refs store cheap signatures instead of whole payloads.
   const predsRef = React.useRef('')
   const historyRef = React.useRef('')
+  // ETag refs — store server ETag per endpoint and send If-None-Match on polls
+  // so the server returns 304 when nothing changed → skip all state updates
+  const predETagRef = React.useRef(null)
+  const histETagRef = React.useRef(null)
+  const overdueETagRef = React.useRef(null)
+  const statsETagRef = React.useRef(null)
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -579,6 +618,7 @@ function App() {
   const [overdueLoading, setOverdueLoading] = useState(true)
   const [crawling, setCrawling] = useState(false)
   const [tripleSignal, setTripleSignal] = useState(null)
+  const [modelContrib, setModelContrib] = useState(null)
 
   // Bingo18 operating hours: 06:00–21:54 Vietnam time (UTC+7)
   const isNowOperating = () => {
@@ -590,8 +630,14 @@ function App() {
   const loadOverdue = useCallback(async () => {
     setOverdueLoading(true)
     try {
-      const d = await fetch('/overdue', { cache: 'no-store' }).then(r => r.json())
-      setOverdue(d)
+      const headers = overdueETagRef.current ? { 'If-None-Match': overdueETagRef.current } : {}
+      const r = await fetch('/overdue', { cache: 'no-cache', headers })
+      if (r.status !== 304) {
+        const etag = r.headers.get('ETag')
+        if (etag) overdueETagRef.current = etag
+        setOverdue(await r.json())
+      }
+      // 304 → data unchanged, skip re-render
     } catch (_) { }
     setOverdueLoading(false)
   }, [])
@@ -599,8 +645,17 @@ function App() {
   const loadStats = useCallback(async () => {
     setStatsLoading(true)
     try {
-      const s = await fetch('/stats', { cache: 'no-store' }).then(r => r.json())
-      setStats(s)
+      const headers = statsETagRef.current ? { 'If-None-Match': statsETagRef.current } : {}
+      const r = await fetch('/stats', { cache: 'no-cache', headers })
+      if (r.status !== 304) {
+        const etag = r.headers.get('ETag')
+        if (etag) statsETagRef.current = etag
+        const s = await r.json()
+        setStats(s)
+        // Server is computing for the first time — auto-retry after 60s
+        if (s?.computing) setTimeout(() => loadStatsRef.current(), 60_000)
+      }
+      // 304 → data unchanged, skip re-render
     } catch (_) { }
     setStatsLoading(false)
   }, [])
@@ -609,38 +664,53 @@ function App() {
     if (!silent) setLoading(true)
     setError(null)
     try {
-      const [pRes, hRes] = await Promise.all([
-        fetch('/predict', { cache: 'no-store' }).then(r => { if (!r.ok) throw new Error(`API ${r.status}`); return r.json() }),
-        fetch('/history?limit=500', { cache: 'no-store' }).then(r => r.json()),
+      const predH = predETagRef.current ? { 'If-None-Match': predETagRef.current } : {}
+      const histH = histETagRef.current  ? { 'If-None-Match': histETagRef.current  } : {}
+      const [pRaw, hRaw] = await Promise.all([
+        fetch('/predict',          { cache: 'no-cache', headers: predH }),
+        fetch('/history?limit=500', { cache: 'no-cache', headers: histH }),
       ])
-      const newPreds = pRes.next || []
-      const newHistory = hRes.records || []
-      const nextPredsSig = predsSignature(newPreds)
-      const nextHistorySig = historySignature(newHistory)
-      const predsChanged = nextPredsSig !== predsRef.current
-      const historyChanged = nextHistorySig !== historyRef.current
 
-      if (predsChanged) {
-        predsRef.current = nextPredsSig
-        setPreds(newPreds)
-        setMaxScore(pRes.maxScore || 1)
-        setTripleSignal(pRes.tripleSignal || null)
-        setSumStats(pRes.sumStats || [])
-      }
-      if (historyChanged) {
-        historyRef.current = nextHistorySig
-        setHistory(newHistory)
-      }
-      if (predsChanged || historyChanged || !silent) {
+      // Both unchanged — nothing to do, skip all state updates
+      if (pRaw.status === 304 && hRaw.status === 304) return
+
+      if (pRaw.status !== 304 && !pRaw.ok) throw new Error(`API ${pRaw.status}`)
+
+      const pRes = pRaw.status !== 304 ? await pRaw.json() : null
+      const hRes = hRaw.status !== 304 ? await hRaw.json() : null
+
+      if (pRes) {
+        const etag = pRaw.headers.get('ETag')
+        if (etag) predETagRef.current = etag
+        const newPreds = pRes.next || []
+        const nextSig = predsSignature(newPreds)
+        if (nextSig !== predsRef.current) {
+          predsRef.current = nextSig
+          setPreds(newPreds)
+          setMaxScore(pRes.maxScore || 1)
+          setTripleSignal(pRes.tripleSignal || null)
+          setModelContrib(pRes.modelContrib || null)
+          setSumStats(pRes.sumStats || [])
+        }
         setTotal(pRes.total || 0)
         setUpdated(new Date().toLocaleTimeString('vi-VN'))
+      }
+      if (hRes) {
+        const etag = hRaw.headers.get('ETag')
+        if (etag) histETagRef.current = etag
+        const newHistory = hRes.records || []
+        const nextSig = historySignature(newHistory)
+        if (nextSig !== historyRef.current) {
+          historyRef.current = nextSig
+          setHistory(newHistory)
+        }
       }
     } catch (e) {
       setError(e.message)
     } finally {
       if (!silent) setLoading(false)
     }
-  }, [])  // stable — state comparison uses refs, not closure values
+  }, [])  // stable — ETag refs mutated in place, no closure deps needed
 
   // Use refs so SSE handler always calls latest version of load functions
   const loadRef = React.useRef(load)
@@ -734,7 +804,7 @@ function App() {
       <div style={C.header}>
         <div>
           <div style={C.logo}>🎰 Bingo18 AI</div>
-          <div style={C.sub} className="hide-mobile">AI Ensemble 7 Tín Hiệu · Realtime SSE · Walk-forward Backtest</div>
+          <div style={C.sub} className="hide-mobile">Thống kê đa dạng hóa combo · Realtime SSE · Walk-forward Backtest (p=0.51 — chưa có edge)</div>
         </div>
         <div className="header-actions">
           <span style={C.pill}>{total} records</span>
@@ -774,7 +844,7 @@ function App() {
 
       {/* ―― Disclaimer ―― */}
       <div style={{ background: 'rgba(15,23,42,0.8)', borderBottom: '1px solid rgba(99,102,241,0.15)', padding: '7px 24px', textAlign: 'center', fontSize: 11, color: '#64748b' }}>
-        ⚠️ Đây là công cụ thống kê giải trí. Bingo18 là xổ số ngẫu nhiên — không có mô hình AI nào có thể dự đoán chính xác kết quả. Chơi có trách nhiệm.
+        ⚠️ Công cụ thống kê giải trí — không có edge dự đoán được xác nhận (p=0.51, verdict=no_pattern). Top-10 là portfolio đa dạng, không phải AI "biết trước" kết quả. Chơi có trách nhiệm.
       </div>
 
       <div style={{ maxWidth: 1120, margin: '0 auto', padding: 'clamp(12px,3vw,28px) clamp(12px,3vw,20px)' }}>
@@ -805,6 +875,57 @@ function App() {
             </div>
           </div>
           <TripleSignalCard signal={tripleSignal} anyTriple={overdue?.anyTriple} />
+
+          {/* P4: Effective model contribution bar */}
+          {modelContrib && (
+            <div style={{
+              background: 'rgba(255,255,255,0.03)',
+              border: '1px solid rgba(255,255,255,0.07)',
+              borderRadius: 10,
+              padding: '10px 14px',
+              marginBottom: 12,
+            }}>
+              <div style={{ fontSize: 10, color: '#475569', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>
+                Đóng góp model thực tế
+                {modelContrib._uniform && (
+                  <span style={{ marginLeft: 6, color: '#fbbf24', fontWeight: 400, textTransform: 'none' }}>
+                    · no_pattern → uniform (portfolio diversity only)
+                  </span>
+                )}
+              </div>
+              {!modelContrib._uniform ? (
+                <div style={{ display: 'flex', gap: 2, height: 8, borderRadius: 4, overflow: 'hidden' }}>
+                  {[
+                    { key: 'stat', label: 'stat', color: '#818cf8' },
+                    { key: 'mk2', label: 'mk2', color: '#34d399' },
+                    { key: 'sess', label: 'sess', color: '#fb923c' },
+                    { key: 'knn', label: 'knn', color: '#a78bfa' },
+                    { key: 'gbm', label: 'gbm', color: '#60a5fa' },
+                  ].filter(m => (modelContrib[m.key] ?? 0) > 0).map(m => (
+                    <div key={m.key} title={`${m.label}: ${modelContrib[m.key]}%`}
+                      style={{ width: `${modelContrib[m.key]}%`, background: m.color, minWidth: modelContrib[m.key] > 0 ? 2 : 0 }} />
+                  ))}
+                </div>
+              ) : (
+                <div style={{ height: 8, borderRadius: 4, background: 'repeating-linear-gradient(45deg,#334155,#334155 4px,#1e293b 4px,#1e293b 8px)' }} />
+              )}
+              {!modelContrib._uniform && (
+                <div style={{ display: 'flex', gap: 10, marginTop: 5, flexWrap: 'wrap' }}>
+                  {[
+                    { key: 'stat', label: 'stat (z-score)', color: '#818cf8' },
+                    { key: 'mk2', label: 'mk2 (Markov)', color: '#34d399' },
+                    { key: 'sess', label: 'sess', color: '#fb923c' },
+                    { key: 'knn', label: 'knn', color: '#a78bfa' },
+                    { key: 'gbm', label: 'gbm', color: '#60a5fa' },
+                  ].filter(m => (modelContrib[m.key] ?? 0) > 0).map(m => (
+                    <span key={m.key} style={{ fontSize: 10, color: m.color }}>
+                      {m.label} {modelContrib[m.key]}%
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           <div className="grid3">
             {preds.length === 0 && !loading && (
               <div style={{ color: '#64748b', fontSize: 13 }}>Chưa có dự đoán.</div>

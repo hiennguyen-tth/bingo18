@@ -1,10 +1,25 @@
 # Bingo18 AI Predictor
 
-Hệ thống dự đoán Bingo18 dùng **5-model Ensemble v8** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward + L2 regularisation)**. Model A được bổ sung 4 tín hiệu phụ (S3–S6), Model B dùng Laplace smoothing, và ensemble có **reality-aware shrink** khi dữ liệu trông gần random. Crawler dùng **xoso.net.vn** làm primary và **xomo.com** làm fallback, phục vụ qua REST API + Dashboard React, deploy trên Fly.io.
+Hệ thống dự đoán Bingo18 dùng **5-model Ensemble v9** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward + L2 regularisation)**. Model A được bổ sung 4 tín hiệu phụ (S3–S6 với S5/S6 loại trừ nhau), Model B dùng Laplace smoothing, và ensemble dùng **Bayesian p-value shrink**: khi `no_pattern` → wA=wB=wD=0 (kill hoàn toàn); khi có pattern → shrink liên tục theo confidence. Top-10 dùng **portfolio selection** (maximize P(hit ≥ 1)). Crawler dùng **xoso.net.vn** làm primary và **xomo.com** làm fallback, phục vụ qua REST API + Dashboard React, deploy trên Fly.io.
 
-Kể từ logic mới nhất, `/stats` bổ sung **Reality Check** (chi-square, autocorr, runs), chia 3 segment (train/valid/forward), và trả thêm **calibrated hit rate theo từng rank**. Triple signal chỉ còn là lớp thông tin hỗ trợ; top-10 không còn ép combo hoa lên đầu bằng bypass.
+Kể từ logic mới nhất, `/stats` bổ sung **Reality Check** (chi-square, autocorr, runs), chia 3 segment (train/valid/forward), và trả thêm **calibrated hit rate theo từng rank**. Triple signal chỉ còn là lớp thông tin hỗ trợ; top-10 không còn ép combo hoa lên đầu bằng bypass. **Cooldown penalty** ngăn combo vừa xuất hiện tiếp tục được suggest (fix h6 re-suggest bug).
 
 > **Production:** https://xs-bingo18.fly.dev
+
+---
+
+## ⚠️ Giới hạn thống kê — Đọc trước khi dùng
+
+Đây là những sự thật cần nhìn thẳng trước khi diễn giải bất kỳ kết quả nào:
+
+| Thực tế | Chi tiết |
+|---------|----------|
+| **p-value = 0.51** | Top-10 đạt 5.07% vs random 4.63% (+9.5% relative) — nhưng **chưa có ý nghĩa thống kê**. Khả năng cao đây là variance, không phải edge. Cần thêm nhiều kỳ để kết luận. |
+| **Reality check = no_pattern** | Chi-square p=0.18, autocorr p=0.41, runs p=0.62 → cả 3 test đều không reject H0. Data gần như IID random. **Giới hạn vật lý, không phải do code.** |
+| **Effective pipeline = 1 model** | `wA=0.46, wB=0.10, wC=–0.10 (disabled), wD=0, wE=0` → khi `no_pattern`, shrink=0 khiến wA=wB=wD=0. Score tất cả combo gần bằng nhau → lựa chọn thực chất là **portfolio diversity thuần túy**, không phải AI prediction. |
+| **Bản chất IID** | Bingo18 / 36D có 216 outcomes. Không có bộ nhớ giữa các kỳ (như đã xác nhận bởi autocorr). Về lý thuyết, không có edge dài hạn có thể khai thác. |
+
+> **Tóm lại:** Hệ thống này là **công cụ thống kê giải trí**. Thuật toán giúp chọn combo đa dạng thay vì chọn ngẫu nhiên — không hơn, không kém. Đừng diễn giải top-10 là "AI dự đoán được kết quả".
 
 ---
 
@@ -20,7 +35,7 @@ bingo/
 ├── dataset/
 │   └── history.json           # Dữ liệu đã crawl (persistent Fly volume)
 ├── predictor/
-│   ├── ensemble.js            # 5-model ensemble v8 (sigmoid, learned weights, rankNorm)
+│   ├── ensemble.js            # 5-model ensemble v9 (sigmoid, learned weights, rankNorm)
 │   ├── stats_tests.js         # Statistical reality check (chi-square, autocorr, runs)
 │   ├── model_d.js              # k-NN Temporal Similarity (pure-JS)
 │   ├── frequency.js           # Tần suất combo
@@ -75,7 +90,7 @@ node api/server.js             # dashboard → http://localhost:8080
 | GET | `/predict` | Top 10 combo + breakdown model + `tripleSignal` đã được AI xác nhận — **cached 5 phút** |
 | GET | `/history?limit=500` | Lịch sử kỳ gần nhất |
 | GET | `/overdue` | Thống kê quá hạn: bộ ba / `anyTriple` / cặp đôi / tổng — **cached** |
-| GET | `/stats` | Walk-forward backtest + Reality Check + Train/Valid/Forward + calibrated rank buckets — **cached** |
+| GET | `/stats` | Walk-forward backtest + Reality Check + Train/Valid/Forward + calibrated rank buckets — **disk-persisted, stale-while-revalidate** |
 | GET | `/frequency` | Tần suất combo — **cached** |
 | GET | `/events` | SSE stream — phát `new-draw` khi có kỳ mới |
 | POST | `/crawl` | Crawl thủ công ngay lập tức |
@@ -96,7 +111,7 @@ node api/server.js             # dashboard → http://localhost:8080
 
 ---
 
-## Logic dự đoán — Ensemble v8
+## Logic dự đoán — Ensemble v9
 
 ### Tổng quan pipeline
 
@@ -111,21 +126,31 @@ Lịch sử N kỳ
                                                                     │
                                                       S2 Triple boost (chỉ khi hạn)
                                                                     │
-                                              Diversity cap + top-10 selection
+                                                    Cooldown penalty (z < 0 → suppressed)
+                                                                    │
+                                              Portfolio selection (maximize coverage)
 ```
 
-### Sigmoid ensemble (v8)
+### Sigmoid ensemble (v9)
 
 ```
 score = sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias)
 ```
+
+> **Thực tế hiện tại (no_pattern):** shrink=0 → wA=wB=wD=0; wC disabled (N<5000); wE=0.
+> Rút gọn: `score ≈ sigmoid(bias) = const ≈ 0.378` cho **tất cả** combo.
+> → Lựa chọn top-10 hoàn toàn do **portfolio diversity** (digit overlap penalty), không phải model score.
+> Chỉ khi `pattern_detected` (cần ≥2 test có p<0.05) thì A và B mới có trọng số thực sự.
 
 - Trọng số học qua **walk-forward optimisation với L2 regularisation** (node scripts/train_weights.js)
 - `objective = (top10_acc - baseline_random) - λ·(wA²+wB²+wC²+wD²+wE²)`, λ=0.01 để tránh học noise không beat nổi random
 - Weights có thể **âm** → phạt model nhiễu; **Model D tự động bị disable khi wD < 0**
 - Model E (GBM): dùng khi `python/ml_output.json` tồn tại và còn fresh (< 200 kỳ staleness)
 - Fallback về fixed linear nếu `dataset/model.json` không tồn tại hoặc `improvesValid=false`
-- Khi `Reality Check = no_pattern`, weights của A/B/D bị shrink để tránh overconfidence
+- **Direction 3+4 — Bayesian p-value shrink:**
+  - `no_pattern` (0 test significant) → `shrink=0` → wA=wB=wD=**0** (kill hoàn toàn, không còn shrink nhẹ)
+  - `weak/strong pattern` → `shrink ∝ min(p-values)`: ramp liên tục từ 0.5 (pMin→0.5) đến 1.0 (pMin→0.05)
+  - `signal_confidence = max(0.5, (0.5 − pMin) / 0.45)` — không dùng discrete SHRINK_MAP nữa
 
 **Kết quả học gần nhất** (`dataset/model.json`):
 
@@ -139,10 +164,12 @@ score = sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias)
 ```json
 { "version": "v6", "wA": 0.46, "wB": 0.10, "wC": -0.10, "wD": 0.00, "wE": 0.00, "bias": -0.50, "lambda": 0.01 }
 ```
-> wC âm → session model hơi nhiễu ở dataset hiện tại.  
-> wD=0 → k-NN auto-disabled (wD không âm nhưng =0 trong grid).  
+> wA=0.46 — có chút signal hoặc noise fit; không thể kết luận vì p=0.51.  
+> wB=0.10 — Markov rất yếu; cần ~50.000 kỳ để transition matrix có ý nghĩa.  
+> wC=–0.10 (âm) → disabled hoàn toàn khi N<5000 — session model là nhiễu.  
+> wD=0 → k-NN auto-disabled — không có local pattern để học.  
 > wE=0 → GBM chưa có signal (cần ~5000+ kỳ).  
-> L2 regularisation giữ weights compact, tránh overfit.
+> **Dưới no_pattern, ensemble thực chất là: `score ≈ sigmoid(–0.50) ≈ 0.378` (hằng số) → uniform.**
 
 ### Re-train
 
@@ -219,12 +246,21 @@ Augmented bởi 4 tín hiệu phụ — nhân AFTER baseScore:
 |--------|-------|----------|
 | **S3** Sum deviation | Sum bucket thiếu so với kỳ vọng (window 200 kỳ) | +0–30% |
 | **S4** Digit momentum | Digit đang "hot" trong 30 kỳ gần nhất | +0–15% |
-| **S5** Sum overdue | Sum bucket quá hạn (kySinceLast/avgInterval > 1) | +0–7% |
-| **S6** Pair-digit overdue | Cặp đôi VV quá hạn, áp cho combo pair/triple | +0–7% |
+| **S5** Sum overdue | Sum bucket quá hạn (kySinceLast/avgInterval > 1) | **+0–5%** |
+| **S6** Pair-digit overdue | Cặp đôi VV quá hạn, áp cho combo pair/triple | **+0–5%** |
 
 ```
-score_A = baseScore × s3 × s4 × s5 × s6
+score_A = baseScore × (1 + s3_contrib + s4_contrib + max(s5, s6))
+           ┓ ADDITIVE (v9 — was multiplicative, cầp max 1.50×)
+
+# s3_contrib = sumDev × 0.30  (max 0.30)
+# s4_contrib = avgHot × 0.15  (max 0.15)
+# max(s5,s6)               (max 0.05, chỉ cái cao hơn)
 ```
+
+> **v8 → v9:** S5+S6 trước nhân cộng đồng thời (combined ≤1.57×). Nay additive, tối đa 1.50×. Ngăn inflation phi tuyến khi nhiều tín hiệu cùng mạnh.
+
+> **z=0 cho unseen combo (v9):** Combo chưa xuất hiện từ nay nhận z=0 thay vì z=2.0 cũ. z=2.0 là Gambler’s Fallacy. IID game không có bộ nhớ — unseen ≠ sap ra.
 
 Ngoài ra Model A bị nhân thêm `sampleDecay = min(1, log(N)/log(5000))` để tránh quá tự tin khi dữ liệu còn ít.
 
@@ -255,7 +291,7 @@ Ca tối:   18h–6h
 score[k] = count_in_session / (session_draws / 216)
 ```
 
-**Tự động disable:** session < 20 kỳ → weight = 0, redistrib về 50% A + 50% B.
+**Tự động disable:** N < 5000 kỳ → hard-disable hoàn toàn (không phụ thuộc vào session size). Lý do: ~339 kỳ/ca → TB 1.57 lần/combo/ca → variance quá cao để có signal thực. wC=-0.10 (âm, nhiễu) là expected. Không còn để weight âm hoạt động ngầm khi dữ liệu chưa đủ.
 
 ---
 
@@ -305,13 +341,39 @@ Bingo18 có cấu trúc xác suất lý thuyết: Sum=10 và Sum=11 phổ biến
 
 ---
 
-### Diversity cap + top-10 selection
+### Portfolio top-10 selection (Direction 1+2)
 
+**Objective:** maximize P(hit ≥ 1) thay vì P(combo_i đúng).
+
+Greedy slot-by-slot:
 ```
-Pass 1 — full: max 2 triple, 4 pair, 4 normal; không quá 2 combo cùng digit
-Pass 2 — relax digit-sharing, giữ pattern cap
-Pass 3 — no constraints
+argmax_k [ score_k − λ × avgDigitOverlap(k, already_selected) ]
+  λ = 0.10
+  avgDigitOverlap = Jaccard similarity trên tập digit unique
 ```
+
+Ví dụ: nếu đã chọn `1-2-3`, thì `1-2-4` bị phạt `λ × 0.67` (2 trong 3 digit giống).
+Các combo không share digit nào (e.g. `4-5-6`) không bị phạt.
+
+| Chế độ | Hành vi |
+|--------|---------|
+| `no_pattern` (shrink=0) | Scores gần như đồng đều → lựa chọn **pure diversity** → tối đa digit coverage |
+| `pattern_detected` | Score spread lớn → high-score combos vẫn dẫn đầu, diversity penalty chỉ phân biệt ngang điểm |
+
+Pattern cap giữ nguyên: max 2 triple, 4 pair, 4 normal. Pass 2 không giới hạn cap (fallback).
+
+### Cooldown penalty (bug fix)
+
+Sau khi tính ensemble score, nếu combo vừa xuất hiện gần đây hơn trung bình lịch sử:
+```
+z < 0 → score × exp(max(-3, z))
+
+Ví dụ 6-6-6 vừa ra 3 kỳ trước, z = -1.53:
+  penalty = exp(-1.53) ≈ 0.22 → score giảm 78%
+```
+
+Ngăn Markov/session override tín hiệu z-score = "combo không quá hạn".
+Không còn trường hợp combo vừa ra tiếp tục được suggest ở top-10.
 
 Không còn bypass ép combo quá hạn vào top-10. Ranking giờ thuần theo final score sau ensemble.
 
@@ -367,11 +429,13 @@ curl -X POST https://xs-bingo18.fly.dev/crawl
 
 ## Walk-forward Backtest
 
-Train trên `i-1` kỳ, dự đoán kỳ `i`:
+Train trên `i-1` kỳ, dự đoán kỳ `i`, lấy mẫu 1/3 kỳ (SAMPLE_EVERY=3) để tránh block event loop:
 - **Top-1**: combo #1 khớp kỳ thực tế
 - **Top-3**: combo trong top 3
 - **Top-10**: combo trong top 10
 - **Random baseline**: 0.46% / 1.39% / 4.63%
+
+**Performance (v10):** Backtest chạy background bất đồng bộ (setImmediate yielding) → health check và /predict không bị block. Kết quả lưu vào `dataset/stats_cache.json` (disk-persisted), load ngay khi restart — phản hồi `/stats` trong <1ms thay vì ~19s trước đây.
 
 ### Segmented accuracy (train / valid / forward)
 
@@ -409,7 +473,9 @@ Nếu **train >> forward**: model có thể overfit. Nếu cả 3 gần nhau: co
 | **Runs** | Chuỗi trên/dưới median ngẫu nhiên | Có hot/cold streak có ý nghĩa |
 
 **Verdict**:
-- `no_pattern` — 0 test significant → game consistent với IID random → model A/B/D fit noise
+- `no_pattern` — 0 test significant → shrink=0 → wA=wB=wD=0; fallback về session+GBM+uniform+portfolio diversity
+- `weak_pattern` — 1 test → shrink=max(0.5, (0.5−pMin)/0.45) (continuous, không discrete)
+- `pattern_detected` — 2–3 test → shrink→1.0
 - `weak_pattern` — 1 test → có thể là noise, cần thêm dữ liệu
 - `pattern_detected` — 2-3 test → evidence cấu trúc thực sự
 
@@ -509,16 +575,23 @@ fly logs         # stream logs realtime
 | weights_history.json | ✅ | Time-series log mỗi lần train |
 | backtest_history.json | ✅ | Time-series accuracy log mỗi lần backtest |
 | Dataset corruption guard | ✅ | Array.isArray check trong loadHistory() |
-| Backtest dùng predict.ranked() | ✅ | Đo đúng pipeline production (diversity cap + boost) |
+| Backtest dùng predict.ranked() | ✅ | Đo đúng pipeline production (portfolio + boost) |
 | scripts/train_weights.js | ✅ | Walk-forward grid+descent+L2, tự lưu model.json |
 | Python GBM predictor | ✅ | Offline tool, 64-feature GBM, xuất ml_output.json |
 | 5 trang SEO content | ✅ | about, how-it-works, 2 blog, privacy |
 | AdSense ads.txt | ✅ | pub-2330743593269954 |
 | Sitemap + robots.txt | ✅ | Đã submit Search Console |
 | /ml-status endpoint | ✅ | Xem trạng thái Model D + Python GBM |
-| Backtest top-10 | ✅ | 5.07% vs baseline 4.63% (+9.5%) |
-| S5 sum overdue boost | ✅ | +0–25% cho combo có sum quá hạn |
-| S6 pair-digit overdue boost | ✅ | +0–20% cho pair/triple khi cặp digit đó quá hạn |
+| Backtest top-10 | ✅ | 5.07% vs baseline 4.63% (+9.5% relative, p≈0.51 — chưa ý nghĩa) |
+| CI95 + p-value trên dashboard | ✅ | "Chưa ý nghĩa" khi p>0.05, tránh user hiểu nhầm |
+| Model contribution % (UI) | ✅ | Hiển thị % đóng góp thực của từng model sau shrink |
+| z=0 cho unseen combo (P1) | ✅ | V9 fix Gambler’s Fallacy (was z=2.0 prior) |
+| S3–S6 additive (P2) | ✅ | Không còn multiplicative compounding; max 1.50× |
+| Model C hard-disable N<5000 (P3) | ✅ | Không để weight âm hoạt động ngầm nữa |
+| S5/S6 mutually exclusive (max +5%) | ✅ | Chỉ lấy max(s5,s6); trước là cộng đồng thời ≤+14.5% |
+| Cooldown penalty (z < 0) | ✅ | score × exp(z) — fix h6 re-suggest; z=-1.5 → ×0.22 |
+| Direction 3+4: Bayesian p-value shrink | ✅ | no_pattern→shrink=0 (kill A/B/D); pattern→continuous 0.5→1.0 |
+| Direction 1+2: Portfolio selection | ✅ | argmax[score − λ×avgOverlap]; λ=0.10; maximize P(hit≥1) |
 | anyTriple signal (xxx) | ✅ | Tín hiệu + thống kê hoa bất kỳ trên dashboard |
 | TripleSignalCard UI | ✅ | LOW/MED/HIGH + hotTriples + boost multiplier |
 | Confidence 35–80% | ✅ | Thay thế hardcap 75%; tính theo score spread top-10 |

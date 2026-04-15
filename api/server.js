@@ -80,8 +80,30 @@ function broadcast(eventName, data) {
 // ── In-memory cache (invalidated when crawl finds new data) ───────────────
 const apiCache = new Map()  // key → { data, ts }
 
+// ── Persistent stats cache (non-blocking background computation) ──────────
+// Walk-forward backtest takes ~19s synchronously on CPU — instead we compute
+// in background using setImmediate yielding and save result to disk so it
+// survives restarts. Clients always get an instant response (stale-while-revalidate).
+const STATS_CACHE_FILE = path.join(__dirname, '../dataset/stats_cache.json')
+let _statsCache = null      // last computed result (in-memory)
+let _statsComputing = false  // guard: prevent concurrent computes
+
+  // Load disk cache at startup so first /stats request is instant
+  ; (async () => {
+    try {
+      _statsCache = await fs.readJSON(STATS_CACHE_FILE)
+      console.log('[stats] loaded disk cache, computed:', new Date(_statsCache._computedAt || 0).toISOString())
+    } catch (_) {
+      console.log('[stats] no disk stats cache — will compute after server starts')
+      // Kick off initial compute so data is ready quickly
+      setTimeout(() => _computeStatsBackground(), 3000)
+    }
+  })()
+
 function invalidateCache() {
   apiCache.clear()
+  // New draw arrived — recompute stats in background (non-blocking)
+  _computeStatsBackground()
 }
 
 /**
@@ -95,24 +117,144 @@ function withCache(key, ttlMs, fn) {
     const now = Date.now()
     const hit = apiCache.get(key)
     if (hit && (ttlMs === 0 || now - hit.ts < ttlMs)) {
+      const etag = `"${hit.ts}"`
       res.set('X-Cache', 'HIT')
-      const lastMod = new Date(hit.ts).toUTCString()
-      res.set('Last-Modified', lastMod)
-      if (req.headers['if-modified-since'] && new Date(req.headers['if-modified-since']) >= new Date(hit.ts)) {
-        return res.status(304).end()
-      }
+      res.set('ETag', etag)
+      res.set('Last-Modified', new Date(hit.ts).toUTCString())
+      if (req.headers['if-none-match'] === etag) return res.status(304).end()
       return res.json(hit.data)
     }
     try {
       const data = await fn(req)
       apiCache.set(key, { data, ts: now })
       res.set('X-Cache', 'MISS')
+      res.set('ETag', `"${now}"`)
       res.set('Last-Modified', new Date(now).toUTCString())
       res.json(data)
     } catch (err) {
       console.error(`[${key}]`, err.message)
       res.status(500).json({ error: err.message })
     }
+  }
+}
+
+/**
+ * Walk-forward backtest in background — never blocks the event loop.
+ * Uses setImmediate between batches so health/predict/SSE always respond.
+ * Samples every SAMPLE_EVERY draw (default 3) for 3× speedup; results still
+ * statistically representative. Saves result to disk for restart persistence.
+ */
+async function _computeStatsBackground() {
+  if (_statsComputing) return
+  _statsComputing = true
+  const t0 = Date.now()
+  console.log('[stats] background backtest starting...')
+  try {
+    const data = await loadHistory()
+    const WINDOW = 10
+    if (data.length < WINDOW + 2) {
+      _statsCache = { message: 'Need more data', total: data.length, needed: WINDOW + 2, _computedAt: Date.now() }
+      await fs.writeJSON(STATS_CACHE_FILE, _statsCache)
+      return
+    }
+
+    const chron = [...data].reverse()
+    const N = chron.length
+    const trainEnd = Math.floor(N * 0.6)
+    const validEnd = Math.floor(N * 0.8)
+
+    let top1 = 0, top3 = 0, top10 = 0, tested = 0
+    const rankHits = new Array(10).fill(0)
+    const seg = {
+      train: { top1: 0, top3: 0, top10: 0, tested: 0 },
+      valid: { top1: 0, top3: 0, top10: 0, tested: 0 },
+      forward: { top1: 0, top3: 0, top10: 0, tested: 0 },
+    }
+
+    // Yield every YIELD_EVERY iterations so health check + SSE stay responsive.
+    // SAMPLE_EVERY=3 → test every 3rd draw (~3× faster, still unbiased estimate).
+    const YIELD_EVERY = 10
+    const SAMPLE_EVERY = 3
+    let batchCount = 0
+
+    for (let i = WINDOW; i < N; i += SAMPLE_EVERY) {
+      if (batchCount++ % YIELD_EVERY === 0) {
+        await new Promise(resolve => setImmediate(resolve))
+      }
+      const slice = chron.slice(0, i)
+      const { top10: tp } = predict.ranked(slice)
+      if (!tp || tp.length === 0) continue
+
+      const actual = `${chron[i].n1}-${chron[i].n2}-${chron[i].n3}`
+      const combos = tp.map(r => r.combo)
+      const hit1 = combos[0] === actual
+      const hit3 = combos.slice(0, 3).some(c => c === actual)
+      const hit10 = combos.some(c => c === actual)
+
+      for (let r = 0; r < Math.min(tp.length, 10); r++) {
+        if (tp[r].combo === actual) { rankHits[r]++; break }
+      }
+      if (hit1) top1++
+      if (hit3) top3++
+      if (hit10) top10++
+      tested++
+
+      const segKey = i < trainEnd ? 'train' : i < validEnd ? 'valid' : 'forward'
+      seg[segKey].tested++
+      if (hit1) seg[segKey].top1++
+      if (hit3) seg[segKey].top3++
+      if (hit10) seg[segKey].top10++
+    }
+
+    const baseline = { top1: +(1 / 216 * 100).toFixed(2), top3: +(3 / 216 * 100).toFixed(2), top10: +(10 / 216 * 100).toFixed(2) }
+
+    function _normCDF(z) {
+      const t = 1 / (1 + 0.2316419 * Math.abs(z))
+      const d2 = 0.3989423 * Math.exp(-z * z / 2)
+      const p = d2 * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))))
+      return z > 0 ? 1 - p : p
+    }
+    const p_hat10 = tested > 0 ? top10 / tested : 0
+    const p_base10 = 10 / 216
+    const se_test = Math.sqrt(p_base10 * (1 - p_base10) / Math.max(tested, 1))
+    const z_vs_base = (p_hat10 - p_base10) / (se_test || 1)
+    const pValueVsBaseline = +(2 * (1 - _normCDF(Math.abs(z_vs_base)))).toFixed(4)
+    const se_ci = Math.sqrt(p_hat10 * (1 - p_hat10) / Math.max(tested, 1))
+    const ci95 = {
+      lower: +(Math.max(0, p_hat10 - 1.96 * se_ci) * 100).toFixed(2),
+      upper: +((p_hat10 + 1.96 * se_ci) * 100).toFixed(2),
+    }
+
+    const segments = {}
+    for (const [name, s] of Object.entries(seg)) {
+      const t = s.tested
+      segments[name] = { tested: t, top1: t ? +(s.top1 / t * 100).toFixed(2) : 0, top3: t ? +(s.top3 / t * 100).toFixed(2) : 0, top10: t ? +(s.top10 / t * 100).toFixed(2) : 0 }
+    }
+
+    const statTests = runStatTests(chron)
+    const calBuckets = tested > 0 ? rankHits.map((h, i) => ({ rank: i + 1, hitPct: +(h / tested * 100).toFixed(3) })) : []
+
+    _statsCache = {
+      tested, total: N,
+      accuracy: {
+        top1: tested ? +(top1 / tested * 100).toFixed(2) : 0,
+        top3: tested ? +(top3 / tested * 100).toFixed(2) : 0,
+        top10: tested ? +(top10 / tested * 100).toFixed(2) : 0,
+        top10CI95: ci95,
+        top10PValueVsBaseline: pValueVsBaseline,
+        top10SignificantVsBaseline: pValueVsBaseline < 0.05,
+      },
+      hits: { top1, top3, top10 },
+      baseline, segments, statTests, calBuckets,
+      _computedAt: Date.now(),
+      _sampleEvery: SAMPLE_EVERY,
+    }
+    await fs.writeJSON(STATS_CACHE_FILE, _statsCache)
+    console.log(`[stats] backtest done in ${((Date.now() - t0) / 1000).toFixed(1)}s, tested=${tested}/${N} draws`)
+  } catch (err) {
+    console.error('[stats] background compute error:', err.message, err.stack)
+  } finally {
+    _statsComputing = false
   }
 }
 
@@ -209,7 +351,7 @@ app.get('/predict', withCache('predict', 5 * 60_000, async () => {
   }
 
   // Ranked predictions with full breakdown
-  const { top10, tripleSignal } = predict.ranked(data)
+  const { top10, tripleSignal, effectiveWeights } = predict.ranked(data)
 
   // pct = share within top-10 so they sum to 100%
   const top10Total = top10.reduce((s, r) => s + r.score, 0) || 1
@@ -248,7 +390,7 @@ app.get('/predict', withCache('predict', 5 * 60_000, async () => {
     .map(([sum, cnt]) => ({ sum: +sum, pct: +(cnt / data.length * 100).toFixed(2) }))
     .sort((a, b) => b.pct - a.pct)
 
-  return { next, tripleSignal, sumStats, total: data.length, maxScore: +maxScore.toFixed(3) }
+  return { next, tripleSignal, modelContrib: effectiveWeights, sumStats, total: data.length, maxScore: +maxScore.toFixed(3) }
 }))
 
 /** GET /ml-status — Model D (k-NN) readiness + dataset stats */
@@ -315,113 +457,32 @@ app.get('/frequency', withCache('frequency', 5 * 60_000, async () => {
 /**
  * GET /stats — walk-forward backtest accuracy + statistical reality check.
  *
- * Walk-forward: train on i-1 draws, predict draw i.
- * Segmented: train (first 60%), valid (next 20%), forward (last 20%)
- *   → lets you spot overfitting if valid/forward accuracy diverges from train.
- *
- * Statistical tests (chiSquare, autocorr, runs):
- *   → p < 0.05 means that specific test found evidence of non-randomness.
- *   → If all p > 0.05: data consistent with random → Models A/B/D
- *     are working on noise; wA=0.46 may just be fit noise.
+ * Stale-while-revalidate: always responds instantly from _statsCache.
+ * Background recompute runs via _computeStatsBackground() (non-blocking).
+ * Result is persisted to dataset/stats_cache.json so it survives restarts.
  */
-app.get('/stats', withCache('stats', 5 * 60_000, async () => {
-  const data = await loadHistory()
-  const WINDOW = 10
-  if (data.length < WINDOW + 2) {
-    return { message: 'Need more data', total: data.length, needed: WINDOW + 2 }
-  }
-
-  // Data is newest-first in file; reverse for chronological order
-  const chron = [...data].reverse()
-  const N = chron.length
-
-  // Segment boundaries (by draw index in chron)
-  const trainEnd = Math.floor(N * 0.6)
-  const validEnd = Math.floor(N * 0.8)
-
-  // Overall counters
-  let top1 = 0, top3 = 0, top10 = 0, tested = 0
-  // Per-rank hit counters for calibrated confidence (rank 1–10 → empirical hit rate)
-  const rankHits = new Array(10).fill(0)
-
-  // Per-segment counters: train / valid / forward
-  const seg = {
-    train: { top1: 0, top3: 0, top10: 0, tested: 0 },
-    valid: { top1: 0, top3: 0, top10: 0, tested: 0 },
-    forward: { top1: 0, top3: 0, top10: 0, tested: 0 },
-  }
-
-  for (let i = WINDOW; i < N; i++) {
-    const slice = chron.slice(0, i)
-    // Use predict.ranked() — same pipeline as production (diversity cap + triple boost)
-    const ranked = predict.ranked(slice)
-    if (!ranked || !ranked.top10 || ranked.top10.length === 0) continue
-
-    const actual = `${chron[i].n1}-${chron[i].n2}-${chron[i].n3}`
-    const top = ranked.top10.map(r => r.combo)
-
-    const hit1 = top[0] === actual
-    const hit3 = top.slice(0, 3).some(c => c === actual)
-    const hit10 = top.slice(0, 10).some(c => c === actual)
-
-    // Record which rank position the actual draw landed in (for calibration)
-    for (let r = 0; r < Math.min(ranked.top10.length, 10); r++) {
-      if (ranked.top10[r].combo === actual) { rankHits[r]++; break }
+app.get('/stats', (req, res) => {
+  if (_statsCache) {
+    const ts = _statsCache._computedAt || 0
+    const etag = `"${ts}"`
+    res.set('ETag', etag)
+    res.set('Last-Modified', new Date(ts).toUTCString())
+    res.set('X-Cache', _statsComputing ? 'STALE' : 'HIT')
+    res.set('X-Stats-Computing', _statsComputing ? '1' : '0')
+    // 304 only when not mid-recompute (stale data still valid, just serve it)
+    if (req.headers['if-none-match'] === etag && !_statsComputing) return res.status(304).end()
+    // Trigger fresh compute if cache is older than 15 minutes
+    if (!_statsComputing) {
+      const age = Date.now() - ts
+      if (age > 15 * 60_000) _computeStatsBackground()
     }
-
-    if (hit1) top1++
-    if (hit3) top3++
-    if (hit10) top10++
-    tested++
-
-    const segKey = i < trainEnd ? 'train' : i < validEnd ? 'valid' : 'forward'
-    seg[segKey].tested++
-    if (hit1) seg[segKey].top1++
-    if (hit3) seg[segKey].top3++
-    if (hit10) seg[segKey].top10++
+    return res.json(_statsCache)
   }
-
-  const baseline = {
-    top1: +(1 / 216 * 100).toFixed(2),
-    top3: +(3 / 216 * 100).toFixed(2),
-    top10: +(10 / 216 * 100).toFixed(2),
-  }
-
-  // Build segmented accuracy object
-  const segments = {}
-  for (const [name, s] of Object.entries(seg)) {
-    const t = s.tested
-    segments[name] = {
-      tested: t,
-      top1: t ? +(s.top1 / t * 100).toFixed(2) : 0,
-      top3: t ? +(s.top3 / t * 100).toFixed(2) : 0,
-      top10: t ? +(s.top10 / t * 100).toFixed(2) : 0,
-    }
-  }
-
-  // Statistical reality check — runs OUTSIDE the backtest loop (cheap O(N))
-  const statTests = runStatTests(chron)
-
-  // Calibrated hit rates per rank position (empirical win rate at each rank)
-  const calBuckets = tested > 0
-    ? rankHits.map((h, i) => ({ rank: i + 1, hitPct: +(h / tested * 100).toFixed(3) }))
-    : []
-
-  return {
-    tested,
-    total: N,
-    accuracy: {
-      top1: tested ? +(top1 / tested * 100).toFixed(2) : 0,
-      top3: tested ? +(top3 / tested * 100).toFixed(2) : 0,
-      top10: tested ? +(top10 / tested * 100).toFixed(2) : 0,
-    },
-    hits: { top1, top3, top10 },
-    baseline,
-    segments,
-    statTests,
-    calBuckets,
-  }
-}))
+  // No cache yet: return "computing" status and trigger compute
+  if (!_statsComputing) _computeStatsBackground()
+  res.set('X-Cache', 'MISS')
+  res.json({ computing: true, message: 'Đang tính toán lần đầu, vui lòng thử lại sau 30 giây…', total: 0 })
+})
 
 /** GET /features — last 20 feature vectors */
 app.get('/features', async (req, res) => {
