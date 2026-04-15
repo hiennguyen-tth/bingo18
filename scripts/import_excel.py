@@ -113,12 +113,21 @@ new_records = []
 skipped_dup = 0
 skipped_bad = 0
 
+# Skip any date in the crawler's operational period (on or after 2026-04-01)
+# to avoid synthetic ky values that could override or mis-sort with real crawler ky values.
+CRAWLER_START_DATE = datetime.date(2026, 4, 1)
+
 for row in data_rows:
     raw_time = row[1]
     if not isinstance(raw_time, datetime.time):
         continue  # skip header or empty rows
 
     for col_idx, date in date_cols:
+        # Skip dates covered by the real crawler to avoid synthetic ky conflicts
+        if date >= CRAWLER_START_DATE:
+            skipped_bad += 1
+            continue
+
         value = row[col_idx] if col_idx < len(row) else None
         parsed = parse_draw(value)
         if parsed is None:
