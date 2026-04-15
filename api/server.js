@@ -52,10 +52,13 @@ const INDEX_TPL = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'ut
 const apiCache = new Map()  // key → { data, ts }
 
 // ── Disk cache state ───────────────────────────────────────────────────────
-let _statsCache      = null
-let _statsComputing  = false
-let _prewarmRunning  = false
-let _invalidateTimer = null
+let _statsCache        = null
+let _statsComputing    = false
+let _prewarmRunning    = false
+let _prewarmTimer      = null   // debounced prewarm (avoid cascade)
+let _invalidateTimer   = null   // debounced stats recompute
+let _lastStatsCompute  = 0      // epoch ms — rate-limit to 1/10min
+let _lastInvalidateAt  = 0      // epoch ms — watcher cooldown
 
 // ── Load all disk caches at startup in parallel ────────────────────────────
 // predict, overdue, and stats all survive container restarts this way.
@@ -77,8 +80,12 @@ let _invalidateTimer = null
 })()
 
 // ── History file watcher — invalidate on external change ──────────────────
+// 10-second cooldown prevents cascade when crawl writes file repeatedly.
 fs.watchFile(HISTORY_FILE, { interval: 3000, persistent: false }, (curr, prev) => {
   if (curr.mtime > prev.mtime) {
+    const now = Date.now()
+    if (now - _lastInvalidateAt < 10_000) return  // debounce watcher
+    _lastInvalidateAt = now
     console.log('[cache] history.json changed externally — invalidating + SSE')
     invalidateCache()
     setTimeout(() => broadcast('new-draw', { added: 0, latestKy: '?', total: 0, ts: new Date().toISOString(), source: 'watcher' }), 500)
@@ -97,10 +104,18 @@ function broadcast(eventName, data) {
 
 // ── Cache helpers ──────────────────────────────────────────────────────────
 function invalidateCache() {
+  _lastInvalidateAt = Date.now()  // prevent watcher from double-firing
   apiCache.clear()
-  _prewarmCaches()   // recompute predict + overdue immediately (~50ms) and persist to disk
+  // Debounce prewarm — waits 800ms so rapid consecutive invalidations only fire once.
+  clearTimeout(_prewarmTimer)
+  _prewarmTimer = setTimeout(() => _prewarmCaches(), 800)
+  // Rate-limited stats recompute: at most once per 10 minutes.
   clearTimeout(_invalidateTimer)
-  _invalidateTimer = setTimeout(() => _computeStatsBackground(), 3_500)  // debounce stats
+  const msSinceLastStats = Date.now() - _lastStatsCompute
+  const statsDelay = msSinceLastStats < 10 * 60_000
+    ? (10 * 60_000 - msSinceLastStats)  // wait out the remainder
+    : 5_000                             // first time: 5s debounce
+  _invalidateTimer = setTimeout(() => _computeStatsBackground(), statsDelay)
 }
 
 /**
@@ -330,12 +345,14 @@ async function _computeStatsBackground() {
       forward: { top1: 0, top3: 0, top10: 0, tested: 0 },
     }
 
-    const YIELD_EVERY  = 10
-    const SAMPLE_EVERY = 3
-    let batchCount = 0
+    // Dynamic SAMPLE_EVERY: target ~300 test windows regardless of dataset size.
+    // Yield after EVERY iteration so health-check (/health) is never blocked > 200ms.
+    const SAMPLE_EVERY = Math.max(1, Math.floor(N / 300))
+    // Start from 30% mark — early windows have too little training data.
+    const START_I      = Math.max(WINDOW, Math.floor(N * 0.3))
 
-    for (let i = WINDOW; i < N; i += SAMPLE_EVERY) {
-      if (batchCount++ % YIELD_EVERY === 0) await new Promise(resolve => setImmediate(resolve))
+    for (let i = START_I; i < N; i += SAMPLE_EVERY) {
+      await new Promise(resolve => setImmediate(resolve))  // yield EVERY iteration
       const slice = chron.slice(0, i)
       const { top10: tp } = predict.ranked(slice)
       if (!tp || tp.length === 0) continue
@@ -404,8 +421,9 @@ async function _computeStatsBackground() {
       _computedAt: Date.now(),
       _sampleEvery: SAMPLE_EVERY,
     }
+    _lastStatsCompute = Date.now()
     await fs.writeJSON(STATS_CACHE_FILE, _statsCache)
-    console.log(`[stats] backtest done in ${((Date.now() - t0) / 1000).toFixed(1)}s, tested=${tested}/${N} draws`)
+    console.log(`[stats] backtest done in ${((Date.now() - t0) / 1000).toFixed(1)}s, tested=${tested}/${N} draws (every ${SAMPLE_EVERY})`)
   } catch (err) {
     console.error('[stats] background compute error:', err.message, err.stack)
   } finally {
@@ -470,16 +488,29 @@ app.get('/overdue', withCache('overdue', 5 * 60_000,
   async () => buildOverduePayload(await loadHistory())
 ))
 
-/** GET /history — raw draws, newest first (?limit=500) */
+/** GET /history — raw draws, newest first (?limit=N).
+ * Cached in memory for 60s (avoids re-reading 43K record file on every page load).
+ * Cache is cleared by invalidateCache() → apiCache.clear() when new draws arrive. */
 app.get('/history', async (req, res) => {
   try {
-    const data  = await loadHistory()
-    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 500)
-    const etag  = `"${data.length}-${data[0]?.ky || '0'}"`
-    res.set('Cache-Control', 'no-cache')
+    const limit   = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 1_000)
+    const cacheKey = `history-${limit}`
+    const now      = Date.now()
+    const hit      = apiCache.get(cacheKey)
+    if (hit && now - hit.ts < 60_000) {
+      const etag = `"${hit.ts}"`
+      res.set('X-Cache', 'HIT')
+      res.set('ETag', etag)
+      if (req.headers['if-none-match'] === etag) return res.status(304).end()
+      return res.json(hit.data)
+    }
+    const data    = await loadHistory()
+    const payload = { records: data.slice(0, limit), total: data.length }
+    apiCache.set(cacheKey, { data: payload, ts: now })
+    const etag = `"${now}"`
+    res.set('X-Cache', 'MISS')
     res.set('ETag', etag)
-    if (req.headers['if-none-match'] === etag) return res.status(304).end()
-    res.json({ records: data.slice(0, limit), total: data.length })
+    res.json(payload)
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -555,20 +586,15 @@ app.get('/events', (req, res) => {
   req.on('close', () => { clearInterval(hb); sseClients.delete(res); console.log(`[SSE] -1 client (total: ${sseClients.size})`) })
 })
 
-/** GET /health — liveness probe */
-app.get('/health', async (_req, res) => {
+/** GET /health — liveness probe (fast: uses in-memory predict cache instead of re-reading full file) */
+app.get('/health', (_req, res) => {
   try {
-    const data     = await loadHistory()
-    const newest   = data[0]
-    const drawTime = newest?.drawTime ?? newest?.draw_time ?? null
-    let modelFreshness = null
-    try { modelFreshness = Math.floor((Date.now() - fs.statSync(path.join(__dirname, '../dataset/model.json')).mtimeMs) / 1000) } catch (_) {}
+    const predictHit   = apiCache.get('predict')
+    const historyTotal = predictHit?.data?.total ?? 0
     res.json({
       status:             'ok',
-      historySize:        data.length,
-      lastDrawAt:         drawTime,
-      dataFreshness:      drawTime ? Math.floor((Date.now() - new Date(drawTime).getTime()) / 1000) : null,
-      modelFreshness,
+      historySize:        historyTotal,
+      statsComputing:     _statsComputing,
       crawlerStatus:      isOperatingHours() ? 'operating' : 'offline',
       lastCrawlAttemptAt: lastCrawlAttempt ? new Date(lastCrawlAttempt).toISOString() : null,
       uptime:             Math.floor(process.uptime()),
@@ -630,7 +656,18 @@ app.listen(PORT, '0.0.0.0', () => {
   crawlTick().catch(err => console.error('[crawler] startup error:', err.message))
   setInterval(crawlTick, CRAWL_INTERVAL_MS)
 
-  // Pre-warm after 1.5s: fills any missing disk caches and ensures freshness.
-  // If disk caches were already loaded from startup IIFE, this just refreshes them.
-  setTimeout(() => _prewarmCaches(), 1_500)
+  // Pre-warm after 2s: fills any missing disk caches and ensures freshness.
+  // If disk caches already loaded from startup IIFE, this just refreshes them.
+  setTimeout(() => _prewarmCaches(), 2_000)
+
+  // Kick off stats if not cached yet or cache is > 24h old.
+  setTimeout(() => {
+    const age = _statsCache?._computedAt ? Date.now() - _statsCache._computedAt : Infinity
+    if (!_statsCache || age > 24 * 60 * 60_000) {
+      console.log('[stats] startup: no recent cache — scheduling initial compute in 10s')
+      setTimeout(() => _computeStatsBackground(), 10_000)
+    } else {
+      console.log(`[stats] startup: cache age ${Math.round(age/60000)}min — skipping initial recompute`)
+    }
+  }, 3_000)
 })

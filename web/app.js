@@ -1296,7 +1296,6 @@ function App() {
         cache: 'no-cache',
         headers: predH
       }), fetch('/history?limit=500', {
-        cache: 'no-cache',
         headers: histH
       })]);
 
@@ -1482,7 +1481,7 @@ function App() {
       fontSize: 11,
       color: '#64748b'
     }
-  }, "\u26A0\uFE0F C\xF4ng c\u1EE5 th\u1ED1ng k\xEA gi\u1EA3i tr\xED \u2014 kh\xF4ng c\xF3 edge d\u1EF1 \u0111o\xE1n \u0111\u01B0\u1EE3c x\xE1c nh\u1EADn (p=0.51, verdict=no_pattern). Top-10 l\xE0 portfolio \u0111a d\u1EA1ng, kh\xF4ng ph\u1EA3i AI \"bi\u1EBFt tr\u01B0\u1EDBc\" k\u1EBFt qu\u1EA3. Ch\u01A1i c\xF3 tr\xE1ch nhi\u1EC7m."), /*#__PURE__*/React.createElement("div", {
+  }, "\u26A0\uFE0F C\xF4ng c\u1EE5 th\u1ED1ng k\xEA gi\u1EA3i tr\xED. Top-10 l\xE0 portfolio \u0111a d\u1EA1ng, kh\xF4ng ph\u1EA3i AI \"bi\u1EBFt tr\u01B0\u1EDBc\" k\u1EBFt qu\u1EA3. Ch\u01A1i c\xF3 tr\xE1ch nhi\u1EC7m."), /*#__PURE__*/React.createElement("div", {
     style: {
       maxWidth: 1120,
       margin: '0 auto',
@@ -1700,7 +1699,7 @@ function App() {
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: C.label
-  }, "L\u1ECBch s\u1EED g\u1EA7n nh\u1EA5t (", history.length, " records)"), /*#__PURE__*/React.createElement("div", {
+  }, "L\u1ECBch s\u1EED g\u1EA7n nh\u1EA5t (", history.length, " k\u1EF3 \xB7 t\u1ED5ng ", total.toLocaleString(), " k\u1EF3)"), /*#__PURE__*/React.createElement("div", {
     style: {
       overflowX: 'auto',
       maxHeight: 480,

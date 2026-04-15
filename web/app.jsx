@@ -668,7 +668,7 @@ function App() {
       const histH = histETagRef.current ? { 'If-None-Match': histETagRef.current } : {}
       const [pRaw, hRaw] = await Promise.all([
         fetch('/predict', { cache: 'no-cache', headers: predH }),
-        fetch('/history?limit=500', { cache: 'no-cache', headers: histH }),
+        fetch('/history?limit=500', { headers: histH }),
       ])
 
       // Both unchanged — nothing to do, skip all state updates
@@ -844,7 +844,7 @@ function App() {
 
       {/* ―― Disclaimer ―― */}
       <div style={{ background: 'rgba(15,23,42,0.8)', borderBottom: '1px solid rgba(99,102,241,0.15)', padding: '7px 24px', textAlign: 'center', fontSize: 11, color: '#64748b' }}>
-        ⚠️ Công cụ thống kê giải trí — không có edge dự đoán được xác nhận (p=0.51, verdict=no_pattern). Top-10 là portfolio đa dạng, không phải AI "biết trước" kết quả. Chơi có trách nhiệm.
+        ⚠️ Công cụ thống kê giải trí. Top-10 là portfolio đa dạng, không phải AI "biết trước" kết quả. Chơi có trách nhiệm.
       </div>
 
       <div style={{ maxWidth: 1120, margin: '0 auto', padding: 'clamp(12px,3vw,28px) clamp(12px,3vw,20px)' }}>
@@ -963,7 +963,7 @@ function App() {
 
         {/* ── History table ── */}
         <div style={{ ...C.card, marginBottom: 28 }}>
-          <div style={C.label}>Lịch sử gần nhất ({history.length} records)</div>
+          <div style={C.label}>Lịch sử gần nhất ({history.length} kỳ · tổng {total.toLocaleString()} kỳ)</div>
           <div style={{ overflowX: 'auto', maxHeight: 480, overflowY: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
               <thead style={{ position: 'sticky', top: 0, background: '#1e293b', zIndex: 1 }}>
