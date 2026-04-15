@@ -1,8 +1,30 @@
 'use strict'
 
 // ── Global safeguards — MUST be first ─────────────────────────────────────
-// uncaughtException: process is in an undefined state — must exit (Node.js docs)
-process.on('uncaughtException', (err) => { console.error('[FATAL] uncaughtException:', err.message, err.stack); process.exit(1) })
+// uncaughtException: keep process alive for transient socket/network errors.
+// Exit only on repeated non-transient failures within a short window.
+const _uncaughtRecent = []
+process.on('uncaughtException', (err) => {
+  const code = err?.code || ''
+  const msg = String(err?.message || '')
+  const transient = ['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_SOCKET', 'ERR_STREAM_PREMATURE_CLOSE'].includes(code)
+    || /socket hang up|aborted|write EPIPE|ECONNRESET|premature close/i.test(msg)
+
+  if (transient) {
+    console.error('[WARN] uncaughtException (transient, non-fatal):', code || '-', msg)
+    return
+  }
+
+  const now = Date.now()
+  _uncaughtRecent.push(now)
+  while (_uncaughtRecent.length && now - _uncaughtRecent[0] > 60_000) _uncaughtRecent.shift()
+
+  console.error('[ERROR] uncaughtException:', msg, err?.stack)
+  if (_uncaughtRecent.length >= 3) {
+    console.error('[FATAL] repeated uncaughtException >=3 in 60s — exiting for clean restart')
+    process.exit(1)
+  }
+})
 // unhandledRejection: recoverable — log and continue. Most are network timeouts
 // from crawl/fetch that don't affect server state. Exiting here caused 30-min
 // outages whenever any async operation failed under load.
@@ -125,6 +147,7 @@ function broadcast(eventName, data) {
 
 // ── Cache helpers ──────────────────────────────────────────────────────────
 function invalidateCache() {
+  const prevPredictTotal = apiCache.get('predict')?.data?.total ?? 0
   _lastInvalidateAt = Date.now()  // prevent watcher from double-firing
   apiCache.clear()
   // Debounce prewarm — waits 800ms so rapid consecutive invalidations only fire once.
@@ -134,7 +157,7 @@ function invalidateCache() {
   // Exception: bypass rate limit if dataset grew significantly (e.g. bulk import).
   clearTimeout(_invalidateTimer)
   const msSinceLastStats = Date.now() - _lastStatsCompute
-  const currentN = apiCache.get('predict')?.data?.total ?? 0
+  const currentN = prevPredictTotal || (_statsCache?.total ?? 0)
   const cachedN = Math.max(_lastStatsTotal, _statsCache?.total ?? 0)
   const nGrew = currentN > 0 && cachedN > 0 && currentN > cachedN * 1.1
   const statsDelay = nGrew ? 2_000            // data changed significantly — bypass rate limit
@@ -630,6 +653,7 @@ app.get('/health', (_req, res) => {
     const predictHit = apiCache.get('predict')
     const historyTotal = predictHit?.data?.total ?? 0
     res.json({
+      ok: true,
       status: 'ok',
       historySize: historyTotal,
       statsComputing: _statsComputing,
@@ -663,6 +687,11 @@ function isOperatingHours() {
 
 async function crawlTick() {
   if (!isOperatingHours()) { console.log('[crawler] off-hours (06:00-21:54 VN) -- skipping'); return }
+  if (crawling) {
+    console.log('[crawler] previous crawl still running — skip overlapping tick')
+    return
+  }
+  crawling = true
   lastCrawlAttempt = Date.now()
   console.log(`[crawler] ${new Date().toLocaleTimeString('vi-VN')} -- crawling...`)
   try {
@@ -680,6 +709,7 @@ async function crawlTick() {
       lastKnownTotal = total
     }
   } catch (err) { console.error('[crawler] ERROR:', err.message) }
+  finally { crawling = false }
 }
 
 // ── Start ──────────────────────────────────────────────────────────────────

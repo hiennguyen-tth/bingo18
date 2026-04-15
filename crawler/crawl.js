@@ -15,6 +15,7 @@ const path = require('path')
 const crypto = require('crypto')
 
 const FILE = path.join(__dirname, '../dataset/history.json')
+const BACKUP_FILE = `${FILE}.bak`
 // Source config: old xoso web is primary (currently fastest/freshest).
 const SOURCES = {
   primary: { name: 'xoso.net.vn', liveUrl: 'https://xoso.net.vn/xs-bingo-18.html', moreUrl: 'https://xoso.net.vn/XSDienToan/GetKetQuaBinGo18More' },
@@ -41,6 +42,30 @@ function classify(n1, n2, n3) {
   if (n1 === n2 && n2 === n3) return 'triple'
   if (n1 === n2 || n2 === n3 || n1 === n3) return 'pair'
   return 'normal'
+}
+
+async function atomicWriteJSON(file, data) {
+  const tmp = `${file}.tmp`
+  await fs.writeJSON(tmp, data, { spaces: 2 })
+  await fs.move(tmp, file, { overwrite: true })
+}
+
+async function loadHistorySafe() {
+  const exists = await fs.pathExists(FILE)
+  if (!exists) return []
+
+  const parsed = await fs.readJSON(FILE).catch(() => null)
+  if (Array.isArray(parsed)) return parsed
+
+  // If the primary file is corrupted, attempt recovery from backup.
+  const backup = await fs.readJSON(BACKUP_FILE).catch(() => null)
+  if (Array.isArray(backup) && backup.length > 0) {
+    console.error(`[crawl] WARNING: history.json corrupted, recovering from backup (${backup.length} records)`)
+    await atomicWriteJSON(FILE, backup)
+    return backup
+  }
+
+  throw new Error('history.json corrupted and no valid backup found; refusing to overwrite to prevent data loss')
 }
 
 /** Parse draw records from a cheerio-loaded HTML fragment. */
@@ -154,11 +179,12 @@ async function crawlPage(pageIndex) {
  * @returns {{ total, added, newRecords }}
  */
 async function merge(incoming) {
-  const old = await fs.readJSON(FILE).catch(() => [])
+  const old = await loadHistorySafe()
   // Index by id and ky for fast lookup
   const byId = new Map(old.map(o => [o.id, o]))
   const byKy = new Map(old.map(o => [o.ky, o]))
   const newRecords = []
+  let patched = 0
 
   for (const r of incoming) {
     const existing = byId.get(r.id) || byKy.get(r.ky)
@@ -172,13 +198,21 @@ async function merge(incoming) {
       // Back-fill draw time that was missing (e.g. xsmn got it first, xoso fills in time)
       existing.drawTime = r.drawTime
       delete existing.drawDate  // replace date-only field with full ISO timestamp
+      patched++
     }
+  }
+
+  // Nothing changed: keep file as-is to avoid unnecessary watcher invalidation.
+  if (newRecords.length === 0 && patched === 0) {
+    return { total: old.length, added: 0, newRecords, patched: 0, changed: false }
   }
 
   old.sort((a, b) => Number(b.ky) - Number(a.ky))
   await fs.ensureFile(FILE)
-  await fs.writeJSON(FILE, old, { spaces: 2 })
-  return { total: old.length, added: newRecords.length, newRecords }
+  await atomicWriteJSON(FILE, old)
+  // Keep a last-known-good snapshot for corruption recovery.
+  await atomicWriteJSON(BACKUP_FILE, old)
+  return { total: old.length, added: newRecords.length, newRecords, patched, changed: true }
 }
 
 /** Crawl latest draws — tries primary first, falls back to backup if needed. */
