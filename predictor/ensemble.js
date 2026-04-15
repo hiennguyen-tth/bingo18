@@ -442,9 +442,15 @@ function modelB(chron) {
 // ── MODEL C: Time-of-day session frequency ratio ──────────────────────────
 
 function getSession(hoursOrDateStr) {
-  const h = typeof hoursOrDateStr === 'number'
-    ? hoursOrDateStr
-    : new Date(hoursOrDateStr).getHours()
+  let h
+  if (typeof hoursOrDateStr === 'number') {
+    h = hoursOrDateStr  // caller passes VN hour directly
+  } else {
+    // drawTime strings include TZ offset (e.g. +07:00). Use UTC math to get
+    // Vietnam local hour regardless of the server's system TZ (Fly.io is UTC).
+    const d = new Date(hoursOrDateStr)
+    h = (d.getUTCHours() + 7) % 24
+  }
   if (h >= 6 && h < 12) return 'morning'
   if (h >= 12 && h < 18) return 'afternoon'
   return 'evening'
@@ -458,7 +464,9 @@ function getSession(hoursOrDateStr) {
  */
 function modelC(chron, now) {
   if (chron.length < 5000) return {}  // hard-disable: insufficient data
-  const cur = getSession(now.getHours())
+  // Use Vietnam time (UTC+7) for both history classification and current session.
+  const vnHour = (now.getUTCHours() + 7) % 24
+  const cur = getSession(vnHour)
   const sessData = chron.filter(r => r.drawTime && getSession(r.drawTime) === cur)
   if (sessData.length < 20) return {}
 

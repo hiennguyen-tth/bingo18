@@ -179,7 +179,8 @@ const PredCard = memo(function PredCard({
   mk2Norm,
   sessNorm,
   confidence: confFromServer,
-  calBuckets
+  calBuckets,
+  isUniform
 }) {
   const nums = combo.split('-');
   const normScore = maxScore > 0 ? Math.round(score / maxScore * 100) : 0;
@@ -321,7 +322,28 @@ const PredCard = memo(function PredCard({
       textAlign: 'right',
       fontWeight: 700
     }
-  }, pct, "%")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  }, pct, "%")), isUniform ?
+  /*#__PURE__*/
+  // When all pattern-models are disabled (no_pattern → shrink=0), scores are
+  // uniform. The breakdown bar would show raw z-rank, not actual contribution.
+  // Show z-overdue context instead — the only meaningful per-combo signal.
+  React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: '#475569',
+      display: 'flex',
+      justifyContent: 'space-between'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#334155'
+    }
+  }, "portfolio diversity \xB7 ch\u1ECDn theo digit coverage"), zScore != null && zScore > 0 && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: zColor,
+      fontWeight: 700
+    }
+  }, "z+", zScore.toFixed(2), " overdue")) : /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       justifyContent: 'space-between',
@@ -1662,7 +1684,8 @@ function App() {
     mk2Norm: p.mk2Norm,
     sessNorm: p.sessNorm,
     confidence: p.confidence,
-    calBuckets: stats?.calBuckets
+    calBuckets: stats?.calBuckets,
+    isUniform: !!modelContrib?._uniform
   })))), overdue && /*#__PURE__*/React.createElement("div", {
     style: {
       ...C.card,

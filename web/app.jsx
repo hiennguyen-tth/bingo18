@@ -55,7 +55,7 @@ function getRankingBadge(normScore) {
   return { label: '❄️ COLD', color: '#6B7280', bg: 'rgba(107,114,128,0.12)', border: 'rgba(107,114,128,0.35)' }
 }
 
-const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability, zScore, statNorm, mk2Norm, sessNorm, confidence: confFromServer, calBuckets }) {
+const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability, zScore, statNorm, mk2Norm, sessNorm, confidence: confFromServer, calBuckets, isUniform }) {
   const nums = combo.split('-')
   const normScore = maxScore > 0 ? Math.round((score / maxScore) * 100) : 0
   const badge = getRankingBadge(normScore)
@@ -131,23 +131,35 @@ const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxSc
         <span style={{ color: '#a5b4fc', textAlign: 'right', fontWeight: 700 }}>{pct}%</span>
       </div>
 
-      {/* Row 4: 4-model breakdown */}
-      <div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#475569', marginBottom: 3 }}>
-          {breakdownModels.map(m => (
-            <span key={m.label} style={{ color: m.color }}>{m.label} {(m.val / breakTotal * 100).toFixed(0)}%</span>
-          ))}
+      {/* Row 4: model breakdown OR diversity note */}
+      {isUniform ? (
+        // When all pattern-models are disabled (no_pattern → shrink=0), scores are
+        // uniform. The breakdown bar would show raw z-rank, not actual contribution.
+        // Show z-overdue context instead — the only meaningful per-combo signal.
+        <div style={{ fontSize: 9, color: '#475569', display: 'flex', justifyContent: 'space-between' }}>
+          <span style={{ color: '#334155' }}>portfolio diversity · chọn theo digit coverage</span>
+          {zScore != null && zScore > 0 && (
+            <span style={{ color: zColor, fontWeight: 700 }}>z+{zScore.toFixed(2)} overdue</span>
+          )}
         </div>
-        <div style={{ height: 4, background: 'rgba(255,255,255,0.05)', borderRadius: 2, display: 'flex', overflow: 'hidden' }}>
-          {breakdownModels.map(m => (
-            <div key={m.label} style={{
-              width: `${m.val / breakTotal * 100}%`, height: '100%',
-              background: m.color, opacity: 0.85,
-              transition: 'width 0.6s ease',
-            }} />
-          ))}
+      ) : (
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#475569', marginBottom: 3 }}>
+            {breakdownModels.map(m => (
+              <span key={m.label} style={{ color: m.color }}>{m.label} {(m.val / breakTotal * 100).toFixed(0)}%</span>
+            ))}
+          </div>
+          <div style={{ height: 4, background: 'rgba(255,255,255,0.05)', borderRadius: 2, display: 'flex', overflow: 'hidden' }}>
+            {breakdownModels.map(m => (
+              <div key={m.label} style={{
+                width: `${m.val / breakTotal * 100}%`, height: '100%',
+                background: m.color, opacity: 0.85,
+                transition: 'width 0.6s ease',
+              }} />
+            ))}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Row 5: confidence bar */}
       <div>
@@ -380,35 +392,35 @@ const AccuracyPanel = memo(function AccuracyPanel({ stats, loading }) {
                 p &lt; 0.05 = có ý nghĩa thống kê (reject H0). Nếu tất cả p &gt; 0.05 → game random → model A/B/D có thể chỉ fit noise.
               </div>
               <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11, minWidth: 360 }}>
-                <thead>
-                  <tr>
-                    {['Test', 'Stat', 'p-value', 'Ý nghĩa'].map(h => (
-                      <th key={h} style={{ textAlign: 'left', color: '#475569', fontWeight: 600, paddingBottom: 6, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td style={{ color: '#e2e8f0', paddingTop: 6, paddingRight: 8 }}>Chi-square</td>
-                    <td style={{ color: '#94a3b8', paddingRight: 8 }}>{statTests.chiSquare.stat ?? '—'}</td>
-                    <td>{pCell(statTests.chiSquare.pValue)}</td>
-                    <td style={{ color: '#475569' }}>Tần suất combo phẳng?</td>
-                  </tr>
-                  <tr>
-                    <td style={{ color: '#e2e8f0', paddingTop: 4, paddingRight: 8 }}>Autocorr</td>
-                    <td style={{ color: '#94a3b8', paddingRight: 8 }}>{statTests.autocorr.r ?? '—'}</td>
-                    <td>{pCell(statTests.autocorr.pValue)}</td>
-                    <td style={{ color: '#475569' }}>Sum liên tiếp tương quan?</td>
-                  </tr>
-                  <tr>
-                    <td style={{ color: '#e2e8f0', paddingTop: 4, paddingRight: 8 }}>Runs</td>
-                    <td style={{ color: '#94a3b8', paddingRight: 8 }}>{statTests.runs.runs ?? '—'}</td>
-                    <td>{pCell(statTests.runs.pValue)}</td>
-                    <td style={{ color: '#475569' }}>Chuỗi trên/dưới trung vị ngẫu nhiên?</td>
-                  </tr>
-                </tbody>
-              </table>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11, minWidth: 360 }}>
+                  <thead>
+                    <tr>
+                      {['Test', 'Stat', 'p-value', 'Ý nghĩa'].map(h => (
+                        <th key={h} style={{ textAlign: 'left', color: '#475569', fontWeight: 600, paddingBottom: 6, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td style={{ color: '#e2e8f0', paddingTop: 6, paddingRight: 8 }}>Chi-square</td>
+                      <td style={{ color: '#94a3b8', paddingRight: 8 }}>{statTests.chiSquare.stat ?? '—'}</td>
+                      <td>{pCell(statTests.chiSquare.pValue)}</td>
+                      <td style={{ color: '#475569' }}>Tần suất combo phẳng?</td>
+                    </tr>
+                    <tr>
+                      <td style={{ color: '#e2e8f0', paddingTop: 4, paddingRight: 8 }}>Autocorr</td>
+                      <td style={{ color: '#94a3b8', paddingRight: 8 }}>{statTests.autocorr.r ?? '—'}</td>
+                      <td>{pCell(statTests.autocorr.pValue)}</td>
+                      <td style={{ color: '#475569' }}>Sum liên tiếp tương quan?</td>
+                    </tr>
+                    <tr>
+                      <td style={{ color: '#e2e8f0', paddingTop: 4, paddingRight: 8 }}>Runs</td>
+                      <td style={{ color: '#94a3b8', paddingRight: 8 }}>{statTests.runs.runs ?? '—'}</td>
+                      <td>{pCell(statTests.runs.pValue)}</td>
+                      <td style={{ color: '#475569' }}>Chuỗi trên/dưới trung vị ngẫu nhiên?</td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
               <div style={{ marginTop: 8, color: '#475569', fontSize: 10, lineHeight: 1.5 }}>
                 * Ý nghĩa thống kê ≠ khả năng dự đoán. Chi-square có thể reject H0 chỉ vì tần suất không hoàn toàn phẳng, không có nghĩa là combo cụ thể nào có thể dự đoán được.
@@ -939,7 +951,8 @@ function App() {
                 pat={p.pat} stability={p.stability}
                 zScore={p.zScore} statNorm={p.statNorm ?? p.coreNorm}
                 mk2Norm={p.mk2Norm} sessNorm={p.sessNorm}
-                confidence={p.confidence} calBuckets={stats?.calBuckets} />
+                confidence={p.confidence} calBuckets={stats?.calBuckets}
+                isUniform={!!modelContrib?._uniform} />
             ))}
           </div>
         </div>

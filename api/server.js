@@ -58,7 +58,7 @@ let _prewarmRunning = false
 let _prewarmTimer = null   // debounced prewarm (avoid cascade)
 let _invalidateTimer = null   // debounced stats recompute
 let _lastStatsCompute = 0      // epoch ms — rate-limit to 1/10min
-let _lastStatsTotal   = 0      // N at last compute — detect large data jumps
+let _lastStatsTotal = 0      // N at last compute — detect large data jumps
 let _lastInvalidateAt = 0      // epoch ms — watcher cooldown
 
   // ── Load all disk caches at startup in parallel ────────────────────────────
@@ -123,8 +123,8 @@ function invalidateCache() {
   clearTimeout(_invalidateTimer)
   const msSinceLastStats = Date.now() - _lastStatsCompute
   const currentN = apiCache.get('predict')?.data?.total ?? 0
-  const cachedN  = Math.max(_lastStatsTotal, _statsCache?.total ?? 0)
-  const nGrew    = currentN > 0 && cachedN > 0 && currentN > cachedN * 1.1
+  const cachedN = Math.max(_lastStatsTotal, _statsCache?.total ?? 0)
+  const nGrew = currentN > 0 && cachedN > 0 && currentN > cachedN * 1.1
   const statsDelay = nGrew ? 2_000            // data changed significantly — bypass rate limit
     : msSinceLastStats < 10 * 60_000
       ? (10 * 60_000 - msSinceLastStats)      // wait out the remainder
@@ -173,15 +173,23 @@ function buildPredictPayload(data) {
   }
   const { top10, tripleSignal, effectiveWeights } = predict.ranked(data)
   const top10Total = top10.reduce((s, r) => s + r.score, 0) || 1
-  const maxScore = top10[0]?.score || 1
-  const minScore = top10[top10.length - 1]?.score || 0
-  const scoreSpread = maxScore - minScore || 1
 
-  const next = top10.map(r => ({
+  // Use true max/min across all scores (not positional, since rebalanceTripleRanks
+  // can reorder top-10 so top10[0] is not necessarily the highest-scoring combo).
+  const allScores = top10.map(r => r.score)
+  const trueMaxScore = allScores.length ? Math.max(...allScores) : 1
+  const trueMinScore = allScores.length ? Math.min(...allScores) : 0
+  const scoreSpread = trueMaxScore - trueMinScore
+
+  const next = top10.map((r, idx) => ({
     combo: r.combo,
     score: +r.score.toFixed(3),
     pct: +(r.score / top10Total * 100).toFixed(1),
-    confidence: Math.round(35 + ((r.score - minScore) / scoreSpread) * 45),
+    // Rank-based confidence fallback when scores are nearly uniform (spread < 0.005):
+    //   all combos have score≈0.5 → no meaningful score differentiation → use rank position.
+    confidence: scoreSpread < 0.005
+      ? Math.max(35, Math.round(80 - idx * 5))   // 80%, 75%, …, 35% by rank
+      : Math.round(35 + ((r.score - trueMinScore) / scoreSpread) * 45),
     overdueRatio: r.overdueRatio != null ? +r.overdueRatio.toFixed(2) : null,
     comboGap: r.comboGap,
     sumOD: +(r.sumOD ?? 0).toFixed(2),
@@ -202,7 +210,7 @@ function buildPredictPayload(data) {
     .map(([sum, cnt]) => ({ sum: +sum, pct: +(cnt / data.length * 100).toFixed(2) }))
     .sort((a, b) => b.pct - a.pct)
 
-  return { next, tripleSignal, modelContrib: effectiveWeights, sumStats, total: data.length, maxScore: +maxScore.toFixed(3) }
+  return { next, tripleSignal, modelContrib: effectiveWeights, sumStats, total: data.length, maxScore: +trueMaxScore.toFixed(3) }
 }
 
 /** Build /overdue response payload from history array (newest-first). */
@@ -437,7 +445,7 @@ async function _computeStatsBackground() {
       _sampleEvery: SAMPLE_EVERY,
     }
     _lastStatsCompute = Date.now()
-    _lastStatsTotal   = N
+    _lastStatsTotal = N
     await fs.writeJSON(STATS_CACHE_FILE, _statsCache)
     console.log(`[stats] backtest done in ${((Date.now() - t0) / 1000).toFixed(1)}s, tested=${tested}/${N} draws (every ${SAMPLE_EVERY})`)
   } catch (err) {
