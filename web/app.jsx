@@ -665,9 +665,9 @@ function App() {
     setError(null)
     try {
       const predH = predETagRef.current ? { 'If-None-Match': predETagRef.current } : {}
-      const histH = histETagRef.current  ? { 'If-None-Match': histETagRef.current  } : {}
+      const histH = histETagRef.current ? { 'If-None-Match': histETagRef.current } : {}
       const [pRaw, hRaw] = await Promise.all([
-        fetch('/predict',          { cache: 'no-cache', headers: predH }),
+        fetch('/predict', { cache: 'no-cache', headers: predH }),
         fetch('/history?limit=500', { cache: 'no-cache', headers: histH }),
       ])
 
