@@ -4,13 +4,14 @@
   "description": "Bingo18 AI Prediction System — ensemble of frequency + Markov models",
   "main": "api/server.js",
   "scripts": {
+    "build": "node scripts/build_jsx.js",
     "test": "node test.js",
     "crawl": "node crawler/crawl.js",
     "realtime": "node crawler/realtime.js",
     "api": "node api/server.js",
     "backtest": "node backtest/run_backtest.js",
     "train": "node scripts/train_weights.js",
-    "dev": "node api/server.js"
+    "dev": "npm run build && node api/server.js"
   },
   "keywords": [
     "bingo",
@@ -31,5 +32,9 @@
     "express": "^4.19.2",
     "fs-extra": "^11.2.0",
     "mathjs": "^13.0.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.0",
+    "@babel/preset-react": "^7.28.5"
   }
 }

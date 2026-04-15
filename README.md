@@ -58,11 +58,29 @@ bingo/
 │   ├── ads.txt                # Google AdSense publisher declaration
 │   ├── robots.txt             # Crawl rules + sitemap pointer
 │   └── sitemap.xml            # XML sitemap (6 URLs)
+├── scripts/
+│   ├── build_jsx.js           # Pre-compile heatmap.jsx + app.jsx → .js (npm run build)
+│   ├── train_weights.js       # Walk-forward weight optimisation
+│   └── dedup.js               # Dataset deduplication
 ├── fly.toml                   # Fly.io config
-├── Dockerfile                 # node:20-alpine, port 8080
+├── Dockerfile                 # node:20-alpine, JSX build step, port 8080
 ├── start.sh                   # Diagnostic wrapper → node api/server.js
 └── README.md
 ```
+
+---
+
+## Performance Notes
+
+| Concern | Before | After |
+|---------|--------|-------|
+| Page load (Babel Standalone) | 2–5s blank screen (6 MB download + JSX compile) | Instant — JSX pre-compiled at Docker build time via `npm run build` |
+| `/predict` cold start | 370ms (blocks event loop on every cache-miss) | <5ms — pre-warmed on startup + after each new draw |
+| `/overdue` cold start | 200ms | <5ms — same pre-warm |
+| `/stats` | Disk-persisted, stale-while-revalidate | Unchanged |
+| Double-invalidation (crawl + watcher) | Stats computed twice per draw | Debounced 3.5s — computed once |
+
+**Pre-warm mechanism:** `invalidateCache()` clears the in-memory cache and immediately calls `_prewarmCaches()` (takes ~50ms) so the next HTTP request always hits a warm cache. The stats backtest is debounced 3.5s to collapse the crawl-write and the file-watcher detection into a single compute.
 
 ---
 
@@ -76,8 +94,14 @@ npm install
 node crawler/crawl.js          # crawl ~15 kỳ mới nhất từ xoso.net.vn (fallback xomo.com nếu lỗi)
 node crawler/crawl.js --all    # crawl toàn bộ lịch sử (60 trang × 15 ≈ 900 kỳ)
 
+# Pre-compile JSX → JS (chạy 1 lần hoặc sau khi sửa web/app.jsx / web/heatmap.jsx)
+npm run build
+
 # Chạy server
 node api/server.js             # dashboard → http://localhost:8080
+
+# Hoặc dùng npm run dev (tự build trước rồi chạy server)
+npm run dev
 ```
 
 ---

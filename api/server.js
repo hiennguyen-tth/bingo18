@@ -87,6 +87,7 @@ const apiCache = new Map()  // key → { data, ts }
 const STATS_CACHE_FILE = path.join(__dirname, '../dataset/stats_cache.json')
 let _statsCache = null      // last computed result (in-memory)
 let _statsComputing = false  // guard: prevent concurrent computes
+let _invalidateTimer = null  // debounce handle for invalidateCache()
 
   // Load disk cache at startup so first /stats request is instant
   ; (async () => {
@@ -102,8 +103,13 @@ let _statsComputing = false  // guard: prevent concurrent computes
 
 function invalidateCache() {
   apiCache.clear()
-  // New draw arrived — recompute stats in background (non-blocking)
-  _computeStatsBackground()
+  // Pre-warm predict + overdue immediately (takes ~50ms) so the next HTTP request
+  // finds a hot cache instead of blocking the event loop for 400ms.
+  _prewarmCaches()
+  // Debounce stats: crawlTick() calls invalidateCache(), then fs.watchFile fires
+  // again within ~3s detecting the same write — collapse both into one stats compute.
+  clearTimeout(_invalidateTimer)
+  _invalidateTimer = setTimeout(() => _computeStatsBackground(), 3_500)
 }
 
 /**
@@ -255,6 +261,102 @@ async function _computeStatsBackground() {
     console.error('[stats] background compute error:', err.message, err.stack)
   } finally {
     _statsComputing = false
+  }
+}
+
+/**
+ * Pre-warm /predict and /overdue caches in the background.
+ * Called at startup and after invalidateCache() (debounced) so the first
+ * HTTP request to either endpoint after a new draw is always cache-HIT (<5ms)
+ * instead of a cold-miss that blocks the event loop for 200–400ms.
+ */
+let _prewarmRunning = false
+async function _prewarmCaches() {
+  if (_prewarmRunning) return
+  _prewarmRunning = true
+  const t0 = Date.now()
+  try {
+    const data = await loadHistory()
+    if (data.length < 2) return
+
+    // ── Pre-warm /predict ──────────────────────────────────────────────
+    const { top10, tripleSignal, effectiveWeights } = predict.ranked(data)
+    const top10Total = top10.reduce((s, r) => s + r.score, 0) || 1
+    const maxScore = top10[0]?.score || 1
+    const minScore = top10[top10.length - 1]?.score || 0
+    const scoreSpread = maxScore - minScore || 1
+    const next = top10.map(r => ({
+      combo: r.combo,
+      score: +r.score.toFixed(3),
+      pct: +(r.score / top10Total * 100).toFixed(1),
+      confidence: Math.round(35 + ((r.score - minScore) / scoreSpread) * 45),
+      overdueRatio: r.overdueRatio != null ? +r.overdueRatio.toFixed(2) : null,
+      comboGap: r.comboGap,
+      sumOD: +(r.sumOD ?? 0).toFixed(2),
+      pat: r.pat,
+      stability: r.stability != null ? +r.stability.toFixed(2) : null,
+      zScore: r.zScore != null ? +r.zScore.toFixed(2) : null,
+      statNorm: r.statNorm ?? 0,
+      mk2Norm: r.mk2Norm ?? 0,
+      sessNorm: r.sessNorm ?? 0,
+      mlNorm: r.mlNorm ?? 0,
+      coreNorm: r.coreNorm ?? 0,
+      chiNorm: 0,
+    }))
+    const sumBucket = {}
+    for (const d of data) sumBucket[d.sum] = (sumBucket[d.sum] || 0) + 1
+    const sumStats = Object.entries(sumBucket)
+      .map(([sum, cnt]) => ({ sum: +sum, pct: +(cnt / data.length * 100).toFixed(2) }))
+      .sort((a, b) => b.pct - a.pct)
+    apiCache.set('predict', {
+      data: { next, tripleSignal, modelContrib: effectiveWeights, sumStats, total: data.length, maxScore: +maxScore.toFixed(3) },
+      ts: Date.now(),
+    })
+
+    // ── Pre-warm /overdue ──────────────────────────────────────────────
+    // (reuse the same data array, no extra file read)
+    const chron = [...data].reverse()
+    const N = chron.length
+    function computeStats(keyFn, labelFn) {
+      const lastSeen = {}, counts = {}, gaps = {}
+      chron.forEach((r, i) => {
+        const k = keyFn(r)
+        const ks = Array.isArray(k) ? k : [k]
+        ks.forEach(key => {
+          counts[key] = (counts[key] || 0) + 1
+          if (lastSeen[key] !== undefined) { if (!gaps[key]) gaps[key] = []; gaps[key].push(i - lastSeen[key]) }
+          lastSeen[key] = i
+        })
+      })
+      return Object.keys(counts).map(key => {
+        const appeared = counts[key]
+        const kySince = lastSeen[key] !== undefined ? (N - 1 - lastSeen[key]) : N
+        const avgGap = gaps[key]?.length ? +(gaps[key].reduce((a, b) => a + b, 0) / gaps[key].length).toFixed(1) : N
+        return { key, label: labelFn ? labelFn(key) : key, appeared, kySinceLast: kySince, avgInterval: avgGap, overdueScore: +(kySince / (avgGap || 1)).toFixed(2) }
+      }).sort((a, b) => b.overdueScore - a.overdueScore)
+    }
+    const TRIPLES = ['1-1-1', '2-2-2', '3-3-3', '4-4-4', '5-5-5', '6-6-6']
+    const tripleStats = computeStats(r => { const k = `${r.n1}-${r.n2}-${r.n3}`; return TRIPLES.includes(k) ? [k] : [] }, k => k.replace(/-/g, ''))
+    const tripleKeys = new Set(tripleStats.map(t => t.key))
+    const tripleResult = [...tripleStats, ...TRIPLES.filter(k => !tripleKeys.has(k)).map(k => ({ key: k, label: k.replace(/-/g, ''), appeared: 0, kySinceLast: N, avgInterval: N, overdueScore: 1 }))].sort((a, b) => b.overdueScore - a.overdueScore)
+    let lastTripleIdx = -1; const anyTripleGaps = []
+    chron.forEach((r, i) => { const pat = r.pattern || (r.n1 === r.n2 && r.n2 === r.n3 ? 'triple' : 'other'); if (pat === 'triple') { if (lastTripleIdx >= 0) anyTripleGaps.push(i - lastTripleIdx); lastTripleIdx = i } })
+    const sinceAnyTriple = lastTripleIdx >= 0 ? N - 1 - lastTripleIdx : N
+    const avgAnyTripleGap = anyTripleGaps.length ? +(anyTripleGaps.reduce((a, b) => a + b, 0) / anyTripleGaps.length).toFixed(1) : 36
+    const anyTriple = { key: 'any-triple', label: 'XXX', appeared: tripleResult.reduce((s, t) => s + t.appeared, 0), kySinceLast: sinceAnyTriple, avgInterval: avgAnyTripleGap, overdueScore: +(sinceAnyTriple / (avgAnyTripleGap || 36)).toFixed(2) }
+    const pairStats = computeStats(r => { if (r.n1 === r.n2 || r.n1 === r.n3) return [`pair-${r.n1}`]; if (r.n2 === r.n3) return [`pair-${r.n2}`]; return [] }, k => { const v = k.replace('pair-', ''); return `${v}${v}` })
+    const pairKeys = new Set(pairStats.map(p => p.key))
+    const pairResult = [...pairStats, ...[1,2,3,4,5,6].filter(v => !pairKeys.has(`pair-${v}`)).map(v => ({ key: `pair-${v}`, label: `${v}${v}`, appeared: 0, kySinceLast: N, avgInterval: N, overdueScore: 1 }))].sort((a, b) => b.overdueScore - a.overdueScore)
+    const sumStats2 = computeStats(r => [`sum-${r.sum}`], k => k.replace('sum-', ''))
+    const sumKeys = new Set(sumStats2.map(s => s.key))
+    const sumResult = [...sumStats2, ...Array.from({ length: 16 }, (_, i) => `sum-${i + 3}`).filter(k => !sumKeys.has(k)).map(k => ({ key: k, label: k.replace('sum-', ''), appeared: 0, kySinceLast: N, avgInterval: N, overdueScore: 1 }))].sort((a, b) => b.overdueScore - a.overdueScore)
+    apiCache.set('overdue', { data: { total: N, triples: tripleResult, anyTriple, pairs: pairResult, sums: sumResult }, ts: Date.now() })
+
+    console.log(`[prewarm] predict + overdue cached in ${Date.now() - t0}ms`)
+  } catch (err) {
+    console.error('[prewarm]', err.message)
+  } finally {
+    _prewarmRunning = false
   }
 }
 
@@ -789,4 +891,9 @@ app.listen(PORT, '0.0.0.0', () => {
   // Startup crawl immediately, then continue at the configured interval
   crawlTick().catch(err => console.error('[crawler] startup error:', err.message))
   setInterval(crawlTick, CRAWL_INTERVAL_MS)
+
+  // Pre-warm predict + overdue caches so first HTTP request is always fast.
+  // Delay 1.5s so the stats disk cache loads first (IIFE above) and history
+  // file is stable before we read it.
+  setTimeout(() => _prewarmCaches(), 1_500)
 })

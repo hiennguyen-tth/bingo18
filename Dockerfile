@@ -4,9 +4,16 @@ WORKDIR /app
 
 COPY package*.json ./
 
-RUN npm install --omit=dev
+# Install all deps (including devDeps) so the build step has @babel/core etc.
+RUN npm install
 
 COPY . .
+
+# Pre-compile JSX → plain JS (eliminates Babel Standalone from browser load path)
+RUN npm run build
+
+# Strip devDependencies for the final production image
+RUN npm prune --production
 
 # Ensure dataset and logs dirs exist (dataset/history.json excluded from .dockerignore)
 RUN mkdir -p dataset logs
