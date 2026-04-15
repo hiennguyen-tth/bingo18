@@ -62,6 +62,7 @@ const { run: crawlRun } = require('../crawler/crawl')
 const app = express()
 const PORT = parseInt(process.env.PORT) || 8080
 const ADSENSE_PUBLISHER_ID = process.env.ADSENSE_PUBLISHER_ID || ''
+const RECOVERY_TOKEN = process.env.RECOVERY_TOKEN || ''
 
 const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
 const WEB_DIR = path.join(__dirname, '../web')
@@ -493,12 +494,18 @@ async function _computeStatsBackground() {
 // ── Middleware ─────────────────────────────────────────────────────────────
 app.use(compression({ filter: (req, res) => req.path !== '/events' && compression.filter(req, res) }))
 app.use(cors())
-app.use(express.json())
+app.use(express.json({ limit: '20mb' }))
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 async function loadHistory() {
   const data = await fs.readJSON(HISTORY_FILE).catch(() => [])
   return Array.isArray(data) && data.length > 0 ? data : []
+}
+
+async function atomicWriteJSON(filePath, data) {
+  const tmp = `${filePath}.tmp`
+  await fs.writeJSON(tmp, data, { spaces: 2 })
+  await fs.move(tmp, filePath, { overwrite: true })
 }
 
 function renderIndex() {
@@ -628,6 +635,80 @@ app.get('/features', async (req, res) => {
     const feat = features(data)
     res.json({ features: feat.slice(-20), total: feat.length })
   } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+/** POST /admin/recover-history — emergency restore endpoint (token gated).
+ *  Accepts a JSON array of records (or {records:[...]}), merges by ky, keeps richer record,
+ *  writes atomically, then invalidates all caches and pushes SSE.
+ */
+app.post('/admin/recover-history', async (req, res) => {
+  try {
+    if (!RECOVERY_TOKEN) return res.status(404).json({ ok: false, error: 'not enabled' })
+    const token = req.headers['x-recovery-token']
+    if (!token || token !== RECOVERY_TOKEN) return res.status(401).json({ ok: false, error: 'unauthorized' })
+
+    const incomingRaw = Array.isArray(req.body) ? req.body : req.body?.records
+    if (!Array.isArray(incomingRaw) || incomingRaw.length === 0) {
+      return res.status(400).json({ ok: false, error: 'payload must be a non-empty JSON array' })
+    }
+
+    const incoming = incomingRaw.filter(r => r && (r.ky != null) && Number.isFinite(Number(r.n1)) && Number.isFinite(Number(r.n2)) && Number.isFinite(Number(r.n3)))
+    if (incoming.length === 0) return res.status(400).json({ ok: false, error: 'no valid records in payload' })
+
+    const existing = await loadHistory()
+    const byKy = new Map()
+
+    const quality = (r) => {
+      let q = 0
+      if (r?.drawTime) q += 3
+      if (r?.id) q += 1
+      if (r?.sum != null) q += 1
+      if (r?.pattern) q += 1
+      return q
+    }
+
+    for (const r of existing) byKy.set(String(r.ky), r)
+    let improved = 0
+    let inserted = 0
+
+    for (const r of incoming) {
+      const k = String(r.ky)
+      const prev = byKy.get(k)
+      if (!prev) {
+        byKy.set(k, r)
+        inserted++
+        continue
+      }
+      if (quality(r) > quality(prev)) {
+        byKy.set(k, { ...prev, ...r })
+        improved++
+      }
+    }
+
+    const merged = [...byKy.values()].sort((a, b) => Number(b.ky) - Number(a.ky))
+    if (existing.length > 0 && merged.length < Math.floor(existing.length * 0.9)) {
+      return res.status(409).json({ ok: false, error: 'merge would shrink dataset unexpectedly; aborted' })
+    }
+
+    const backupFile = path.join(path.dirname(HISTORY_FILE), `history_before_recover_${Date.now()}.json`)
+    await atomicWriteJSON(backupFile, existing)
+    await atomicWriteJSON(HISTORY_FILE, merged)
+
+    invalidateCache()
+    broadcast('new-draw', { added: inserted, latestKy: merged[0]?.ky || '?', total: merged.length, ts: new Date().toISOString(), source: 'recovery' })
+
+    return res.json({
+      ok: true,
+      previousTotal: existing.length,
+      incomingTotal: incoming.length,
+      mergedTotal: merged.length,
+      inserted,
+      improved,
+      backupFile,
+    })
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message })
+  }
 })
 
 /** GET /events — SSE stream (new-draw push) */

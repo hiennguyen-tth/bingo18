@@ -129,6 +129,7 @@ npm run dev
 | GET | `/frequency` | Tần suất combo — **cached** |
 | GET | `/events` | SSE stream — phát `new-draw` khi có kỳ mới |
 | POST | `/crawl` | Crawl thủ công ngay lập tức |
+| POST | `/admin/recover-history` | Emergency restore dữ liệu lịch sử (token-gated, disabled nếu thiếu `RECOVERY_TOKEN`) |
 | GET | `/health` | Liveness probe (historySize, freshness, crawlerStatus, cacheKeys) |
 | GET | `/ads.txt` | Google AdSense publisher declaration |
 | GET | `/robots.txt` | Crawl rules + sitemap pointer |
