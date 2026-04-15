@@ -1194,6 +1194,12 @@ const DrawPivotTable = memo(function DrawPivotTable({
   total
 }) {
   const [filter, setFilter] = useState('all');
+  const [isMobile, setIsMobile] = useState(typeof window !== 'undefined' ? window.innerWidth < 720 : false);
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth < 720);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
   if (!history || history.length === 0) return /*#__PURE__*/React.createElement("div", {
     style: {
       color: '#475569',
@@ -1202,7 +1208,20 @@ const DrawPivotTable = memo(function DrawPivotTable({
     }
   }, "Kh\xF4ng c\xF3 d\u1EEF li\u1EC7u");
 
-  // Group by VN date × time slot (UTC+7 explicit to work in any browser timezone)
+  // Canonical Bingo18 schedule: 159 draws/day, every 6 minutes from 06:05 to 21:53.
+  const START_MIN = 6 * 60 + 5;
+  const SLOT_STEP = 6;
+  const SLOT_COUNT = 159;
+  const ALL_SLOTS = Array.from({
+    length: SLOT_COUNT
+  }, (_, i) => {
+    const totalMin = START_MIN + i * SLOT_STEP;
+    const hh = Math.floor(totalMin / 60).toString().padStart(2, '0');
+    const mm = (totalMin % 60).toString().padStart(2, '0');
+    return `${hh}:${mm}`;
+  });
+
+  // Group by VN date × canonical slot (UTC+7 explicit to work in any browser timezone)
   const VN_OFF = 7 * 3600_000;
   const bySlot = {}; // HH:MM → { YYYY-MM-DD → record }
   const dateSet = new Set();
@@ -1212,7 +1231,10 @@ const DrawPivotTable = memo(function DrawPivotTable({
     const vnD = new Date(vnMs);
     const h = vnD.getUTCHours(),
       m = vnD.getUTCMinutes();
-    const slot = h.toString().padStart(2, '0') + ':' + m.toString().padStart(2, '0');
+    const vnMin = h * 60 + m;
+    const slotIdx = Math.round((vnMin - START_MIN) / SLOT_STEP);
+    if (slotIdx < 0 || slotIdx >= SLOT_COUNT) continue;
+    const slot = ALL_SLOTS[slotIdx];
     const dateStr = vnD.getUTCFullYear() + '-' + (vnD.getUTCMonth() + 1).toString().padStart(2, '0') + '-' + vnD.getUTCDate().toString().padStart(2, '0');
     if (!bySlot[slot]) bySlot[slot] = {};
     if (!bySlot[slot][dateStr]) bySlot[slot][dateStr] = r; // keep newest (first seen)
@@ -1220,10 +1242,10 @@ const DrawPivotTable = memo(function DrawPivotTable({
   }
 
   // Up to 5 most-recent dates as columns, newest → oldest (left → right)
-  const dates = [...dateSet].sort((a, b) => b.localeCompare(a)).slice(0, 5);
+  const dates = [...dateSet].sort((a, b) => b.localeCompare(a)).slice(0, isMobile ? 3 : 5);
 
-  // All time slots sorted ascending, filtered by period
-  let slots = Object.keys(bySlot).sort();
+  // Use all 159 canonical slots, filtered by period.
+  let slots = ALL_SLOTS;
   if (filter === 'morning') slots = slots.filter(s => +s.slice(0, 2) < 12);
   if (filter === 'afternoon') slots = slots.filter(s => {
     const h = +s.slice(0, 2);
@@ -1316,10 +1338,10 @@ const DrawPivotTable = memo(function DrawPivotTable({
     };
   });
   const TH = {
-    padding: '8px 6px',
+    padding: isMobile ? '6px 4px' : '8px 6px',
     textAlign: 'center',
     color: '#64748b',
-    fontSize: 10,
+    fontSize: isMobile ? 9 : 10,
     fontWeight: 700,
     letterSpacing: '0.05em',
     borderBottom: '1px solid rgba(255,255,255,0.08)',
@@ -1328,6 +1350,7 @@ const DrawPivotTable = memo(function DrawPivotTable({
   const ROW_BD = {
     borderBottom: '1px solid rgba(255,255,255,0.04)'
   };
+  const BALL_SIZE = isMobile ? 18 : 21;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
@@ -1344,19 +1367,20 @@ const DrawPivotTable = memo(function DrawPivotTable({
       color: filter === v ? '#a5b4fc' : '#475569',
       border: filter === v ? '1px solid rgba(99,102,241,0.45)' : '1px solid rgba(255,255,255,0.08)',
       borderRadius: 6,
-      padding: '4px 11px',
+      padding: isMobile ? '4px 9px' : '4px 11px',
       cursor: 'pointer',
-      fontSize: 11
+      fontSize: isMobile ? 10 : 11
     }
   }, l)), /*#__PURE__*/React.createElement("span", {
     style: {
-      fontSize: 11,
+      fontSize: isMobile ? 10 : 11,
       color: '#334155',
       marginLeft: 4
     }
-  }, total.toLocaleString(), " k\u1EF3 t\u1ED5ng \xB7 ", dates.length, " ng\xE0y g\u1EA7n nh\u1EA5t"), /*#__PURE__*/React.createElement("div", {
+  }, total.toLocaleString(), " k\u1EF3 t\u1ED5ng \xB7 159 k\u1EF3/ng\xE0y \xB7 ", dates.length, " ng\xE0y"), /*#__PURE__*/React.createElement("div", {
     style: {
-      marginLeft: 'auto',
+      marginLeft: isMobile ? 0 : 'auto',
+      width: isMobile ? '100%' : 'auto',
       display: 'flex',
       gap: 10,
       fontSize: 10,
@@ -1381,9 +1405,57 @@ const DrawPivotTable = memo(function DrawPivotTable({
     }
   }), l)))), /*#__PURE__*/React.createElement("div", {
     style: {
+      marginBottom: 10,
+      overflowX: 'auto'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: `repeat(${Math.max(1, dates.length)}, minmax(${isMobile ? 120 : 160}px,1fr))`,
+      gap: 8,
+      minWidth: dates.length ? `${dates.length * (isMobile ? 120 : 160)}px` : 'auto'
+    }
+  }, dates.map((d, i) => /*#__PURE__*/React.createElement("div", {
+    key: d,
+    style: {
+      background: 'rgba(255,255,255,0.03)',
+      border: '1px solid rgba(255,255,255,0.08)',
+      borderRadius: 8,
+      padding: isMobile ? '7px 8px' : '8px 10px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: isMobile ? 10 : 11,
+      color: '#64748b',
+      marginBottom: 4,
+      fontWeight: 700
+    }
+  }, fmtDateHdr(d)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      fontSize: isMobile ? 11 : 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#fbbf24',
+      fontWeight: 700
+    }
+  }, "HOA ", colSum[i]?.t ?? 0), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#7dd3fc',
+      fontWeight: 700
+    }
+  }, "\u0110\xF4i ", colSum[i]?.p ?? 0), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#94a3b8',
+      fontWeight: 700
+    }
+  }, "Th\u01B0\u1EDDng ", colSum[i]?.n ?? 0)))))), /*#__PURE__*/React.createElement("div", {
+    style: {
       overflowX: 'auto',
       overflowY: 'auto',
-      maxHeight: 540
+      maxHeight: isMobile ? 420 : 540
     }
   }, /*#__PURE__*/React.createElement("table", {
     style: {
@@ -1398,25 +1470,24 @@ const DrawPivotTable = memo(function DrawPivotTable({
       position: 'sticky',
       left: 0,
       zIndex: 3,
-      minWidth: 52,
-      padding: '8px 10px'
+      minWidth: isMobile ? 44 : 52,
+      padding: isMobile ? '6px 8px' : '8px 10px'
     }
   }, "Gi\u1EDD"), dates.map(d => /*#__PURE__*/React.createElement("th", {
     key: d,
     style: {
       ...TH,
-      minWidth: 110
+      minWidth: isMobile ? 92 : 110
     }
   }, fmtDateHdr(d))))), /*#__PURE__*/React.createElement("tbody", null, slots.map(slot => {
-    if (!dates.some(d => bySlot[slot]?.[d])) return null;
     return /*#__PURE__*/React.createElement("tr", {
       key: slot
     }, /*#__PURE__*/React.createElement("td", {
       style: {
         ...ROW_BD,
-        padding: '4px 10px',
+        padding: isMobile ? '4px 6px' : '4px 10px',
         color: '#475569',
-        fontSize: 11,
+        fontSize: isMobile ? 10 : 11,
         fontWeight: 700,
         position: 'sticky',
         left: 0,
@@ -1433,7 +1504,7 @@ const DrawPivotTable = memo(function DrawPivotTable({
         key: date,
         style: {
           ...ROW_BD,
-          padding: '4px 6px',
+          padding: isMobile ? '3px 4px' : '4px 6px',
           textAlign: 'center',
           ...cellCS(h)
         }
@@ -1450,18 +1521,18 @@ const DrawPivotTable = memo(function DrawPivotTable({
           display: 'inline-flex',
           alignItems: 'center',
           justifyContent: 'center',
-          width: 21,
-          height: 21,
+          width: BALL_SIZE,
+          height: BALL_SIZE,
           background: bbg,
           border: bb,
           borderRadius: 5,
           fontWeight: 800,
           color: bc,
-          fontSize: 11
+          fontSize: isMobile ? 10 : 11
         }
       }, n)), /*#__PURE__*/React.createElement("span", {
         style: {
-          fontSize: 10,
+          fontSize: isMobile ? 9 : 10,
           color: '#475569',
           marginLeft: 2
         }
@@ -1472,66 +1543,7 @@ const DrawPivotTable = memo(function DrawPivotTable({
         }
       }, "\u2014"));
     }));
-  })), /*#__PURE__*/React.createElement("tfoot", null, /*#__PURE__*/React.createElement("tr", {
-    style: {
-      borderTop: '2px solid rgba(255,255,255,0.10)'
-    }
-  }, /*#__PURE__*/React.createElement("td", {
-    style: {
-      padding: '6px 10px',
-      fontSize: 10,
-      color: '#fbbf24',
-      fontWeight: 700,
-      position: 'sticky',
-      left: 0,
-      background: '#1e293b'
-    }
-  }, "HOA"), colSum.map((s, i) => /*#__PURE__*/React.createElement("td", {
-    key: i,
-    style: {
-      padding: '6px 6px',
-      textAlign: 'center',
-      color: '#fbbf24',
-      fontWeight: 700,
-      fontSize: 13
-    }
-  }, s.t))), /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
-    style: {
-      padding: '3px 10px',
-      fontSize: 10,
-      color: '#7dd3fc',
-      fontWeight: 700,
-      position: 'sticky',
-      left: 0,
-      background: '#1e293b'
-    }
-  }, "\u0110\xF4i"), colSum.map((s, i) => /*#__PURE__*/React.createElement("td", {
-    key: i,
-    style: {
-      padding: '3px 6px',
-      textAlign: 'center',
-      color: '#7dd3fc',
-      fontSize: 13
-    }
-  }, s.p))), /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
-    style: {
-      padding: '3px 10px 8px',
-      fontSize: 10,
-      color: '#64748b',
-      fontWeight: 700,
-      position: 'sticky',
-      left: 0,
-      background: '#1e293b'
-    }
-  }, "Th\u01B0\u1EDDng"), colSum.map((s, i) => /*#__PURE__*/React.createElement("td", {
-    key: i,
-    style: {
-      padding: '3px 6px 8px',
-      textAlign: 'center',
-      color: '#64748b',
-      fontSize: 12
-    }
-  }, s.n)))))));
+  })))));
 });
 
 /* ─────────────────────────── NewDrawToast ──────────────────────────────── */
@@ -1685,11 +1697,11 @@ function App() {
         if (nextSig !== predsRef.current) {
           predsRef.current = nextSig;
           setPreds(newPreds);
-          setMaxScore(pRes.maxScore || 1);
-          setTripleSignal(pRes.tripleSignal || null);
-          setModelContrib(pRes.modelContrib || null);
-          setSumStats(pRes.sumStats || []);
         }
+        setMaxScore(pRes.maxScore || 1);
+        setTripleSignal(pRes.tripleSignal || null);
+        setModelContrib(pRes.modelContrib || null);
+        setSumStats(pRes.sumStats || []);
         setTotal(pRes.total || 0);
         setUpdated(new Date().toLocaleTimeString('vi-VN'));
       }
@@ -1741,6 +1753,11 @@ function App() {
         const info = JSON.parse(e.data);
         setLiveKy(info.latestKy);
         setToast(info);
+        // Force full refresh after a confirmed new draw event.
+        predETagRef.current = null;
+        histETagRef.current = null;
+        overdueETagRef.current = null;
+        statsETagRef.current = null;
         loadRef.current(true);
         loadStatsRef.current();
         loadOverdueRef.current();
@@ -1838,11 +1855,25 @@ function App() {
     },
     onClick: async () => {
       setCrawling(true);
-      await fetch('/crawl', {
-        method: 'POST'
-      }).catch(() => {});
-      setCrawling(false);
-      load();
+      try {
+        const r = await fetch('/crawl', {
+          method: 'POST',
+          cache: 'no-store'
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || j?.ok === false) throw new Error(j?.message || `API ${r.status}`);
+
+        // Always force-refresh all views after manual crawl trigger.
+        predETagRef.current = null;
+        histETagRef.current = null;
+        overdueETagRef.current = null;
+        statsETagRef.current = null;
+        await Promise.all([loadRef.current(true), loadStatsRef.current(), loadOverdueRef.current()]);
+      } catch (e) {
+        setError(e.message || 'Không thể cập nhật dữ liệu');
+      } finally {
+        setCrawling(false);
+      }
     },
     disabled: crawling || loading
   }, crawling ? 'Đang tải…' : loading ? 'Loading…' : '⬇ Cập nhật'))), /*#__PURE__*/React.createElement("div", {

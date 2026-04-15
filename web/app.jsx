@@ -579,12 +579,30 @@ const OverdueTable = memo(function OverdueTable({ items, loading, title }) {
 /* ─────────────────────── DrawPivotTable (lịch sử theo giờ) ─────────────── */
 const DrawPivotTable = memo(function DrawPivotTable({ history, total }) {
   const [filter, setFilter] = useState('all')
+  const [isMobile, setIsMobile] = useState((typeof window !== 'undefined') ? window.innerWidth < 720 : false)
+
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth < 720)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
   if (!history || history.length === 0) return (
     <div style={{ color: '#475569', fontSize: 13, padding: '16px 0' }}>Không có dữ liệu</div>
   )
 
-  // Group by VN date × time slot (UTC+7 explicit to work in any browser timezone)
+  // Canonical Bingo18 schedule: 159 draws/day, every 6 minutes from 06:05 to 21:53.
+  const START_MIN = 6 * 60 + 5
+  const SLOT_STEP = 6
+  const SLOT_COUNT = 159
+  const ALL_SLOTS = Array.from({ length: SLOT_COUNT }, (_, i) => {
+    const totalMin = START_MIN + i * SLOT_STEP
+    const hh = Math.floor(totalMin / 60).toString().padStart(2, '0')
+    const mm = (totalMin % 60).toString().padStart(2, '0')
+    return `${hh}:${mm}`
+  })
+
+  // Group by VN date × canonical slot (UTC+7 explicit to work in any browser timezone)
   const VN_OFF = 7 * 3600_000
   const bySlot = {}  // HH:MM → { YYYY-MM-DD → record }
   const dateSet = new Set()
@@ -594,7 +612,10 @@ const DrawPivotTable = memo(function DrawPivotTable({ history, total }) {
     const vnMs = new Date(r.drawTime).getTime() + VN_OFF
     const vnD = new Date(vnMs)
     const h = vnD.getUTCHours(), m = vnD.getUTCMinutes()
-    const slot = h.toString().padStart(2, '0') + ':' + m.toString().padStart(2, '0')
+    const vnMin = h * 60 + m
+    const slotIdx = Math.round((vnMin - START_MIN) / SLOT_STEP)
+    if (slotIdx < 0 || slotIdx >= SLOT_COUNT) continue
+    const slot = ALL_SLOTS[slotIdx]
     const dateStr = vnD.getUTCFullYear() + '-' +
       (vnD.getUTCMonth() + 1).toString().padStart(2, '0') + '-' +
       vnD.getUTCDate().toString().padStart(2, '0')
@@ -604,13 +625,13 @@ const DrawPivotTable = memo(function DrawPivotTable({ history, total }) {
   }
 
   // Up to 5 most-recent dates as columns, newest → oldest (left → right)
-  const dates = [...dateSet].sort((a, b) => b.localeCompare(a)).slice(0, 5)
+  const dates = [...dateSet].sort((a, b) => b.localeCompare(a)).slice(0, isMobile ? 3 : 5)
 
-  // All time slots sorted ascending, filtered by period
-  let slots = Object.keys(bySlot).sort()
-  if (filter === 'morning')   slots = slots.filter(s => +s.slice(0, 2) < 12)
+  // Use all 159 canonical slots, filtered by period.
+  let slots = ALL_SLOTS
+  if (filter === 'morning') slots = slots.filter(s => +s.slice(0, 2) < 12)
   if (filter === 'afternoon') slots = slots.filter(s => { const h = +s.slice(0, 2); return h >= 12 && h < 18 })
-  if (filter === 'evening')   slots = slots.filter(s => +s.slice(0, 2) >= 18)
+  if (filter === 'evening') slots = slots.filter(s => +s.slice(0, 2) >= 18)
 
   const DAY_VN = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7']
   function fmtDateHdr(ds) {
@@ -620,33 +641,33 @@ const DrawPivotTable = memo(function DrawPivotTable({ history, total }) {
   }
 
   function isTriple(r) { return r.n1 === r.n2 && r.n2 === r.n3 }
-  function isPair(r)   { return !isTriple(r) && (r.n1 === r.n2 || r.n2 === r.n3 || r.n1 === r.n3) }
-  function getSum(r)   { return r.sum != null ? r.sum : r.n1 + r.n2 + r.n3 }
+  function isPair(r) { return !isTriple(r) && (r.n1 === r.n2 || r.n2 === r.n3 || r.n1 === r.n3) }
+  function getSum(r) { return r.sum != null ? r.sum : r.n1 + r.n2 + r.n3 }
 
   // Highlight flags for a given (slot, column-index) cell
   function getHL(slot, di) {
     const cur = bySlot[slot]?.[dates[di]]
     if (!cur) return {}
     const h = {}
-    if      (isTriple(cur)) h.triple = true
-    else if (isPair(cur))   h.pair   = true
+    if (isTriple(cur)) h.triple = true
+    else if (isPair(cur)) h.pair = true
     const curSum = getSum(cur)
     // Compare against immediate neighbours (previous and next column)
     for (const adj of [bySlot[slot]?.[dates[di - 1]], bySlot[slot]?.[dates[di + 1]]]) {
       if (!adj) continue
-      if (getSum(adj) === curSum)           h.sameSum    = true
-      if (isTriple(cur) && isTriple(adj))   h.sameTriple = true
-      if (isPair(cur)   && isPair(adj))     h.samePair   = true
+      if (getSum(adj) === curSum) h.sameSum = true
+      if (isTriple(cur) && isTriple(adj)) h.sameTriple = true
+      if (isPair(cur) && isPair(adj)) h.samePair = true
     }
     return h
   }
 
   function cellCS(h) { // background + box-shadow for the <td>
-    if (h.sameTriple) return { background: 'rgba(251,191,36,0.28)',  boxShadow: 'inset 0 0 0 2px rgba(251,191,36,0.65)' }
-    if (h.triple)     return { background: 'rgba(251,191,36,0.12)',  boxShadow: 'inset 0 0 0 1px rgba(251,191,36,0.38)' }
-    if (h.samePair)   return { background: 'rgba(167,139,250,0.20)', boxShadow: 'inset 0 0 0 2px rgba(167,139,250,0.58)' }
-    if (h.pair)       return { background: 'rgba(125,211,252,0.10)', boxShadow: 'inset 0 0 0 1px rgba(125,211,252,0.28)' }
-    if (h.sameSum)    return { background: 'rgba(251,113,133,0.12)', boxShadow: 'inset 0 0 0 2px rgba(251,113,133,0.52)' }
+    if (h.sameTriple) return { background: 'rgba(251,191,36,0.28)', boxShadow: 'inset 0 0 0 2px rgba(251,191,36,0.65)' }
+    if (h.triple) return { background: 'rgba(251,191,36,0.12)', boxShadow: 'inset 0 0 0 1px rgba(251,191,36,0.38)' }
+    if (h.samePair) return { background: 'rgba(167,139,250,0.20)', boxShadow: 'inset 0 0 0 2px rgba(167,139,250,0.58)' }
+    if (h.pair) return { background: 'rgba(125,211,252,0.10)', boxShadow: 'inset 0 0 0 1px rgba(125,211,252,0.28)' }
+    if (h.sameSum) return { background: 'rgba(251,113,133,0.12)', boxShadow: 'inset 0 0 0 2px rgba(251,113,133,0.52)' }
     return { background: 'transparent', boxShadow: 'none' }
   }
   function ballColor(h) {
@@ -670,57 +691,74 @@ const DrawPivotTable = memo(function DrawPivotTable({ history, total }) {
     return { t, p, n }
   })
 
-  const TH = { padding: '8px 6px', textAlign: 'center', color: '#64748b', fontSize: 10, fontWeight: 700, letterSpacing: '0.05em', borderBottom: '1px solid rgba(255,255,255,0.08)', background: '#1e293b' }
+  const TH = { padding: isMobile ? '6px 4px' : '8px 6px', textAlign: 'center', color: '#64748b', fontSize: isMobile ? 9 : 10, fontWeight: 700, letterSpacing: '0.05em', borderBottom: '1px solid rgba(255,255,255,0.08)', background: '#1e293b' }
   const ROW_BD = { borderBottom: '1px solid rgba(255,255,255,0.04)' }
+  const BALL_SIZE = isMobile ? 18 : 21
 
   return (
     <div>
       {/* Filter buttons + legend */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 14, flexWrap: 'wrap', alignItems: 'center' }}>
-        {[['all','Tất cả'],['morning','Sáng 6–12h'],['afternoon','Chiều 12–18h'],['evening','Tối 18–22h']].map(([v, l]) => (
+        {[['all', 'Tất cả'], ['morning', 'Sáng 6–12h'], ['afternoon', 'Chiều 12–18h'], ['evening', 'Tối 18–22h']].map(([v, l]) => (
           <button key={v} onClick={() => setFilter(v)} style={{
             background: filter === v ? 'rgba(99,102,241,0.22)' : 'rgba(255,255,255,0.04)',
             color: filter === v ? '#a5b4fc' : '#475569',
             border: filter === v ? '1px solid rgba(99,102,241,0.45)' : '1px solid rgba(255,255,255,0.08)',
-            borderRadius: 6, padding: '4px 11px', cursor: 'pointer', fontSize: 11,
+            borderRadius: 6, padding: isMobile ? '4px 9px' : '4px 11px', cursor: 'pointer', fontSize: isMobile ? 10 : 11,
           }}>{l}</button>
         ))}
-        <span style={{ fontSize: 11, color: '#334155', marginLeft: 4 }}>{total.toLocaleString()} kỳ tổng · {dates.length} ngày gần nhất</span>
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 10, fontSize: 10, color: '#64748b', flexWrap: 'wrap', alignItems: 'center' }}>
-          {[['rgba(251,191,36,0.40)','HOA'],['rgba(125,211,252,0.35)','Đôi'],['rgba(251,113,133,0.35)','Same Tổng'],['rgba(167,139,250,0.35)','Same Đôi']].map(([c, l]) => (
+        <span style={{ fontSize: isMobile ? 10 : 11, color: '#334155', marginLeft: 4 }}>{total.toLocaleString()} kỳ tổng · 159 kỳ/ngày · {dates.length} ngày</span>
+        <div style={{ marginLeft: isMobile ? 0 : 'auto', width: isMobile ? '100%' : 'auto', display: 'flex', gap: 10, fontSize: 10, color: '#64748b', flexWrap: 'wrap', alignItems: 'center' }}>
+          {[['rgba(251,191,36,0.40)', 'HOA'], ['rgba(125,211,252,0.35)', 'Đôi'], ['rgba(251,113,133,0.35)', 'Same Tổng'], ['rgba(167,139,250,0.35)', 'Same Đôi']].map(([c, l]) => (
             <span key={l} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
               <span style={{ display: 'inline-block', width: 10, height: 10, background: c, borderRadius: 2 }} />{l}
             </span>
           ))}
         </div>
       </div>
+
+      {/* Summary first (before detailed table) */}
+      <div style={{ marginBottom: 10, overflowX: 'auto' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.max(1, dates.length)}, minmax(${isMobile ? 120 : 160}px,1fr))`, gap: 8, minWidth: dates.length ? `${dates.length * (isMobile ? 120 : 160)}px` : 'auto' }}>
+          {dates.map((d, i) => (
+            <div key={d} style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 8, padding: isMobile ? '7px 8px' : '8px 10px' }}>
+              <div style={{ fontSize: isMobile ? 10 : 11, color: '#64748b', marginBottom: 4, fontWeight: 700 }}>{fmtDateHdr(d)}</div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: isMobile ? 11 : 12 }}>
+                <span style={{ color: '#fbbf24', fontWeight: 700 }}>HOA {colSum[i]?.t ?? 0}</span>
+                <span style={{ color: '#7dd3fc', fontWeight: 700 }}>Đôi {colSum[i]?.p ?? 0}</span>
+                <span style={{ color: '#94a3b8', fontWeight: 700 }}>Thường {colSum[i]?.n ?? 0}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
       {/* Scrollable pivot table */}
-      <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 540 }}>
+      <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: isMobile ? 420 : 540 }}>
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
           <thead>
             <tr>
-              <th style={{ ...TH, textAlign: 'left', position: 'sticky', left: 0, zIndex: 3, minWidth: 52, padding: '8px 10px' }}>Giờ</th>
-              {dates.map(d => <th key={d} style={{ ...TH, minWidth: 110 }}>{fmtDateHdr(d)}</th>)}
+              <th style={{ ...TH, textAlign: 'left', position: 'sticky', left: 0, zIndex: 3, minWidth: isMobile ? 44 : 52, padding: isMobile ? '6px 8px' : '8px 10px' }}>Giờ</th>
+              {dates.map(d => <th key={d} style={{ ...TH, minWidth: isMobile ? 92 : 110 }}>{fmtDateHdr(d)}</th>)}
             </tr>
           </thead>
           <tbody>
             {slots.map(slot => {
-              if (!dates.some(d => bySlot[slot]?.[d])) return null
               return (
                 <tr key={slot}>
-                  <td style={{ ...ROW_BD, padding: '4px 10px', color: '#475569', fontSize: 11, fontWeight: 700, position: 'sticky', left: 0, background: '#1e293b', zIndex: 1 }}>{slot}</td>
+                  <td style={{ ...ROW_BD, padding: isMobile ? '4px 6px' : '4px 10px', color: '#475569', fontSize: isMobile ? 10 : 11, fontWeight: 700, position: 'sticky', left: 0, background: '#1e293b', zIndex: 1 }}>{slot}</td>
                   {dates.map((date, di) => {
                     const r = bySlot[slot]?.[date]
                     const h = r ? getHL(slot, di) : {}
                     const bc = ballColor(h), bbg = ballBg(h), bb = ballBorder(h)
                     return (
-                      <td key={date} style={{ ...ROW_BD, padding: '4px 6px', textAlign: 'center', ...cellCS(h) }}>
+                      <td key={date} style={{ ...ROW_BD, padding: isMobile ? '3px 4px' : '4px 6px', textAlign: 'center', ...cellCS(h) }}>
                         {r ? (
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 2 }}>
                             {[r.n1, r.n2, r.n3].map((n, j) => (
-                              <span key={j} style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 21, height: 21, background: bbg, border: bb, borderRadius: 5, fontWeight: 800, color: bc, fontSize: 11 }}>{n}</span>
+                              <span key={j} style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: BALL_SIZE, height: BALL_SIZE, background: bbg, border: bb, borderRadius: 5, fontWeight: 800, color: bc, fontSize: isMobile ? 10 : 11 }}>{n}</span>
                             ))}
-                            <span style={{ fontSize: 10, color: '#475569', marginLeft: 2 }}>{getSum(r)}</span>
+                            <span style={{ fontSize: isMobile ? 9 : 10, color: '#475569', marginLeft: 2 }}>{getSum(r)}</span>
                           </div>
                         ) : (
                           <span style={{ color: '#1e3a5f', fontSize: 11 }}>—</span>
@@ -732,20 +770,6 @@ const DrawPivotTable = memo(function DrawPivotTable({ history, total }) {
               )
             })}
           </tbody>
-          <tfoot>
-            <tr style={{ borderTop: '2px solid rgba(255,255,255,0.10)' }}>
-              <td style={{ padding: '6px 10px', fontSize: 10, color: '#fbbf24', fontWeight: 700, position: 'sticky', left: 0, background: '#1e293b' }}>HOA</td>
-              {colSum.map((s, i) => <td key={i} style={{ padding: '6px 6px', textAlign: 'center', color: '#fbbf24', fontWeight: 700, fontSize: 13 }}>{s.t}</td>)}
-            </tr>
-            <tr>
-              <td style={{ padding: '3px 10px', fontSize: 10, color: '#7dd3fc', fontWeight: 700, position: 'sticky', left: 0, background: '#1e293b' }}>Đôi</td>
-              {colSum.map((s, i) => <td key={i} style={{ padding: '3px 6px', textAlign: 'center', color: '#7dd3fc', fontSize: 13 }}>{s.p}</td>)}
-            </tr>
-            <tr>
-              <td style={{ padding: '3px 10px 8px', fontSize: 10, color: '#64748b', fontWeight: 700, position: 'sticky', left: 0, background: '#1e293b' }}>Thường</td>
-              {colSum.map((s, i) => <td key={i} style={{ padding: '3px 6px 8px', textAlign: 'center', color: '#64748b', fontSize: 12 }}>{s.n}</td>)}
-            </tr>
-          </tfoot>
         </table>
       </div>
     </div>
@@ -877,11 +901,11 @@ function App() {
         if (nextSig !== predsRef.current) {
           predsRef.current = nextSig
           setPreds(newPreds)
-          setMaxScore(pRes.maxScore || 1)
-          setTripleSignal(pRes.tripleSignal || null)
-          setModelContrib(pRes.modelContrib || null)
-          setSumStats(pRes.sumStats || [])
         }
+        setMaxScore(pRes.maxScore || 1)
+        setTripleSignal(pRes.tripleSignal || null)
+        setModelContrib(pRes.modelContrib || null)
+        setSumStats(pRes.sumStats || [])
         setTotal(pRes.total || 0)
         setUpdated(new Date().toLocaleTimeString('vi-VN'))
       }
@@ -930,6 +954,11 @@ function App() {
         const info = JSON.parse(e.data)
         setLiveKy(info.latestKy)
         setToast(info)
+        // Force full refresh after a confirmed new draw event.
+        predETagRef.current = null
+        histETagRef.current = null
+        overdueETagRef.current = null
+        statsETagRef.current = null
         loadRef.current(true)
         loadStatsRef.current()
         loadOverdueRef.current()
@@ -1022,9 +1051,27 @@ function App() {
           <button style={{ ...C.btn, opacity: (crawling || loading) ? 0.6 : 1, background: 'rgba(52,211,153,0.15)', borderColor: 'rgba(52,211,153,0.4)', color: '#34d399' }}
             onClick={async () => {
               setCrawling(true)
-              await fetch('/crawl', { method: 'POST' }).catch(() => { })
-              setCrawling(false)
-              load()
+              try {
+                const r = await fetch('/crawl', { method: 'POST', cache: 'no-store' })
+                const j = await r.json().catch(() => ({}))
+                if (!r.ok || j?.ok === false) throw new Error(j?.message || `API ${r.status}`)
+
+                // Always force-refresh all views after manual crawl trigger.
+                predETagRef.current = null
+                histETagRef.current = null
+                overdueETagRef.current = null
+                statsETagRef.current = null
+
+                await Promise.all([
+                  loadRef.current(true),
+                  loadStatsRef.current(),
+                  loadOverdueRef.current(),
+                ])
+              } catch (e) {
+                setError(e.message || 'Không thể cập nhật dữ liệu')
+              } finally {
+                setCrawling(false)
+              }
             }}
             disabled={crawling || loading}>
             {crawling ? 'Đang tải…' : loading ? 'Loading…' : '⬇ Cập nhật'}

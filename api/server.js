@@ -748,49 +748,57 @@ app.get('/health', (_req, res) => {
 })
 
 /** POST /crawl — manual crawl trigger */
-let crawling = false
 app.post('/crawl', async (_req, res) => {
-  if (crawling) return res.json({ ok: false, message: 'Dang crawl, vui long doi...' })
-  crawling = true
-  try { await crawlTick(); res.json({ ok: true, message: 'Crawl xong' }) }
+  try {
+    const result = await crawlTick({ manual: true })
+    if (result.busy) return res.json({ ok: false, message: 'Dang crawl, vui long doi...' })
+    res.json({ ok: true, message: result.added > 0 ? `Da them ${result.added} ky moi` : 'Khong co ky moi', ...result })
+  }
   catch (err) { res.status(500).json({ ok: false, message: err.message }) }
-  finally { crawling = false }
 })
 
 // ── Crawler loop ───────────────────────────────────────────────────────────
 let lastKnownTotal = 0
 let lastCrawlAttempt = 0
+let _crawlRunning = false
 
 function isOperatingHours() {
   const vnMinutes = ((new Date().getUTCHours() + 7) % 24) * 60 + new Date().getUTCMinutes()
   return vnMinutes >= 360 && vnMinutes <= 1314  // 06:00-21:54 VN
 }
 
-async function crawlTick() {
-  if (!isOperatingHours()) { console.log('[crawler] off-hours (06:00-21:54 VN) -- skipping'); return }
-  if (crawling) {
-    console.log('[crawler] previous crawl still running — skip overlapping tick')
-    return
+async function crawlTick({ manual = false } = {}) {
+  if (!manual && !isOperatingHours()) {
+    console.log('[crawler] off-hours (06:00-21:54 VN) -- skipping')
+    return { skipped: true, reason: 'off-hours', added: 0, total: lastKnownTotal, latestKy: null, changed: false }
   }
-  crawling = true
+  if (_crawlRunning) {
+    console.log('[crawler] previous crawl still running — skip overlapping tick')
+    return { busy: true, added: 0, total: lastKnownTotal, latestKy: null, changed: false }
+  }
+  _crawlRunning = true
   lastCrawlAttempt = Date.now()
   console.log(`[crawler] ${new Date().toLocaleTimeString('vi-VN')} -- crawling...`)
   try {
     const { total, added, newRecords } = await crawlRun()
+    const latestKy = newRecords[0]?.ky || null
+    let changed = false
     if (added > 0 || total !== lastKnownTotal) {
-      const latestKy = newRecords[0]?.ky || '?'
       if (added > 0) {
         console.log(`[crawler] ${added} ky moi (latest: #${latestKy}) -- push SSE -> ${sseClients.size} client(s)`)
         invalidateCache()
-        broadcast('new-draw', { added, latestKy, total, ts: new Date().toISOString() })
+        broadcast('new-draw', { added, latestKy: latestKy || '?', total, ts: new Date().toISOString() })
       } else {
         console.log(`[crawler] total changed ${lastKnownTotal}->${total} -- invalidating cache`)
         invalidateCache()
       }
       lastKnownTotal = total
+      changed = true
     }
+    return { busy: false, skipped: false, added, total, latestKy, changed }
   } catch (err) { console.error('[crawler] ERROR:', err.message) }
-  finally { crawling = false }
+  finally { _crawlRunning = false }
+  return { busy: false, skipped: false, added: 0, total: lastKnownTotal, latestKy: null, changed: false }
 }
 
 // ── Start ──────────────────────────────────────────────────────────────────
