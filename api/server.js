@@ -929,6 +929,31 @@ async function runDeepRecovery() {
   }
 }
 
+// ── Markov Reality Check ───────────────────────────────────────────────────
+const { runAll: markovRealityRunAll } = require('../scripts/markov_reality')
+
+let _markovRealityCache = null
+let _markovRealityTs = 0
+const MARKOV_REALITY_TTL = 30 * 60_000  // recompute at most every 30 min
+
+app.get('/experiments/markov-reality', async (_req, res) => {
+  const now = Date.now()
+  if (_markovRealityCache && now - _markovRealityTs < MARKOV_REALITY_TTL) {
+    res.set('X-Cache', 'HIT')
+    return res.json(_markovRealityCache)
+  }
+
+  try {
+    const result = markovRealityRunAll()
+    _markovRealityCache = result
+    _markovRealityTs = now
+    res.set('X-Cache', 'MISS')
+    res.json(result)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // ── Start ──────────────────────────────────────────────────────────────────
 const CRAWL_INTERVAL_MS = 30_000  // poll every 30s — halved to reduce lag; still 12× margin vs 6-min draw frequency
 

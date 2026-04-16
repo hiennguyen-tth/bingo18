@@ -1229,38 +1229,34 @@ const DrawPivotTable = memo(function DrawPivotTable({
     }
   }, "Kh\xF4ng c\xF3 d\u1EEF li\u1EC7u");
 
-  // Canonical Bingo18 schedule: 159 draws/day, every 6 minutes from 06:05 to 21:53.
-  const START_MIN = 6 * 60 + 5;
-  const SLOT_STEP = 6;
-  const SLOT_COUNT = 159;
-  const ALL_SLOTS = Array.from({
-    length: SLOT_COUNT
-  }, (_, i) => {
-    const totalMin = START_MIN + i * SLOT_STEP;
-    const hh = Math.floor(totalMin / 60).toString().padStart(2, '0');
-    const mm = (totalMin % 60).toString().padStart(2, '0');
-    return `${hh}:${mm}`;
-  });
-
-  // Group by VN date × canonical slot (UTC+7 explicit to work in any browser timezone)
+  // Use ACTUAL draw times from the crawl data as slot labels — no canonical snapping.
+  // Rationale: xoso.net.vn timestamps are the publication time, which can be 1-6 minutes
+  // after the canonical 06:05+6min schedule. Snapping to a fixed grid causes:
+  //   (a) draws published near a slot boundary to collide → one gets silently dropped
+  //   (b) the first draw found (newest-first) occupies the slot, later draws skipped
+  // Dynamic slots use exact HH:MM from drawTime — every draw is visible, no collisions.
   const VN_OFF = 7 * 3600_000;
-  const bySlot = {}; // HH:MM → { YYYY-MM-DD → record }
+  const bySlot = {}; // "HH:MM" → { "YYYY-MM-DD" → record }
   const dateSet = new Set();
+  const slotSet = new Set();
   for (const r of history) {
     if (!r.drawTime) continue;
     const vnMs = new Date(r.drawTime).getTime() + VN_OFF;
     const vnD = new Date(vnMs);
     const h = vnD.getUTCHours(),
       m = vnD.getUTCMinutes();
-    const vnMin = h * 60 + m;
-    const slotIdx = Math.round((vnMin - START_MIN) / SLOT_STEP);
-    if (slotIdx < 0 || slotIdx >= SLOT_COUNT) continue;
-    const slot = ALL_SLOTS[slotIdx];
+    if (h < 6 || h >= 22) continue; // skip draws outside operating hours
+    const slot = h.toString().padStart(2, '0') + ':' + m.toString().padStart(2, '0');
     const dateStr = vnD.getUTCFullYear() + '-' + (vnD.getUTCMonth() + 1).toString().padStart(2, '0') + '-' + vnD.getUTCDate().toString().padStart(2, '0');
     if (!bySlot[slot]) bySlot[slot] = {};
-    if (!bySlot[slot][dateStr]) bySlot[slot][dateStr] = r; // keep newest (first seen)
+    if (!bySlot[slot][dateStr]) bySlot[slot][dateStr] = r;
     dateSet.add(dateStr);
+    slotSet.add(slot);
   }
+
+  // ALL_SLOTS: all unique HH:MM values across history, sorted chronologically.
+  // These are the actual published draw times — no hardcoded canonical grid.
+  const ALL_SLOTS = [...slotSet].sort();
 
   // Up to 5 most-recent dates as columns, newest → oldest (left → right)
   const dates = [...dateSet].sort((a, b) => b.localeCompare(a)).slice(0, isMobile ? 3 : 5);
