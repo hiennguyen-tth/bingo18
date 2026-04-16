@@ -1,0 +1,370 @@
+{
+  "date": "2026-04-16T02:48:31.075Z",
+  "totalRecords": 41698,
+  "experiments": {
+    "exp1": {
+      "name": "autocorr_sum",
+      "results": [
+        {
+          "lag": 1,
+          "r": 0.001446,
+          "z": 0.295,
+          "pValue": 0.7679,
+          "significant": false
+        },
+        {
+          "lag": 2,
+          "r": 0.003769,
+          "z": 0.77,
+          "pValue": 0.4416,
+          "significant": false
+        },
+        {
+          "lag": 3,
+          "r": 0.006019,
+          "z": 1.229,
+          "pValue": 0.2191,
+          "significant": false
+        },
+        {
+          "lag": 6,
+          "r": 0.00377,
+          "z": 0.77,
+          "pValue": 0.4414,
+          "significant": false
+        },
+        {
+          "lag": 10,
+          "r": -0.00085,
+          "z": -0.173,
+          "pValue": 0.8623,
+          "significant": false
+        },
+        {
+          "lag": 12,
+          "r": 0.003624,
+          "z": 0.74,
+          "pValue": 0.4593,
+          "significant": false
+        },
+        {
+          "lag": 20,
+          "r": 0.005999,
+          "z": 1.225,
+          "pValue": 0.2207,
+          "significant": false
+        },
+        {
+          "lag": 30,
+          "r": 0.001509,
+          "z": 0.308,
+          "pValue": 0.7581,
+          "significant": false
+        },
+        {
+          "lag": 50,
+          "r": 0.004838,
+          "z": 0.987,
+          "pValue": 0.3235,
+          "significant": false
+        },
+        {
+          "lag": 100,
+          "r": 0.007861,
+          "z": 1.603,
+          "pValue": 0.1089,
+          "significant": false
+        }
+      ],
+      "anySig": false
+    },
+    "exp2": {
+      "name": "chi_by_hour",
+      "results": [
+        {
+          "hour": 6,
+          "n": 2613,
+          "chiStat": 12.46,
+          "df": 15,
+          "pValue": 0.6443,
+          "significant": false
+        },
+        {
+          "hour": 7,
+          "n": 2629,
+          "chiStat": 16.09,
+          "df": 15,
+          "pValue": 0.376,
+          "significant": false
+        },
+        {
+          "hour": 8,
+          "n": 2627,
+          "chiStat": 12.45,
+          "df": 15,
+          "pValue": 0.6453,
+          "significant": false
+        },
+        {
+          "hour": 9,
+          "n": 2626,
+          "chiStat": 21.27,
+          "df": 15,
+          "pValue": 0.1279,
+          "significant": false
+        },
+        {
+          "hour": 10,
+          "n": 2629,
+          "chiStat": 12.96,
+          "df": 15,
+          "pValue": 0.6059,
+          "significant": false
+        },
+        {
+          "hour": 11,
+          "n": 2612,
+          "chiStat": 13.77,
+          "df": 15,
+          "pValue": 0.5435,
+          "significant": false
+        },
+        {
+          "hour": 12,
+          "n": 2633,
+          "chiStat": 9.23,
+          "df": 15,
+          "pValue": 0.8655,
+          "significant": false
+        },
+        {
+          "hour": 13,
+          "n": 2621,
+          "chiStat": 15.35,
+          "df": 15,
+          "pValue": 0.4268,
+          "significant": false
+        },
+        {
+          "hour": 14,
+          "n": 2619,
+          "chiStat": 23.99,
+          "df": 15,
+          "pValue": 0.065,
+          "significant": false
+        },
+        {
+          "hour": 15,
+          "n": 2615,
+          "chiStat": 25.73,
+          "df": 15,
+          "pValue": 0.0409,
+          "significant": true
+        },
+        {
+          "hour": 16,
+          "n": 2616,
+          "chiStat": 16.48,
+          "df": 15,
+          "pValue": 0.3505,
+          "significant": false
+        },
+        {
+          "hour": 17,
+          "n": 2630,
+          "chiStat": 18.25,
+          "df": 15,
+          "pValue": 0.2494,
+          "significant": false
+        },
+        {
+          "hour": 18,
+          "n": 2619,
+          "chiStat": 12.79,
+          "df": 15,
+          "pValue": 0.6194,
+          "significant": false
+        },
+        {
+          "hour": 19,
+          "n": 2616,
+          "chiStat": 7.29,
+          "df": 15,
+          "pValue": 0.9491,
+          "significant": false
+        },
+        {
+          "hour": 20,
+          "n": 2622,
+          "chiStat": 20.01,
+          "df": 15,
+          "pValue": 0.171,
+          "significant": false
+        },
+        {
+          "hour": 21,
+          "n": 2371,
+          "chiStat": 17.42,
+          "df": 15,
+          "pValue": 0.2939,
+          "significant": false
+        }
+      ],
+      "anySig": true
+    },
+    "exp3": {
+      "name": "runs_pattern",
+      "result": {
+        "runs": 2313,
+        "E_runs": 2318.7,
+        "z": -0.505,
+        "pValue": 0.6133,
+        "significant": false
+      },
+      "tripleRate": 0.0286,
+      "pairRate": 0.4195,
+      "anySig": false
+    },
+    "exp4": {
+      "name": "markov1_sum",
+      "rowResults": [
+        {
+          "from": 3,
+          "n": 200,
+          "chiStat": 8.56,
+          "df": 15,
+          "pValue": 0.8996,
+          "significant": false
+        },
+        {
+          "from": 4,
+          "n": 559,
+          "chiStat": 21.16,
+          "df": 15,
+          "pValue": 0.1314,
+          "significant": false
+        },
+        {
+          "from": 5,
+          "n": 1176,
+          "chiStat": 17.09,
+          "df": 15,
+          "pValue": 0.3133,
+          "significant": false
+        },
+        {
+          "from": 6,
+          "n": 1987,
+          "chiStat": 21.99,
+          "df": 15,
+          "pValue": 0.1077,
+          "significant": false
+        },
+        {
+          "from": 7,
+          "n": 2785,
+          "chiStat": 8.85,
+          "df": 15,
+          "pValue": 0.8855,
+          "significant": false
+        },
+        {
+          "from": 8,
+          "n": 4001,
+          "chiStat": 7.71,
+          "df": 15,
+          "pValue": 0.9349,
+          "significant": false
+        },
+        {
+          "from": 9,
+          "n": 4775,
+          "chiStat": 14.34,
+          "df": 15,
+          "pValue": 0.5001,
+          "significant": false
+        },
+        {
+          "from": 10,
+          "n": 5185,
+          "chiStat": 18.86,
+          "df": 15,
+          "pValue": 0.2195,
+          "significant": false
+        },
+        {
+          "from": 11,
+          "n": 5168,
+          "chiStat": 20.16,
+          "df": 15,
+          "pValue": 0.1654,
+          "significant": false
+        },
+        {
+          "from": 12,
+          "n": 4852,
+          "chiStat": 7.79,
+          "df": 15,
+          "pValue": 0.9319,
+          "significant": false
+        },
+        {
+          "from": 13,
+          "n": 4137,
+          "chiStat": 5.91,
+          "df": 15,
+          "pValue": 0.9808,
+          "significant": false
+        },
+        {
+          "from": 14,
+          "n": 2980,
+          "chiStat": 18.76,
+          "df": 15,
+          "pValue": 0.2242,
+          "significant": false
+        },
+        {
+          "from": 15,
+          "n": 1986,
+          "chiStat": 26.34,
+          "df": 15,
+          "pValue": 0.0345,
+          "significant": true
+        },
+        {
+          "from": 16,
+          "n": 1158,
+          "chiStat": 7.11,
+          "df": 15,
+          "pValue": 0.9543,
+          "significant": false
+        },
+        {
+          "from": 17,
+          "n": 559,
+          "chiStat": 11.05,
+          "df": 15,
+          "pValue": 0.7496,
+          "significant": false
+        },
+        {
+          "from": 18,
+          "n": 189,
+          "chiStat": 18.41,
+          "df": 15,
+          "pValue": 0.2414,
+          "significant": false
+        }
+      ],
+      "overall": {
+        "chiStat": 234.1,
+        "df": 240,
+        "pValue": 0.5953,
+        "significant": false
+      },
+      "anySig": true
+    }
+  },
+  "anySignal": true
+}

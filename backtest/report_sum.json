@@ -1,0 +1,26 @@
+{
+  "date": "2026-04-16T02:48:48.308Z",
+  "totalRecords": 41698,
+  "window": 50,
+  "startIndex": 12509,
+  "sampleEvery": 83,
+  "tested": 352,
+  "top1Hit": 24,
+  "top3Hit": 90,
+  "top5Hit": 163,
+  "accuracy": {
+    "top1": 0.0682,
+    "top3": 0.2557,
+    "top5": 0.4631
+  },
+  "pValues": {
+    "top1": 0.6597,
+    "top3": 0.001,
+    "top5": 0
+  },
+  "baseline": {
+    "top1": 6.25,
+    "top3": 18.75,
+    "top5": 31.25
+  }
+}

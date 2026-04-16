@@ -57,7 +57,7 @@ const predict = require('../predictor/ensemble')
 const frequency = require('../predictor/frequency')
 const features = require('../predictor/features')
 const { runStatTests } = require('../predictor/stats_tests')
-const { run: crawlRun } = require('../crawler/crawl')
+const { run: crawlRun, crawlPage, merge: crawlMerge } = require('../crawler/crawl')
 
 const app = express()
 const PORT = parseInt(process.env.PORT) || 8080
@@ -85,6 +85,10 @@ try {
 
 // ── In-memory cache ────────────────────────────────────────────────────────
 const apiCache = new Map()  // key → { data, ts }
+
+// ── History file in-memory cache (avoids re-reading 8+ MB JSON on every request) ──
+let _historyCache = null
+let _historyCacheMtime = 0
 
 // ── Disk cache state ───────────────────────────────────────────────────────
 let _statsCache = null
@@ -150,6 +154,8 @@ function broadcast(eventName, data) {
 function invalidateCache() {
   const prevPredictTotal = apiCache.get('predict')?.data?.total ?? 0
   _lastInvalidateAt = Date.now()  // prevent watcher from double-firing
+  _historyCache = null            // force re-read of history on next loadHistory()
+  _historyCacheMtime = 0
   apiCache.clear()
   // Debounce prewarm — waits 800ms so rapid consecutive invalidations only fire once.
   clearTimeout(_prewarmTimer)
@@ -204,10 +210,18 @@ function withCache(key, ttlMs, fn) {
 
 /** Build /predict response payload from history array (newest-first). */
 function buildPredictPayload(data) {
+  const latestRecord = data[0] || null
   if (data.length < 2) {
-    return { next: [], sumStats: [], total: data.length, message: 'Not enough data — run: node crawler/crawl.js' }
+    return {
+      next: [],
+      sumStats: [],
+      total: data.length,
+      latestKy: latestRecord?.ky ?? null,
+      latestDrawTime: latestRecord?.drawTime ?? null,
+      message: 'Not enough data — run: node crawler/crawl.js'
+    }
   }
-  const { top10, tripleSignal, effectiveWeights } = predict.ranked(data)
+  const { top10, tripleSignal, effectiveWeights, verdict } = predict.ranked(data)
   const top10Total = top10.reduce((s, r) => s + r.score, 0) || 1
 
   // Use true max/min across all scores (not positional, since rebalanceTripleRanks
@@ -246,7 +260,17 @@ function buildPredictPayload(data) {
     .map(([sum, cnt]) => ({ sum: +sum, pct: +(cnt / data.length * 100).toFixed(2) }))
     .sort((a, b) => b.pct - a.pct)
 
-  return { next, tripleSignal, modelContrib: effectiveWeights, sumStats, total: data.length, maxScore: +trueMaxScore.toFixed(3) }
+  return {
+    next,
+    tripleSignal,
+    modelContrib: effectiveWeights,
+    verdict: verdict || 'no_pattern',
+    sumStats,
+    total: data.length,
+    latestKy: latestRecord?.ky ?? null,
+    latestDrawTime: latestRecord?.drawTime ?? null,
+    maxScore: +trueMaxScore.toFixed(3)
+  }
 }
 
 /** Build /overdue response payload from history array (newest-first). */
@@ -497,9 +521,23 @@ app.use(cors())
 app.use(express.json({ limit: '20mb' }))
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+/** Load history with mtime-based in-memory cache. Avoids re-reading 8+ MB JSON
+ *  on every request. Cache is invalidated by invalidateCache() on new draws. */
 async function loadHistory() {
-  const data = await fs.readJSON(HISTORY_FILE).catch(() => [])
-  return Array.isArray(data) && data.length > 0 ? data : []
+  try {
+    const stat = await fs.stat(HISTORY_FILE)
+    const mtime = stat.mtimeMs
+    if (_historyCache && mtime === _historyCacheMtime) return _historyCache
+    const data = await fs.readJSON(HISTORY_FILE)
+    if (Array.isArray(data) && data.length > 0) {
+      _historyCache = data
+      _historyCacheMtime = mtime
+    }
+    return _historyCache || []
+  } catch {
+    return _historyCache || []
+  }
 }
 
 async function atomicWriteJSON(filePath, data) {
@@ -547,6 +585,13 @@ app.use(express.static(WEB_DIR, { index: false }))
 /** GET /predict — top-10 ensemble predictions (disk-persisted, always warm) */
 app.get('/predict', withCache('predict', 5 * 60_000,
   async () => buildPredictPayload(await loadHistory())
+))
+
+/** GET /predict-sum — sum-level prediction (16 outcomes, Markov-1 + z-score).
+ *  Lower dimensionality than combo → converges with less data.
+ *  Cached for 5 min alongside combo predictions. */
+app.get('/predict-sum', withCache('predict-sum', 5 * 60_000,
+  async () => predict.predictSum(await loadHistory())
 ))
 
 /** GET /overdue — overdue stats for triples/pairs/sums (disk-persisted, always warm) */
@@ -763,13 +808,14 @@ let lastCrawlAttempt = 0
 let _crawlRunning = false
 
 function isOperatingHours() {
-  const vnMinutes = ((new Date().getUTCHours() + 7) % 24) * 60 + new Date().getUTCMinutes()
-  return vnMinutes >= 360 && vnMinutes <= 1314  // 06:00-21:54 VN
+  const now = new Date()
+  const vnMinutes = ((now.getUTCHours() + 7) % 24) * 60 + now.getUTCMinutes()
+  return vnMinutes >= 360 && vnMinutes <= 1320  // 06:00–22:00 VN
 }
 
 async function crawlTick({ manual = false } = {}) {
   if (!manual && !isOperatingHours()) {
-    console.log('[crawler] off-hours (06:00-21:54 VN) -- skipping')
+    console.log('[crawler] off-hours (before 06:00 or after 22:00 VN) -- skipping')
     return { skipped: true, reason: 'off-hours', added: 0, total: lastKnownTotal, latestKy: null, changed: false }
   }
   if (_crawlRunning) {
@@ -780,20 +826,45 @@ async function crawlTick({ manual = false } = {}) {
   lastCrawlAttempt = Date.now()
   console.log(`[crawler] ${new Date().toLocaleTimeString('vi-VN')} -- crawling...`)
   try {
-    const { total, added, newRecords } = await crawlRun()
+    let { total, added, newRecords } = await crawlRun()
     const latestKy = newRecords[0]?.ky || null
+
+    // Gap recovery: when new draws are found but ky sequence still has a gap,
+    // the source website sometimes publishes draws with 3-10s delay.
+    // Retry up to 3 times (8s, 12s, 15s) to fill gaps — before broadcasting
+    // SSE — so predictions are built from fully-filled data.
+    if (added > 0) {
+      const retryDelays = [8000, 12000, 15000]
+      for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+        const freshKys = (await loadHistory()).slice(0, 50).map(r => Number(r.ky)).sort((a, b) => b - a)
+        const hasGap = freshKys.some((k, i) => i > 0 && freshKys[i - 1] - k > 1)
+        if (!hasGap) break
+        console.log(`[crawler] ky gap in recent draws — recovery attempt ${attempt + 1}/${retryDelays.length} in ${retryDelays[attempt] / 1000}s...`)
+        await new Promise(r => setTimeout(r, retryDelays[attempt]))
+        const rec = await crawlRun()
+        if (rec.added > 0) {
+          console.log(`[crawler] gap recovery ${attempt + 1}: +${rec.added} records (latestKy: ${rec.newRecords[0]?.ky})`)
+          total = rec.total
+        }
+      }
+    }
+
     let changed = false
     if (added > 0 || total !== lastKnownTotal) {
       if (added > 0) {
         console.log(`[crawler] ${added} ky moi (latest: #${latestKy}) -- push SSE -> ${sseClients.size} client(s)`)
         invalidateCache()
-        broadcast('new-draw', { added, latestKy: latestKy || '?', total, ts: new Date().toISOString() })
+        // Broadcast full-reload event so all clients refresh predictions, history, sum, overdue
+        broadcast('new-draw', { added, latestKy: latestKy || '?', total, ts: new Date().toISOString(), reload: true })
       } else {
         console.log(`[crawler] total changed ${lastKnownTotal}->${total} -- invalidating cache`)
         invalidateCache()
       }
       lastKnownTotal = total
       changed = true
+    } else {
+      // No new draws this tick — check for historical gaps periodically
+      await runDeepRecovery()
     }
     return { busy: false, skipped: false, added, total, latestKy, changed }
   } catch (err) { console.error('[crawler] ERROR:', err.message) }
@@ -801,28 +872,101 @@ async function crawlTick({ manual = false } = {}) {
   return { busy: false, skipped: false, added: 0, total: lastKnownTotal, latestKy: null, changed: false }
 }
 
+// ── Deep recovery: fill recent gaps by fetching extra pages ──────────────────
+// Fires at most once every 10 min when recent ky sequence has gaps.
+let _lastDeepRecovery = 0
+async function runDeepRecovery() {
+  const now = Date.now()
+  if (now - _lastDeepRecovery < 10 * 60_000) return
+  _lastDeepRecovery = now
+
+  const data = await loadHistory()
+  if (data.length < 30) return
+
+  // Check last 30 records (sorted newest first) for consecutive ky gaps
+  const recent = data.slice(0, 30).map(r => Number(r.ky)).sort((a, b) => b - a)
+  const hasGap = recent.some((k, i) => i > 0 && recent[i - 1] - k > 1)
+  if (!hasGap) return
+
+  console.log('[crawler] deep recovery: gaps detected in recent records, fetching 3 extra pages...')
+  let totalAdded = 0
+  for (let page = 1; page <= 3; page++) {
+    try {
+      const recs = await crawlPage(page)
+      if (!recs.length) break
+      const res = await crawlMerge(recs)
+      totalAdded += res.added
+      await new Promise(r => setTimeout(r, 350))
+    } catch (err) {
+      console.error(`[crawler] deep recovery page ${page}:`, err.message)
+    }
+  }
+  if (totalAdded > 0) {
+    console.log(`[crawler] deep recovery: filled ${totalAdded} missing draws`)
+    invalidateCache()
+    const data2 = await loadHistory()
+    broadcast('new-draw', { added: totalAdded, latestKy: data2[0]?.ky || '?', total: data2.length, ts: new Date().toISOString(), source: 'deep-recovery' })
+  }
+}
+
 // ── Start ──────────────────────────────────────────────────────────────────
-const CRAWL_INTERVAL_MS = 30_000  // poll every 30s during operating hours
+const CRAWL_INTERVAL_MS = 60_000  // poll every 60s (1 draw per 6 min → ample margin)
+
+function startCrawlerLoop() {
+  async function tick() {
+    try {
+      await crawlTick()
+    } catch (err) {
+      console.error('[crawler] loop error:', err.message)
+    } finally {
+      setTimeout(tick, CRAWL_INTERVAL_MS)
+    }
+  }
+
+  tick()
+}
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Bingo AI API  ->  http://localhost:${PORT}`)
   console.log(`Dashboard     ->  http://localhost:${PORT}/`)
   console.log(`SSE stream    ->  http://localhost:${PORT}/events`)
-  console.log(`Crawl interval: every ${CRAWL_INTERVAL_MS / 1000}s`)
+  console.log(`Crawl interval: every ${CRAWL_INTERVAL_MS / 1000}s (sequential loop)`)
 
-  crawlTick().catch(err => console.error('[crawler] startup error:', err.message))
-  setInterval(crawlTick, CRAWL_INTERVAL_MS)
+  startCrawlerLoop()
 
   // Pre-warm after 2s: fills any missing disk caches and ensures freshness.
-  // If disk caches already loaded from startup IIFE, this just refreshes them.
   setTimeout(() => _prewarmCaches(), 2_000)
+
+  // Startup gap recovery: crawl 5 pages in background to fill any recent gaps
+  // caused by server restarts or outages. Runs once per container start.
+  setTimeout(async () => {
+    console.log('[startup] gap recovery: crawling 5 historical pages to fill recent gaps...')
+    let recoverAdded = 0
+    for (let page = 1; page <= 5; page++) {
+      try {
+        const recs = await crawlPage(page)
+        if (!recs.length) break
+        const res = await crawlMerge(recs)
+        recoverAdded += res.added
+        await new Promise(r => setTimeout(r, 400))
+      } catch (err) {
+        console.error(`[startup] recovery page ${page}:`, err.message)
+      }
+    }
+    if (recoverAdded > 0) {
+      console.log(`[startup] gap recovery: filled ${recoverAdded} missing records`)
+      invalidateCache()
+    } else {
+      console.log('[startup] gap recovery: no missing records found')
+    }
+  }, 5_000)
 
   // Kick off stats if not cached yet or cache is > 24h old.
   setTimeout(() => {
     const age = _statsCache?._computedAt ? Date.now() - _statsCache._computedAt : Infinity
     if (!_statsCache || age > 24 * 60 * 60_000) {
-      console.log('[stats] startup: no recent cache — scheduling initial compute in 10s')
-      setTimeout(() => _computeStatsBackground(), 10_000)
+      console.log('[stats] startup: no recent cache — scheduling initial compute in 15s')
+      setTimeout(() => _computeStatsBackground(), 15_000)
     } else {
       console.log(`[stats] startup: cache age ${Math.round(age / 60000)}min — skipping initial recompute`)
     }

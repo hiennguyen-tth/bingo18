@@ -38,7 +38,7 @@ const WEIGHTS_FILE = path.join(__dirname, '../dataset/model.json')
 const WEIGHTS_HISTORY_FILE = path.join(__dirname, '../dataset/weights_history.json')
 
 const TRAIN_START = 50        // minimum draws before first prediction
-const TRAIN_STEP = 2         // sample every Nth draw in training window (speed)
+const TRAIN_STEP = 50        // sample every Nth draw in training window (speed)
 const VALID_RATIO = 0.25      // last 25% of steps = validation holdout
 
 // ── sigmoid ───────────────────────────────────────────────────────────────
@@ -160,8 +160,9 @@ async function main() {
     const trainSamples = await precompute(chron, TRAIN_START, validStart, TRAIN_STEP)
     console.log(`  ${trainSamples.length} samples`)
 
-    process.stdout.write('[train_weights] Pre-computing valid scores')
-    const validSamples = await precompute(chron, validStart, N, 1)
+    const VALID_STEP = Math.max(1, Math.floor((N - validStart) / 500))  // cap ~500 valid samples
+    process.stdout.write(`[train_weights] Pre-computing valid scores (step=${VALID_STEP})`)
+    const validSamples = await precompute(chron, validStart, N, VALID_STEP)
     console.log(`  ${validSamples.length} samples`)
 
     if (trainSamples.length < 20) {

@@ -54,10 +54,26 @@ function buildVec(slice) {
     return v
 }
 
-function euclidean(a, b) {
-    let d = 0
-    for (let i = 0; i < a.length; i++) d += (a[i] - b[i]) ** 2
-    return Math.sqrt(d)
+/**
+ * Gower distance: handles mixed feature types better than pure Euclidean.
+ * Categorical features (pattern: index 4,9,14...) use 0/1 match.
+ * Numerical features (sum, digits, freq) use normalised Manhattan |a-b|.
+ * All features contribute equally (each dimension already normalised to [0,1]).
+ */
+function gowerDistance(a, b) {
+    let totalD = 0
+    const dim = a.length
+    const freqStart = dim - 6  // last 6 dims are digit frequency (numerical)
+    for (let i = 0; i < dim; i++) {
+        if (i < freqStart && (i % 5) === 4) {
+            // Pattern feature (categorical): 0 if same, 1 if different
+            totalD += a[i] === b[i] ? 0 : 1
+        } else {
+            // Numerical feature (already [0,1]): Manhattan distance
+            totalD += Math.abs(a[i] - b[i])
+        }
+    }
+    return totalD / dim
 }
 
 /**
@@ -81,7 +97,7 @@ function modelD(chron) {
     const dists = []
     for (let i = WINDOW; i < N - 1; i++) {
         const vec = buildVec(chron.slice(i - WINDOW, i))
-        const dist = euclidean(qVec, vec)
+        const dist = gowerDistance(qVec, vec)
         dists.push({ dist, r: chron[i] })       // chron[i] is what actually followed that context
     }
 

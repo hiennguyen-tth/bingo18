@@ -56,6 +56,32 @@ def get_hour(draw_time: str) -> int:
         return 12
 
 
+def get_day_of_week(draw_time: str) -> int:
+    """Extract day of week from drawTime (0=Monday, 6=Sunday); default 3 if missing."""
+    if not draw_time:
+        return 3
+    try:
+        dt = datetime.datetime.fromisoformat(draw_time.replace('Z', '+00:00'))
+        return dt.weekday()
+    except Exception:
+        return 3
+
+
+def get_ky_in_day(draw_time: str) -> float:
+    """Estimate draw index within day (0.0-1.0) based on hour/minute.
+    Bingo18 runs 06:00-22:00, each 6min = 159 draws/day."""
+    h = get_hour(draw_time)
+    if not draw_time:
+        return 0.5
+    try:
+        dt = datetime.datetime.fromisoformat(draw_time.replace('Z', '+00:00'))
+        m = dt.minute
+    except Exception:
+        m = 0
+    minutes_since_start = (h - 6) * 60 + m  # minutes since 06:00
+    return max(0.0, min(1.0, minutes_since_start / (16 * 60)))  # 16h operating window
+
+
 def encode_pattern(n1: int, n2: int, n3: int) -> int:
     """Encode draw pattern: 0=normal, 1=pair, 2=triple."""
     if n1 == n2 == n3:
@@ -71,13 +97,16 @@ def build_features(data: list, window: int = WINDOW):
     """
     Build (X, y_n1, y_n2, y_n3) for supervised learning.
 
-    Feature vector dimensions (total = 5*window + 2 + 6 + 6 = 5w+14):
+    Feature vector dimensions (total = 5*window + 2 + 2 + 1 + 5 + 6 + 6 = 5w+22):
       lag_sum  [window]   — sum values of last `window` draws
       lag_n1   [window]   — n1 digit values
       lag_n2   [window]   — n2 digit values
       lag_n3   [window]   — n3 digit values
       lag_pat  [window]   — pattern codes (0/1/2)
       hour_sin, hour_cos  — cyclic encoding of current draw hour
+      dow_sin, dow_cos    — cyclic encoding of day of week
+      ky_in_day           — position within day (0.0-1.0)
+      sum_lag [5]         — sum values of last 5 draws (explicit, separate from window)
       digit_cnt [6]       — how often each digit appeared across all 3 positions
       digit_gap [6]       — draws since each digit (1-6) last appeared anywhere
     """
@@ -97,6 +126,16 @@ def build_features(data: list, window: int = WINDOW):
         hour_sin = float(np.sin(2 * np.pi * hour / 24))
         hour_cos = float(np.cos(2 * np.pi * hour / 24))
 
+        dow      = get_day_of_week(cur.get('drawTime'))
+        dow_sin  = float(np.sin(2 * np.pi * dow / 7))
+        dow_cos  = float(np.cos(2 * np.pi * dow / 7))
+
+        kid      = get_ky_in_day(cur.get('drawTime'))
+
+        # Explicit sum lags (last 5 draws, separate from the window lags)
+        sum_lags = [data[i - j - 1]['sum'] if i - j - 1 >= 0 else 10.5
+                    for j in range(5)]
+
         # Count appearances of each digit (1-6) across all 3 positions in window
         all_digits = lag_n1 + lag_n2 + lag_n3
         digit_cnt  = [all_digits.count(d) for d in range(1, 7)]
@@ -110,7 +149,8 @@ def build_features(data: list, window: int = WINDOW):
 
         feats = (
             lag_sum + lag_n1 + lag_n2 + lag_n3 + lag_pat +
-            [hour_sin, hour_cos] +
+            [hour_sin, hour_cos, dow_sin, dow_cos, kid] +
+            sum_lags +
             digit_cnt +
             digit_gap
         )

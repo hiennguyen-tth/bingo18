@@ -73,7 +73,7 @@ const { runStatTests } = require('./stats_tests')
 const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
 const WEIGHTS_FILE = path.join(__dirname, '../dataset/model.json')
 const GBM_FILE = path.join(__dirname, '../python/ml_output.json')
-const GBM_MAX_STALENESS = 200  // records; invalidate GBM scores if dataset grew > this
+const GBM_MAX_STALENESS = 2000  // records; invalidate GBM scores if dataset grew > this
 
 // ── Learned weights (sigmoid ensemble) ────────────────────────────────────
 // Trained by: node scripts/train_weights.js
@@ -456,18 +456,33 @@ function getSession(hoursOrDateStr) {
   return 'evening'
 }
 
+// Rolling window for Model C session frequency.
+// Using ALL historical session draws (~15k records) makes the frequency so stable
+// that adding one new draw barely shifts any combo's rank: at N=15000, one new draw
+// changes a combo's count by 0.0067% — not enough to change Top 10.
+// With SESS_WINDOW=300 (~1 day of any session), each new draw affects ~0.33% of the
+// sample so combos rotate visibly. When a top-ranked (session-rare) combo appears,
+// its count jumps 0→1 (from 0% to 0.72× expected), exits the rare group, and a
+// different combo takes its place in the next /predict call.
+const SESS_WINDOW = 300
+
 /**
  * Model C: frequency ratio for the current day-part session.
  * Returns {} when N < 5000 (hard disable — ~339 draws/session gives ~1.57
  * appearances per combo, variance too high for reliable signal; wC=-0.10 confirms).
  * Also returns {} when < 20 draws in session after threshold met.
+ * Uses a rolling window of the most recent SESS_WINDOW session draws so that each
+ * new draw measurably changes session ranks (instead of being diluted in 15k records).
  */
 function modelC(chron, now) {
   if (chron.length < 5000) return {}  // hard-disable: insufficient data
   // Use Vietnam time (UTC+7) for both history classification and current session.
   const vnHour = (now.getUTCHours() + 7) % 24
   const cur = getSession(vnHour)
-  const sessData = chron.filter(r => r.drawTime && getSession(r.drawTime) === cur)
+  // Filter ALL historical session draws, then take the most recent SESS_WINDOW.
+  // chron is sorted oldest-first; slice(-N) gives the N most recent session draws.
+  const allSessData = chron.filter(r => r.drawTime && getSession(r.drawTime) === cur)
+  const sessData = allSessData.length > SESS_WINDOW ? allSessData.slice(-SESS_WINDOW) : allSessData
   if (sessData.length < 20) return {}
 
   const W = sessData.length
@@ -517,6 +532,7 @@ function tripleBoostMult(chron) {
 // ── ENSEMBLE ──────────────────────────────────────────────────────────────
 
 function ensembleAll(chron, now) {
+  const DIGIT_RECENCY_K = 3  // look at last 3 draws for digit-position overlap
   // Reality-aware weight shrinking: when statistical tests find no detectable pattern,
   // shrink pattern-detection model weights (A, B, D) toward zero so the ensemble
   // produces more uniform predictions — intellectually honest for a near-random game.
@@ -612,6 +628,27 @@ function ensembleAll(chron, now) {
     //   z=-1.0 → ×0.37;  z=-1.5 → ×0.22;  z=-3.0 → ×0.05 (near-zero).
     const zVal = zMap[k]
     if (zVal < 0) score *= Math.exp(Math.max(-3, zVal))
+
+    // Digit-position recency: penalize combos sharing digit-positions with
+    // recent draws. Without this, after draw 1-1-2 the top-10 would still
+    // contain many 1-1-X combos because z-score only penalizes the EXACT
+    // combo. This ensures partial-match rotation: "digits already appeared
+    // → other digits should take priority".
+    //
+    // Scan last DIGIT_RECENCY_K draws. For each, count how many of the 3
+    // digit-positions match. 2+ matches → apply decaying penalty.
+    //   last draw, 2 match: ×0.55  |  3 match (exact): ×0.41 (stacks with z-cooldown)
+    //   2nd-to-last, 2 match: ×0.74  |  3rd-to-last, 2 match: ×0.82
+    for (let d = 0; d < DIGIT_RECENCY_K && d < chron.length; d++) {
+      const rd = chron[chron.length - 1 - d]
+      let posMatch = 0
+      if (a === rd.n1) posMatch++
+      if (b === rd.n2) posMatch++
+      if (c === rd.n3) posMatch++
+      if (posMatch >= 2) {
+        score *= Math.exp(-0.3 * posMatch / (1 + d))
+      }
+    }
 
     results[k] = {
       combo: k,
@@ -842,7 +879,7 @@ function predictRanked(data) {
     chiNorm: 0,
   }))
 
-  return { top10: mapped, tripleSignal, effectiveWeights }
+  return { top10: mapped, tripleSignal, effectiveWeights, verdict: statRes.verdict }
 }
 
 /** Score map for all 216 combos — used by /stats backtest. */
@@ -903,4 +940,104 @@ predict.ranked = predictRanked
 predict.getModelScores = getModelScores
 predict.reloadWeights = loadLearnedWeights
 predict.reloadGBM = loadGBMScores
+
+// ── Sum prediction (16 outcomes) ──────────────────────────────────────────
+// Exploits the lower dimensionality: 16 sums vs 216 combos → Markov-1 is
+// feasible with 43k draws (~168 samples per state pair). z-score on sum gaps
+// also converges faster.
+
+const SUM_THEORETICAL = {}  // P(sum=s) = count(combos with that sum) / 216
+for (const [a, b, c] of ALL_COMBOS) SUM_THEORETICAL[a + b + c] = (SUM_THEORETICAL[a + b + c] || 0) + 1 / 216
+
+function predictSum(data) {
+  if (!data || data.length < 30) return { sums: [], mode: 'insufficient' }
+  const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
+  const N = chron.length
+
+  // 1) z-score on sum gaps (same logic as Model A but on 16 sum buckets)
+  const lastSeen = {}, gapLists = {}
+  for (let i = 0; i < N; i++) {
+    const s = chron[i].sum || (chron[i].n1 + chron[i].n2 + chron[i].n3)
+    if (lastSeen[s] !== undefined) {
+      if (!gapLists[s]) gapLists[s] = []
+      gapLists[s].push(i - lastSeen[s])
+    }
+    lastSeen[s] = i
+  }
+
+  const zScores = {}
+  for (let s = 3; s <= 18; s++) {
+    const gaps = gapLists[s] || []
+    const curGap = lastSeen[s] !== undefined ? N - 1 - lastSeen[s] : N
+    const avg = gaps.length ? gaps.reduce((a, b) => a + b, 0) / gaps.length : null
+    const variance = gaps.length > 1 ? gaps.reduce((acc, g) => acc + (g - avg) ** 2, 0) / gaps.length : null
+    const std = variance !== null ? Math.sqrt(variance) : null
+    if (avg !== null && std !== null && std >= 1) {
+      zScores[s] = { z: (curGap - avg) / std, curGap, avgGap: avg }
+    } else if (avg !== null) {
+      zScores[s] = { z: Math.max(-2, Math.min(2, (curGap - avg) / avg)), curGap, avgGap: avg }
+    } else {
+      zScores[s] = { z: 0, curGap, avgGap: null }
+    }
+  }
+
+  // 2) Markov-1 on sums: P(sum_next | sum_prev)
+  const mk1 = {}
+  for (let i = 1; i < N; i++) {
+    const prev = chron[i - 1].sum || (chron[i - 1].n1 + chron[i - 1].n2 + chron[i - 1].n3)
+    const cur = chron[i].sum || (chron[i].n1 + chron[i].n2 + chron[i].n3)
+    if (!mk1[prev]) mk1[prev] = {}
+    mk1[prev][cur] = (mk1[prev][cur] || 0) + 1
+  }
+  const lastSum = chron[N - 1].sum || (chron[N - 1].n1 + chron[N - 1].n2 + chron[N - 1].n3)
+  const context = mk1[lastSum] || {}
+  const ctxTotal = Object.values(context).reduce((s, v) => s + v, 0) || 0
+
+  // 3) Session frequency on sums (rolling window)
+  const now = new Date()
+  const vnHour = (now.getUTCHours() + 7) % 24
+  const curSession = getSession(vnHour)
+  const sessDraws = chron.filter(r => r.drawTime && getSession(r.drawTime) === curSession)
+  const sessRecent = sessDraws.length > SESS_WINDOW ? sessDraws.slice(-SESS_WINDOW) : sessDraws
+  const sessSumCount = {}
+  for (const r of sessRecent) {
+    const s = r.sum || (r.n1 + r.n2 + r.n3)
+    sessSumCount[s] = (sessSumCount[s] || 0) + 1
+  }
+  const sessTotal = sessRecent.length || 1
+
+  // 4) Combine: z-score (overdue) + Markov transition + session deficit
+  const results = []
+  for (let s = 3; s <= 18; s++) {
+    const zInfo = zScores[s]
+    const zClamp = Math.max(0, Math.min(3, zInfo.z))  // overdue boost [0,3]
+    const ALPHA = 0.5  // Laplace smoothing
+    const mkProb = ctxTotal > 0 ? ((context[s] || 0) + ALPHA) / (ctxTotal + ALPHA * 16) : SUM_THEORETICAL[s] || (1 / 16)
+    const sessRatio = sessTotal >= 20 ? (sessSumCount[s] || 0) / (sessTotal * (SUM_THEORETICAL[s] || 1 / 16)) : 1
+    // sessDeficit: higher when sum appeared less than expected in current session
+    const sessDeficit = Math.max(0, 1 - sessRatio) * 0.3  // 0–0.3 range
+
+    const score = 0.4 * zClamp + 0.4 * (mkProb * 16) + 0.2 * sessDeficit  // weighted
+    results.push({
+      sum: s,
+      score: +score.toFixed(3),
+      z: +zInfo.z.toFixed(2),
+      curGap: zInfo.curGap,
+      avgGap: zInfo.avgGap != null ? +zInfo.avgGap.toFixed(1) : null,
+      mkProb: +(mkProb * 100).toFixed(2),
+      theoretical: +((SUM_THEORETICAL[s] || 0) * 100).toFixed(2),
+      sessRatio: +sessRatio.toFixed(2),
+    })
+  }
+
+  results.sort((a, b) => b.score - a.score)
+  return {
+    sums: results,
+    prevSum: lastSum,
+    session: curSession,
+    mode: 'active',
+  }
+}
+
+predict.predictSum = predictSum
 module.exports = predict

@@ -1,6 +1,25 @@
-# Bingo18 AI Predictor
+# Bingo18 Analyzer
 
-Hệ thống dự đoán Bingo18 dùng **5-model Ensemble v9** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward + L2 regularisation)**. Model A được bổ sung 4 tín hiệu phụ (S3–S6 với S5/S6 loại trừ nhau), Model B dùng Laplace smoothing, và ensemble dùng **Bayesian p-value shrink**: khi `no_pattern` → wA=wB=wD=0 (kill hoàn toàn); khi có pattern → shrink liên tục theo confidence. Top-10 dùng **portfolio selection** (maximize P(hit ≥ 1)). Crawler dùng **xoso.net.vn** làm primary và **xomo.com** làm fallback, phục vụ qua REST API + Dashboard React, deploy trên Fly.io.
+Hệ thống **phân tích thống kê** Bingo18 dùng **5-model Ensemble v9** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward + L2 regularisation)**. Model A được bổ sung 4 tín hiệu phụ (S3–S6 với S5/S6 loại trừ nhau), Model B dùng Laplace smoothing, và ensemble dùng **Bayesian p-value shrink**: khi `no_pattern` → wA=wB=wD=0 (kill hoàn toàn); khi có pattern → shrink liên tục theo confidence. Top-10 dùng **portfolio selection** (maximize P(hit ≥ 1)). Crawler dùng **xoso.net.vn** làm primary và **xomo.com** làm fallback, phục vụ qua REST API + Dashboard React, deploy trên Fly.io.
+
+**Reframe (v10):** Hệ thống được reframe từ "AI Predictor" thành "Analyzer" — trung thực về khả năng. UI hiển thị **diversity-aware badges** (Quá hạn / Hiếm / Đa dạng) thay vì HOT/STRONG misleading. **Calibrated hit rate** từ backtest thay cho confidence score. **Sticky disclaimer** nhắc user rằng đây là trò chơi ngẫu nhiên.
+
+**v11 Changes:**
+- **Digit-position recency cooldown:** Top-10 giờ xoay tích cực hơn — combo chia sẻ ≥2 digit-position với 3 kỳ gần nhất bị penalty exponential (ví dụ: kỳ vừa ra 1-1-2 → combo 1-1-x bị giảm ~45% score)
+- **GBM retrained on 41k+ records:** Model E (GBM) giờ train trên toàn bộ 41698 records × 72 features (thêm day_of_week, ky_in_day, sum_lags). `GBM_MAX_STALENESS` tăng từ 200→2000
+- **Ensemble weights v7:** wA=0.38, wB=0.15, wC=0.05, wD=0, wE=0.15. ModelD disabled (wD=0) — k-NN trên 41k records mất ~1-2s/call, block event loop khi backtest × 300 steps → Fly health check timeout → 503
+- **Crawl interval 60s:** Poll đủ chậm để không gây tải, đủ nhanh so với 6 phút/kỳ
+
+**v12 Changes (current):**
+- **loadHistory mtime cache:** Không còn đọc lại 8 MB JSON từ disk mỗi request. Cache được giữ trong RAM và invalidate tự động khi file thay đổi (kiểm tra `mtimeMs`). Toàn bộ request đọc history đều từ RAM sau lần đầu tiên.
+- **Startup gap recovery:** Khi server khởi động, tự động crawl **5 trang phân trang** (75 kỳ gần nhất) trong background để fill các gap do restart/outage. Runs once per container start.
+- **Periodic deep recovery:** Sau mỗi crawl tick không có kỳ mới, kiểm tra 30 ky gần nhất có gap hay không. Nếu có gap → crawl thêm 3 trang để tự sửa. Rate-limited max 1 lần/10 phút.
+- **SSE `reload: true` flag:** Broadcast `new-draw` giờ thêm `{ reload: true }` để client biết phải reload toàn bộ (predict, history, sum, overdue).
+- **Operating hours 22:00 nhất quán:** Sửa bug ở `app.jsx` polling dùng 21:54 (1314) thay vì 22:00 (1320). Cả server và client giờ dùng 06:00–22:00 VN.
+
+**Sum Prediction (v10):** Thêm endpoint `/predict-sum` — dự đoán 16 outcomes (sum=3..18) thay vì 216 combo. Sử dụng Markov-1 transition + z-score overdue + session frequency. Với 43k draws, mỗi sum state có ~168 samples — đủ tin cậy hơn combo-level prediction.
+
+**Model D Gower Distance (v10):** Thay Euclidean bằng **Gower distance** — xử lý mixed features: Hamming cho categorical (pattern), Manhattan cho numerical (sum/digits). Phù hợp hơn cho feature space bao gồm cả ordinal và nominal dimensions.
 
 Kể từ logic mới nhất, `/stats` bổ sung **Reality Check** (chi-square, autocorr, runs), chia 3 segment (train/valid/forward), và trả thêm **calibrated hit rate theo từng rank**. Triple signal chỉ còn là lớp thông tin hỗ trợ; top-10 không còn ép combo hoa lên đầu bằng bypass. **Cooldown penalty** ngăn combo vừa xuất hiện tiếp tục được suggest (fix h6 re-suggest bug).
 
@@ -19,9 +38,9 @@ UI lịch sử đã chuyển từ bảng phẳng 500 kỳ sang **pivot theo ngà
 | Thực tế | Chi tiết |
 |---------|----------|
 | **p-value = 0.51** | Top-10 đạt 5.07% vs random 4.63% (+9.5% relative) — nhưng **chưa có ý nghĩa thống kê**. Khả năng cao đây là variance, không phải edge. Cần thêm nhiều kỳ để kết luận. |
-| **Reality check = no_pattern** | Chi-square p=0.18, autocorr p=0.41, runs p=0.62 → cả 3 test đều không reject H0. Data gần như IID random. **Giới hạn vật lý, không phải do code.** |
-| **Effective pipeline = 1 model** | `wA=0.46, wB=0.10, wC=–0.10 (disabled), wD=0, wE=0` → khi `no_pattern`, shrink=0 khiến wA=wB=wD=0. Score tất cả combo gần bằng nhau → lựa chọn thực chất là **portfolio diversity thuần túy**, không phải AI prediction. |
-| **Bản chất IID** | Bingo18 / 36D có 216 outcomes. Không có bộ nhớ giữa các kỳ (như đã xác nhận bởi autocorr). Về lý thuyết, không có edge dài hạn có thể khai thác. |
+| **Reality check = no_pattern** | Chi-square p=0.18, autocorr p=0.41, runs p=0.62 → cả 3 test đều không reject H0. P1 experiments confirm: autocorr ns ở mọi lag, chi-by-hour chỉ marginal (1/16 hour p=0.04 — Bonferroni ns), Markov-1 sum pooled p=0.60 (ns). Data IID random. |
+| **Effective pipeline = 2 models** | `wA=0.38, wB=0.15, wC=0.05, wD=0.12, wE=0.15` → khi `no_pattern`, shrink=0 khiến wA=wB=wD=0. **Model C (5%) + Model E GBM (15%) active** → effective: sess=25%, gbm=75%. GBM trained on 41698 records × 72 features → phân phối phi-uniform hợp lý. Top-10 xoay nhờ digit-position recency penalty. |
+| **Bản chất IID** | Bingo18 / 36D có 216 outcomes. Không có bộ nhớ giữa các kỳ (4 experiments xác nhận). Về lý thuyết, không có edge dài hạn có thể khai thác. |
 
 > **Tóm lại:** Hệ thống này là **công cụ thống kê giải trí**. Thuật toán giúp chọn combo đa dạng thay vì chọn ngẫu nhiên — không hơn, không kém. Đừng diễn giải top-10 là "AI dự đoán được kết quả".
 
@@ -65,7 +84,12 @@ bingo/
 ├── scripts/
 │   ├── build_jsx.js           # Pre-compile heatmap.jsx + app.jsx → .js (npm run build)
 │   ├── train_weights.js       # Walk-forward weight optimisation
+│   ├── experiments.js         # P1 micro-experiments (autocorr, chi-hour, runs, Markov-1)
 │   └── dedup.js               # Dataset deduplication
+├── backtest/
+│   ├── run_backtest.js        # Walk-forward combo backtest
+│   ├── run_backtest_sum.js    # Walk-forward sum prediction backtest (P0)
+│   └── report.json            # Latest backtest results
 ├── fly.toml                   # Fly.io config
 ├── Dockerfile                 # node:20-alpine, JSX build step, port 8080
 ├── start.sh                   # Diagnostic wrapper → node api/server.js
@@ -89,7 +113,12 @@ bingo/
 | Watcher cascade | Multiple history.json writes trigger multiple invalidations in seconds | 10s cooldown on file watcher + invalidateCache sets timestamp |
 | Double-invalidation (crawl + watcher) | Stats computed twice per draw | Debounced 3.5s — computed once |
 | Crawler no-new draws | Vẫn rewrite `history.json` → watcher invalidation liên tục | Không rewrite nếu không có thay đổi (`added=0 && patched=0`) |
+| Crawler scheduler | `setInterval(30s)` có thể chồng tick khi source chậm | Vòng lặp tuần tự `60s` sau mỗi lần crawl xong, giảm skip chồng lệnh và ổn định hơn cho health check |
 | History corruption risk | `readJSON().catch(()=>[])` có thể ghi đè mất dữ liệu | `loadHistorySafe()` + backup `.bak` + atomic write `.tmp→move` |
+| **loadHistory cache** | Đọc 8 MB JSON từ disk mỗi lần gọi (mỗi request, mỗi tick crawl) | **mtime-based RAM cache**: chỉ đọc lại khi file thực sự thay đổi. Toàn bộ request chạy từ RAM sau lần đọc đầu tiên. `invalidateCache()` reset cache khi có kỳ mới. |
+| **Kỳ bị miss (delayed publish)** | Nguồn đôi khi publish kỳ sau ~3–8s delay → crawl 60s vừa kịp bỏ lỡ → gap vĩnh viễn | **Startup recovery** (crawl 5 trang khi boot) + **Periodic deep recovery** (nếu gap phát hiện trong 30 ky gần nhất → crawl 3 trang, max 1 lần/10 phút). Crawl interval: 60s. |
+| **Top 10 không đổi giữa các kỳ** | Model C dùng toàn bộ lịch sử session (~15k records) → 1 kỳ mới chỉ thay đổi 0.006% → rank không xoay | **Rolling window SESS_WINDOW=300** + **digit-position recency penalty** (v11): combo chia sẻ ≥2 digit-position với 3 kỳ gần nhất bị phạt exponential. |
+| **model.json từ volume cũ** | `start.sh` chỉ copy vào volume ở lần boot đầu tiên → nếu volume có `wC=0` từ training cũ, tất cả score = `sigmoid(bias) = 0.378` → Top 10 hoàn toàn random | `start.sh` luôn overwrite `model.json` từ image (git source of truth) mỗi lần khởi động |
 
 **Pre-warm mechanism:** `invalidateCache()` clears the in-memory cache and immediately calls `_prewarmCaches()` (takes ~50ms) so the next HTTP request always hits a warm cache. The stats backtest is debounced 3.5s to collapse the crawl-write and the file-watcher detection into a single compute.
 
@@ -122,7 +151,8 @@ npm run dev
 | Method | Route | Mô tả |
 |--------|-------|--------|
 | GET | `/` | Dashboard React |
-| GET | `/predict` | Top 10 combo + breakdown model + `tripleSignal` đã được AI xác nhận — **cached 5 phút** |
+| GET | `/predict` | Top 10 combo + breakdown model + `tripleSignal` + `verdict` + `latestKy/latestDrawTime` — **cached 5 phút** |
+| GET | `/predict-sum` | Dự đoán sum (16 outcomes, Markov-1 + z-score + session) — **cached 5 phút** |
 | GET | `/history?limit=1000` | Feed lịch sử cho pivot table ngày × giờ |
 | GET | `/overdue` | Thống kê quá hạn: bộ ba / `anyTriple` / cặp đôi / tổng — **cached** |
 | GET | `/stats` | Walk-forward backtest + Reality Check + Train/Valid/Forward + calibrated rank buckets — **disk-persisted, stale-while-revalidate** |
@@ -189,10 +219,10 @@ Lịch sử N kỳ
 score = sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias)
 ```
 
-> **Thực tế hiện tại (no_pattern):** shrink=0 → wA=wB=wD=0; wC disabled (N<5000); wE=0.
-> Rút gọn: `score ≈ sigmoid(bias) = const ≈ 0.378` cho **tất cả** combo.
-> → Lựa chọn top-10 hoàn toàn do **portfolio diversity** (digit overlap penalty), không phải model score.
-> Chỉ khi `pattern_detected` (cần ≥2 test có p<0.05) thì A và B mới có trọng số thực sự.
+ Thực tế hiện tại (no_pattern):** shrink=0 → wA=wB=wD=0; **wC=0.05 + wE=0.15 active**.
+> Session (25%) + GBM (75%) tạo phân phối có cấu trúc. GBM trained on 41698 records × 72 features.
+> **Digit-position recency** (v11) penalty bổ sung giúp top-10 xoay mạnh mẽ hơn giữa các kỳ.
+> Chỉ khi `pattern_detected` (≥2 test có p<0.05) thì A, B, D mới có trọng số thực sự.
 
 - Trọng số học qua **walk-forward optimisation với L2 regularisation** (node scripts/train_weights.js)
 - `objective = (top10_acc - baseline_random) - λ·(wA²+wB²+wC²+wD²+wE²)`, λ=0.01 để tránh học noise không beat nổi random
@@ -214,14 +244,14 @@ score = sigmoid(wA·sA + wB·sB + wC·sC + wD·sD + wE·sE + bias)
 
 **Learned weights** (`dataset/model.json`):
 ```json
-{ "version": "v6", "wA": 0.46, "wB": 0.10, "wC": -0.10, "wD": 0.00, "wE": 0.00, "bias": -0.50, "lambda": 0.01 }
+{ "version": "v7", "wA": 0.38, "wB": 0.15, "wC": 0.05, "wD": 0.12, "wE": 0.15, "bias": -0.20, "lambda": 0.01 }
 ```
-> wA=0.46 — có chút signal hoặc noise fit; không thể kết luận vì p=0.51.  
-> wB=0.10 — Markov rất yếu; cần ~50.000 kỳ để transition matrix có ý nghĩa.  
-> wC=–0.10 (âm) → disabled hoàn toàn khi N<5000 — session model là nhiễu.  
-> wD=0 → k-NN auto-disabled — không có local pattern để học.  
-> wE=0 → GBM chưa có signal (cần ~5000+ kỳ).  
-> **Dưới no_pattern, ensemble thực chất là: `score ≈ sigmoid(–0.50) ≈ 0.378` (hằng số) → uniform.**
+> wA=0.38 — z-score overdue, nhưng bị zeroed khi no_pattern (shrink=0).  
+> wB=0.15 — Markov-2, cũng bị zeroed khi no_pattern.  
+> wC=0.05 → session model, active dưới no_pattern (sess=25% effective).  
+> wD=0.12 → k-NN, bị zeroed khi no_pattern.  
+> wE=0.15 → **GBM active** (gbm=75% effective) — trained on 41698 records × 72 features.  
+> **Dưới no_pattern: score = sigmoid(0.05·sC + 0.15·sE − 0.20)** → sess+GBM tạo phân phối có cấu trúc, không còn uniform.
 
 ### Re-train
 
@@ -240,7 +270,7 @@ Nên chạy lại sau mỗi ~200 kỳ mới. Server tự hot-reload `model.json`
 
 ---
 
-### MODEL D — k-NN Temporal Similarity
+### MODEL D — k-NN Temporal Similarity (Gower Distance)
 
 **Ý nghĩa:** Tìm k kỳ lịch sử có "bối cảnh" gần nhất, dự đoán combo dựa trên tần suất kết quả thực tế sau các bối cảnh đó.
 
@@ -250,8 +280,16 @@ Feature vector per context (dim = 5×WINDOW + 6):
   digit_frequency[1..6] / max_count                  ← global context (6 dims)
 
 k = adaptive: max(15, 5% records), capped at 60
-Score(combo) = Σ 1/(dist+ε) for each neighbor that resulted in combo
+
+Distance metric: Gower distance (mixed-type aware)
+  - Numerical features: normalised Manhattan |a−b| (sum/18, n1/6, n2/6, n3/6, digit freq)
+  - Categorical features: Hamming 0/1 (pattern encoding — every 5th dim)
+  - Final distance = mean across all dimensions
+
+Score(combo) = Σ 1/(gowerDist+ε) for each neighbor that resulted in combo
 ```
+
+**v10 Gower upgrade:** Euclidean distance xử lý pattern encoding (0/1) như continuous → sai lầm. Gower distance tách biệt categorical vs numerical → chính xác hơn cho mixed feature space.
 
 **Khi nào active:** ≥ 24 kỳ lịch sử + wD ≥ 0 (auto-disable khi wD < 0 để giảm noise).  
 **Feature cải thiện (v6):** Thêm digit frequency + pattern encoding vs v5 (chỉ có sum/n1/n2/n3).  
@@ -273,9 +311,10 @@ source .venv/bin/activate && python python/ml_predictor.py
 ```
 
 Output `python/ml_output.json` được `ensemble.js` load tự động:
-- **Active khi:** file tồn tại AND `|currentRecords - trainRecords| ≤ 200`
-- **Stale check:** nếu dataset tăng > 200 kỳ → sE=0 (tự động vô hiệu)
-- **Feature engineering (64 dims):** last-10 sum/n1/n2/n3/pattern lags + sin/cos giờ + digit counts + digit gaps
+- **Active khi:** file tồn tại AND `|currentRecords - trainRecords| ≤ 2000`
+- **Stale check:** nếu dataset tăng > 2000 kỳ → sE=0 (tự động vô hiệu)
+- **Feature engineering (72 dims):** last-10 sum/n1/n2/n3/pattern lags + sin/cos giờ + sin/cos ngày trong tuần + vị trí kỳ trong ngày + sum lags (5) + digit counts + digit gaps
+- **v11:** Retrained on 41698 records, +8 features (day_of_week cyclic, ky_in_day, explicit sum_lags)
 
 ---
 
@@ -368,17 +407,49 @@ Mỗi lần `/predict` trả về thêm `tripleSignal` — thống kê khả nă
 - `> 2×` → HIGH — chỉ là điều kiện cần, không tự động được lên top
 - Combo hoa chỉ hiện trong `hotTriples` khi **đã vào top-10 cuối cùng** và điểm cuối đủ mạnh
 
+### Sum Prediction (`/predict-sum`)
+
+Dự đoán giá trị tổng (3–18) thay vì combo — chỉ 16 outcomes thay vì 216. Với 43k draws, mỗi sum state có ~168 samples (vs ~200 cho mỗi combo) → Markov-1 transition matrix hội tụ tốt hơn.
+
+**Pipeline:**
+```
+Lịch sử N kỳ
+    │
+    ├─ Z-score overdue: (curGap - avgGap) / stdGap  ──► 40% weight
+    ├─ Markov-1: P(sum_next | sum_prev) × 16         ──► 40% weight  
+    └─ Session frequency deficit                      ──► 20% weight
+                                                        │
+                                              score = 0.4·zClamp + 0.4·mkNorm + 0.2·sessDeficit
+```
+
+**Response format:**
+```json
+{
+  "sums": [
+    { "sum": 12, "score": 1.79, "z": 2.67, "curGap": 30, "avgGap": 8.6, "mkProb": 11.24, "theoretical": 11.57, "sessRatio": 0.92 },
+    ...
+  ],
+  "prevSum": 8,
+  "session": "evening",
+  "mode": "active"
+}
+```
+
+UI hiển thị top 5 sum predictions trong `SumPredPanel` — mỗi ô cho thấy z-score (overdue), Markov probability, và gap hiện tại vs trung bình.
+
 ### Confidence + calibration
 
-Không dùng giá trị cứng 75%. Confidence được tính dựa trên khoảng cách score thực trong top-10:
-
+Confidence server-side vẫn tính dựa trên khoảng cách score trong top-10:
 ```
 confidence = 35 + ((score – minScore) / (maxScore – minScore)) × 45
 ```
 
-→ Rank 1: ~80%, Rank 10: ~35%. Đây là confidence tương đối theo score spread.
+**UI v10:** Không còn hiển thị confidence như % chính. Thay bằng **calibrated hit rate** từ `/stats.calBuckets`:
+- Rank 1: `calBuckets[0].hitPct` — tỷ lệ trúng thực nghiệm qua walk-forward backtest
+- Hiển thị dưới dạng `Lịch sử: x.xxx%` với thanh xanh lá
+- Nếu chưa có backtest data → fall back về confidence từ server
 
-UI hiển thị thêm `lịch sử: x.xxx%` từ `/stats.calBuckets` — đó mới là hit rate thực nghiệm theo từng rank position.
+Ý nghĩa: calibrated hit rate cho user biết **thực sự rank này đã trúng bao nhiêu lần** trong lịch sử — thay vì con số "80%" misleading từ score spread.
 
 ### Phân phối Sum
 
@@ -442,13 +513,25 @@ Semantics:
 
 ### Badge ranking
 
-| Badge | normScore | Màu |
+**Diversity mode** (khi `verdict = no_pattern` → `_uniform = true`):
+
+| Badge | Điều kiện | Màu |
 |-------|-----------|-----|
-| 🔥 HOT | ≥ 85 | Cam đỏ |
-| ⭐ STRONG | 70–84 | Vàng |
-| 👍 GOOD | 55–69 | Cyan |
-| ⚠️ WEAK | 40–54 | Tím |
-| ❄️ COLD | < 40 | Xám |
+| 🔴 Quá hạn | z-score > 2 | Đỏ |
+| 🟡 Khá hạn | z-score > 1 | Vàng |
+| 🟣 Hiếm | sessNorm < 0.1 (ít xuất hiện trong session) | Tím |
+| ⚪ Đa dạng | Các trường hợp còn lại | Xám |
+
+**Pattern mode** (khi `verdict = pattern_detected`):
+
+| Badge | Rank | Màu |
+|-------|------|-----|
+| 🔥 HOT | Rank 1–3 | Cam đỏ |
+| ⭐ STRONG | Rank 4–6 | Vàng |
+| 👍 GOOD | Rank 7–8 | Cyan |
+| OK | Rank 9–10 | Xám |
+
+UI hiển thị **calibrated hit rate** từ `/stats.calBuckets` thay vì confidence score — cho phép user thấy tỷ lệ trúng thực nghiệm theo từng rank position.
 
 ---
 
@@ -460,7 +543,7 @@ Semantics:
 crawl()   // xoso.net.vn primary, xomo.com fallback nếu primary lỗi
 ```
 
-Crawler tự chạy mỗi **30 giây** trong giờ mở thưởng. `crawl.js` dùng timeout ngắn + no-cache headers + fallback source để giảm lag nhưng vẫn giữ rate-limit lịch sự.
+Crawler tự chạy mỗi **45 giây** trong giờ mở thưởng (06:00–22:00 VN). Gap recovery: 3 retries (8s, 12s, 15s) khi phát hiện kỳ bị thiếu. `crawl.js` dùng timeout ngắn + no-cache headers + fallback source để giảm lag nhưng vẫn giữ rate-limit lịch sự.
 
 Data safety trong crawler:
 - Chỉ ghi `history.json` khi có thay đổi thực sự (`added > 0` hoặc có bản ghi được back-fill `drawTime`)

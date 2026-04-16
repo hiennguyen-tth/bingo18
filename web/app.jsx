@@ -18,8 +18,8 @@ function fmtTime(iso) {
   return `${hh}:${mi} ${dd}/${mo}/${yy}`
 }
 
-function predsSignature(preds) {
-  return preds.map(p => `${p.combo}:${p.score}:${p.confidence}`).join('|')
+function predsSignature(preds, latestKy) {
+  return `${latestKy || '0'}::${preds.map(p => `${p.combo}:${p.score}:${p.confidence}`).join('|')}`
 }
 
 function historySignature(records) {
@@ -47,24 +47,29 @@ const C = {
 }
 
 /* ─────────────────────────── PredCard ─────────────────────────────────── */
-function getRankingBadge(normScore) {
-  if (normScore >= 85) return { label: '🔥 HOT', color: '#FF6B3D', bg: 'rgba(255,107,61,0.18)', border: 'rgba(255,107,61,0.5)' }
-  if (normScore >= 70) return { label: '⭐ STRONG', color: '#FFC857', bg: 'rgba(255,200,87,0.15)', border: 'rgba(255,200,87,0.45)' }
-  if (normScore >= 55) return { label: '👍 GOOD', color: '#4CC9F0', bg: 'rgba(76,201,240,0.13)', border: 'rgba(76,201,240,0.4)' }
-  if (normScore >= 40) return { label: '⚠️ WEAK', color: '#9D8DF1', bg: 'rgba(157,141,241,0.13)', border: 'rgba(157,141,241,0.4)' }
-  return { label: '❄️ COLD', color: '#6B7280', bg: 'rgba(107,114,128,0.12)', border: 'rgba(107,114,128,0.35)' }
+function getRankingBadge(rank, zScore, sessNorm, isUniform) {
+  // When no_pattern (uniform scores), show diversity-aware labels instead of misleading "HOT 80%"
+  if (isUniform || rank >= 10) {
+    // Overdue-based badge
+    if (zScore != null && zScore > 2.0) return { label: '🔴 Quá hạn', color: '#FF6B3D', bg: 'rgba(255,107,61,0.18)', border: 'rgba(255,107,61,0.5)' }
+    if (zScore != null && zScore > 1.0) return { label: '🟡 Khá hạn', color: '#FFC857', bg: 'rgba(255,200,87,0.15)', border: 'rgba(255,200,87,0.45)' }
+    if (sessNorm != null && sessNorm < 0.1) return { label: '🟣 Hiếm', color: '#a78bfa', bg: 'rgba(167,139,250,0.15)', border: 'rgba(167,139,250,0.4)' }
+    return { label: '⚪ Đa dạng', color: '#94a3b8', bg: 'rgba(148,163,184,0.12)', border: 'rgba(148,163,184,0.35)' }
+  }
+  // Pattern mode: rank-based
+  if (rank < 3) return { label: '🔥 HOT', color: '#FF6B3D', bg: 'rgba(255,107,61,0.18)', border: 'rgba(255,107,61,0.5)' }
+  if (rank < 5) return { label: '⭐ STRONG', color: '#FFC857', bg: 'rgba(255,200,87,0.15)', border: 'rgba(255,200,87,0.45)' }
+  if (rank < 7) return { label: '👍 GOOD', color: '#4CC9F0', bg: 'rgba(76,201,240,0.13)', border: 'rgba(76,201,240,0.4)' }
+  return { label: '⚠️ OK', color: '#9D8DF1', bg: 'rgba(157,141,241,0.13)', border: 'rgba(157,141,241,0.4)' }
 }
 
 const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability, zScore, statNorm, mk2Norm, sessNorm, confidence: confFromServer, calBuckets, isUniform }) {
   const nums = combo.split('-')
-  const normScore = maxScore > 0 ? Math.round((score / maxScore) * 100) : 0
-  const badge = getRankingBadge(normScore)
-  // Use server-computed confidence (35–80% range, varies by score spread)
-  // Falls back to rank-based estimate if not provided
-  const confidence = confFromServer != null ? confFromServer
-    : Math.max(35, Math.round(80 - rank * 4.5))
+  const badge = getRankingBadge(rank, zScore, sessNorm, isUniform)
   // Calibrated hit rate at this rank position from walk-forward backtest
   const calHitPct = calBuckets ? calBuckets.find(b => b.rank === rank + 1)?.hitPct : null
+  // Display calibrated hit rate when available, else server confidence
+  const displayConf = calHitPct != null ? calHitPct : confFromServer
 
   const patLabel = { triple: '♦ Triple', pair: '◆ Pair', normal: '◇ Normal' }[pat] || pat || '◇ Normal'
   const patColor = { triple: '#c4b5fd', pair: '#7dd3fc', normal: '#94a3b8' }[pat] || '#94a3b8'
@@ -125,8 +130,8 @@ const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxSc
         <span style={{ color: zColor, textAlign: 'right', fontWeight: 700 }}>{zLabel}</span>
         <span style={{ color: '#64748b' }}>pattern</span>
         <span style={{ color: patColor, textAlign: 'right', fontWeight: 600 }}>{patLabel}</span>
-        <span style={{ color: '#64748b' }}>stability</span>
-        <span style={{ color: '#e2e8f0', textAlign: 'right', fontWeight: 700 }}>{stability != null ? stability.toFixed(2) : '—'}</span>
+        <span style={{ color: '#64748b' }}>chưa về</span>
+        <span style={{ color: comboGap > 500 ? '#FF6B3D' : comboGap > 250 ? '#FFC857' : '#94a3b8', textAlign: 'right', fontWeight: 700 }}>{comboGap != null ? `${comboGap}k` : '—'}</span>
         <span style={{ color: '#64748b' }}>share</span>
         <span style={{ color: '#a5b4fc', textAlign: 'right', fontWeight: 700 }}>{pct}%</span>
       </div>
@@ -161,16 +166,18 @@ const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxSc
         </div>
       )}
 
-      {/* Row 5: confidence bar */}
+      {/* Row 5: calibrated hit rate (replaces misleading confidence %) */}
       <div>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#64748b', marginBottom: 4 }}>
-          <span>confidence{calHitPct != null ? <span style={{ color: '#475569', fontWeight: 400 }}> · lịch sử: {calHitPct}%</span> : ''}</span>
-          <span style={{ color: badge.color, fontWeight: 700 }}>{confidence}%</span>
+          <span>{calHitPct != null ? 'lịch sử' : 'confidence'}{calHitPct != null && <span style={{ color: '#475569', fontWeight: 400 }}> (backtest)</span>}</span>
+          <span style={{ color: calHitPct != null ? '#34d399' : badge.color, fontWeight: 700 }}>{calHitPct != null ? `${calHitPct}%` : displayConf != null ? `${displayConf}%` : '—'}</span>
         </div>
         <div style={{ height: 5, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden' }}>
           <div style={{
-            width: `${confidence}%`, height: '100%',
-            background: `linear-gradient(90deg,${badge.color}88,${badge.color})`,
+            width: `${Math.min(100, (displayConf || 0) * (calHitPct != null ? 50 : 1))}%`, height: '100%',
+            background: calHitPct != null
+              ? 'linear-gradient(90deg,#34d39988,#34d399)'
+              : `linear-gradient(90deg,${badge.color}88,${badge.color})`,
             borderRadius: 3, transition: 'width 0.6s ease',
           }} />
         </div>
@@ -804,6 +811,39 @@ function NewDrawToast({ info, onDismiss }) {
   )
 }
 
+/* ─────────────────────────── SumPredPanel ─────────────────────────────── */
+const SumPredPanel = memo(function SumPredPanel({ data }) {
+  if (!data || !data.sums || data.sums.length === 0) return null
+  const top5 = data.sums.slice(0, 5)
+  const maxScore = top5[0]?.score || 1
+
+  return (
+    <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(99,102,241,0.2)', borderRadius: 10, padding: '12px 14px', marginBottom: 12 }}>
+      <div style={{ fontSize: 10, color: '#6366f1', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
+        🎯 Dự đoán Sum (16 outcomes · Markov + z-score)
+        <span style={{ color: '#475569', fontWeight: 400, textTransform: 'none', marginLeft: 8 }}>· sum trước: {data.prevSum} · {data.session}</span>
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        {top5.map((s, i) => (
+          <div key={s.sum} style={{
+            flex: '1 1 80px', minWidth: 75, background: i === 0 ? 'rgba(99,102,241,0.15)' : 'rgba(255,255,255,0.04)',
+            border: `1px solid ${i === 0 ? 'rgba(99,102,241,0.4)' : 'rgba(255,255,255,0.08)'}`,
+            borderRadius: 8, padding: '8px 10px', textAlign: 'center',
+          }}>
+            <div style={{ fontSize: 22, fontWeight: 900, color: i === 0 ? '#a5b4fc' : '#e2e8f0' }}>{s.sum}</div>
+            <div style={{ fontSize: 9, color: '#64748b', marginTop: 4 }}>
+              z={s.z} · Mk {s.mkProb}%
+            </div>
+            <div style={{ fontSize: 9, color: s.z > 1 ? '#FF6B3D' : '#475569' }}>
+              gap {s.curGap}{s.avgGap ? `/${s.avgGap}` : ''}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+})
+
 /* ─────────────────────────── App ──────────────────────────────────────── */
 function App() {
   const [preds, setPreds] = useState([])
@@ -819,12 +859,16 @@ function App() {
   const histETagRef = React.useRef(null)
   const overdueETagRef = React.useRef(null)
   const statsETagRef = React.useRef(null)
+  const predictBasisRef = React.useRef(null)
+  const basisFlashTimerRef = React.useRef(null)
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [updated, setUpdated] = useState('—')
   const [toast, setToast] = useState(null)
   const [liveKy, setLiveKy] = useState(null)
+  const [predictBasisKy, setPredictBasisKy] = useState(null)
+  const [basisJustChanged, setBasisJustChanged] = useState(false)
   const [sseConnected, setSseConnected] = useState(false)
   const [stats, setStats] = useState(null)
   const [statsLoading, setStatsLoading] = useState(true)
@@ -833,11 +877,13 @@ function App() {
   const [crawling, setCrawling] = useState(false)
   const [tripleSignal, setTripleSignal] = useState(null)
   const [modelContrib, setModelContrib] = useState(null)
+  const [verdict, setVerdict] = useState(null)
+  const [sumPreds, setSumPreds] = useState(null)
 
   // Bingo18 operating hours: 06:00–21:54 Vietnam time (UTC+7)
   const isNowOperating = () => {
     const vnMin = ((new Date().getUTCHours() + 7) % 24) * 60 + new Date().getUTCMinutes()
-    return vnMin >= 360 && vnMin <= 1314
+    return vnMin >= 360 && vnMin <= 1320
   }
   const [bingoClosed, setBingoClosed] = React.useState(!isNowOperating())
 
@@ -880,9 +926,10 @@ function App() {
     try {
       const predH = predETagRef.current ? { 'If-None-Match': predETagRef.current } : {}
       const histH = histETagRef.current ? { 'If-None-Match': histETagRef.current } : {}
-      const [pRaw, hRaw] = await Promise.all([
+      const [pRaw, hRaw, sumRaw] = await Promise.all([
         fetch('/predict', { cache: 'no-cache', headers: predH }),
         fetch('/history?limit=1000', { headers: histH }),
+        fetch('/predict-sum', { cache: 'no-cache' }),
       ])
 
       // Both unchanged — nothing to do, skip all state updates
@@ -897,14 +944,23 @@ function App() {
         const etag = pRaw.headers.get('ETag')
         if (etag) predETagRef.current = etag
         const newPreds = pRes.next || []
-        const nextSig = predsSignature(newPreds)
+        const nextBasisKy = pRes.latestKy || null
+        const nextSig = predsSignature(newPreds, nextBasisKy || pRes.total)
         if (nextSig !== predsRef.current) {
           predsRef.current = nextSig
           setPreds(newPreds)
         }
+        if (nextBasisKy && predictBasisRef.current && nextBasisKy !== predictBasisRef.current) {
+          setBasisJustChanged(true)
+          clearTimeout(basisFlashTimerRef.current)
+          basisFlashTimerRef.current = setTimeout(() => setBasisJustChanged(false), 20_000)
+        }
+        predictBasisRef.current = nextBasisKy
         setMaxScore(pRes.maxScore || 1)
+        setPredictBasisKy(nextBasisKy)
         setTripleSignal(pRes.tripleSignal || null)
         setModelContrib(pRes.modelContrib || null)
+        setVerdict(pRes.verdict || null)
         setSumStats(pRes.sumStats || [])
         setTotal(pRes.total || 0)
         setUpdated(new Date().toLocaleTimeString('vi-VN'))
@@ -918,6 +974,10 @@ function App() {
           historyRef.current = nextSig
           setHistory(newHistory)
         }
+      }
+      // Sum prediction response
+      if (sumRaw.ok) {
+        try { setSumPreds(await sumRaw.json()) } catch (_) { }
       }
     } catch (e) {
       setError(e.message)
@@ -933,12 +993,14 @@ function App() {
   useEffect(() => { loadRef.current = load }, [load])
   useEffect(() => { loadStatsRef.current = loadStats }, [loadStats])
   useEffect(() => { loadOverdueRef.current = loadOverdue }, [loadOverdue])
+  useEffect(() => () => clearTimeout(basisFlashTimerRef.current), [])
 
   // ── SSE subscription ──────────────────────────────────────────────────
   useEffect(() => {
     let es
     let reconnectTimer
     let mounted = true
+    let everConnected = false
 
     function connect() {
       if (!mounted) return
@@ -946,7 +1008,14 @@ function App() {
       es = new EventSource('/events')
 
       es.onopen = () => {
-        if (mounted) setSseConnected(true)
+        if (!mounted) return
+        setSseConnected(true)
+        if (everConnected) {
+          // Reconnected after drop — might have missed a draw while offline.
+          // Re-fetch without clearing ETags; server returns 304 if nothing changed, 200 if a new draw came in.
+          loadRef.current(true)
+        }
+        everConnected = true
       }
 
       es.addEventListener('new-draw', e => {
@@ -990,7 +1059,7 @@ function App() {
   useEffect(() => {
     function isOperatingHours() {
       const vnMin = ((new Date().getUTCHours() + 7) % 24) * 60 + new Date().getUTCMinutes()
-      return vnMin >= 360 && vnMin <= 1314  // 06:00–21:54 VN
+      return vnMin >= 360 && vnMin <= 1320  // 06:00–22:00 VN
     }
 
     load()
@@ -1022,8 +1091,8 @@ function App() {
       {/* ── Header ── */}
       <div style={C.header}>
         <div>
-          <div style={C.logo}>🎰 Bingo18 AI</div>
-          <div style={C.sub} className="hide-mobile">Thống kê đa dạng hóa combo · Realtime SSE · Walk-forward Backtest (p=0.51 — chưa có edge)</div>
+          <div style={C.logo}>📊 Bingo18 Analyzer</div>
+          <div style={C.sub} className="hide-mobile">Phân tích thống kê combo · Realtime SSE · Walk-forward Backtest</div>
         </div>
         <div className="header-actions">
           <span style={C.pill}>{total} records</span>
@@ -1079,9 +1148,9 @@ function App() {
         </div>
       </div>
 
-      {/* ―― Disclaimer ―― */}
-      <div style={{ background: 'rgba(15,23,42,0.8)', borderBottom: '1px solid rgba(99,102,241,0.15)', padding: '7px 24px', textAlign: 'center', fontSize: 11, color: '#64748b' }}>
-        ⚠️ Công cụ thống kê giải trí. Top-10 là portfolio đa dạng, không phải AI "biết trước" kết quả. Chơi có trách nhiệm.
+      {/* ―― Disclaimer banner (sticky) ―― */}
+      <div style={{ background: 'rgba(251,191,36,0.08)', borderBottom: '1px solid rgba(251,191,36,0.25)', padding: '8px 24px', textAlign: 'center', fontSize: 12, color: '#fbbf24', fontWeight: 600, position: 'sticky', top: 0, zIndex: 100, backdropFilter: 'blur(8px)' }}>
+        ⚠️ Hệ thống này chọn combo đa dạng — không dự đoán kết quả. Bingo18 là trò chơi ngẫu nhiên (autocorr p=0.41).
       </div>
 
       <div style={{ maxWidth: 1120, margin: '0 auto', padding: 'clamp(12px,3vw,28px) clamp(12px,3vw,20px)' }}>
@@ -1101,10 +1170,18 @@ function App() {
         {/* ── Top-10 Predictions ── */}
         <div style={C.sec}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 14, flexWrap: 'wrap', gap: 6 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
               <div style={C.label}>Top 10 Combo dự đoán</div>
               {updated !== '—' && (
                 <span style={{ fontSize: 10, color: '#475569' }}>⟳ {updated}</span>
+              )}
+              {predictBasisKy && (
+                <span style={{ fontSize: 10, color: '#94a3b8' }}>Dựa trên kỳ #{predictBasisKy}</span>
+              )}
+              {basisJustChanged && predictBasisKy && (
+                <span style={{ fontSize: 10, color: '#34d399', border: '1px solid rgba(52,211,153,0.35)', background: 'rgba(52,211,153,0.08)', borderRadius: 999, padding: '3px 8px', fontWeight: 700 }}>
+                  Đã nhận kỳ mới #{predictBasisKy}
+                </span>
               )}
             </div>
             <div style={{ fontSize: 11, color: '#475569' }} className="hide-mobile">
@@ -1112,6 +1189,7 @@ function App() {
             </div>
           </div>
           <TripleSignalCard signal={tripleSignal} anyTriple={overdue?.anyTriple} />
+          <SumPredPanel data={sumPreds} />
 
           {/* P4: Effective model contribution bar */}
           {modelContrib && (
@@ -1123,10 +1201,10 @@ function App() {
               marginBottom: 12,
             }}>
               <div style={{ fontSize: 10, color: '#475569', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>
-                Đóng góp model thực tế
+                {modelContrib._uniform ? '⚪ Chế độ: Diversity Selection' : 'Đóng góp model thực tế'}
                 {modelContrib._uniform && (
-                  <span style={{ marginLeft: 6, color: '#fbbf24', fontWeight: 400, textTransform: 'none' }}>
-                    · no_pattern → uniform (portfolio diversity only)
+                  <span style={{ marginLeft: 6, color: '#94a3b8', fontWeight: 400, textTransform: 'none' }}>
+                    · không phát hiện pattern → chọn combo đa dạng, phân bổ đều
                   </span>
                 )}
               </div>
@@ -1168,7 +1246,7 @@ function App() {
               <div style={{ color: '#64748b', fontSize: 13 }}>Chưa có dự đoán.</div>
             )}
             {preds.map((p, i) => (
-              <PredCard key={p.combo} combo={p.combo} pct={p.pct} rank={i}
+              <PredCard key={`${predictBasisKy || 'base'}:${p.combo}`} combo={p.combo} pct={p.pct} rank={i}
                 maxPct={maxPct} score={p.score} maxScore={maxScore}
                 overdueRatio={p.overdueRatio} comboGap={p.comboGap ?? 0}
                 pat={p.pat} stability={p.stability}

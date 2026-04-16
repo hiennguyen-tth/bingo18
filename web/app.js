@@ -22,8 +22,8 @@ function fmtTime(iso) {
   const yy = d.getFullYear();
   return `${hh}:${mi} ${dd}/${mo}/${yy}`;
 }
-function predsSignature(preds) {
-  return preds.map(p => `${p.combo}:${p.score}:${p.confidence}`).join('|');
+function predsSignature(preds, latestKy) {
+  return `${latestKy || '0'}::${preds.map(p => `${p.combo}:${p.score}:${p.confidence}`).join('|')}`;
 }
 function historySignature(records) {
   if (!records || records.length === 0) return '0';
@@ -131,36 +131,59 @@ const C = {
 };
 
 /* ─────────────────────────── PredCard ─────────────────────────────────── */
-function getRankingBadge(normScore) {
-  if (normScore >= 85) return {
+function getRankingBadge(rank, zScore, sessNorm, isUniform) {
+  // When no_pattern (uniform scores), show diversity-aware labels instead of misleading "HOT 80%"
+  if (isUniform || rank >= 10) {
+    // Overdue-based badge
+    if (zScore != null && zScore > 2.0) return {
+      label: '🔴 Quá hạn',
+      color: '#FF6B3D',
+      bg: 'rgba(255,107,61,0.18)',
+      border: 'rgba(255,107,61,0.5)'
+    };
+    if (zScore != null && zScore > 1.0) return {
+      label: '🟡 Khá hạn',
+      color: '#FFC857',
+      bg: 'rgba(255,200,87,0.15)',
+      border: 'rgba(255,200,87,0.45)'
+    };
+    if (sessNorm != null && sessNorm < 0.1) return {
+      label: '🟣 Hiếm',
+      color: '#a78bfa',
+      bg: 'rgba(167,139,250,0.15)',
+      border: 'rgba(167,139,250,0.4)'
+    };
+    return {
+      label: '⚪ Đa dạng',
+      color: '#94a3b8',
+      bg: 'rgba(148,163,184,0.12)',
+      border: 'rgba(148,163,184,0.35)'
+    };
+  }
+  // Pattern mode: rank-based
+  if (rank < 3) return {
     label: '🔥 HOT',
     color: '#FF6B3D',
     bg: 'rgba(255,107,61,0.18)',
     border: 'rgba(255,107,61,0.5)'
   };
-  if (normScore >= 70) return {
+  if (rank < 5) return {
     label: '⭐ STRONG',
     color: '#FFC857',
     bg: 'rgba(255,200,87,0.15)',
     border: 'rgba(255,200,87,0.45)'
   };
-  if (normScore >= 55) return {
+  if (rank < 7) return {
     label: '👍 GOOD',
     color: '#4CC9F0',
     bg: 'rgba(76,201,240,0.13)',
     border: 'rgba(76,201,240,0.4)'
   };
-  if (normScore >= 40) return {
-    label: '⚠️ WEAK',
+  return {
+    label: '⚠️ OK',
     color: '#9D8DF1',
     bg: 'rgba(157,141,241,0.13)',
     border: 'rgba(157,141,241,0.4)'
-  };
-  return {
-    label: '❄️ COLD',
-    color: '#6B7280',
-    bg: 'rgba(107,114,128,0.12)',
-    border: 'rgba(107,114,128,0.35)'
   };
 }
 const PredCard = memo(function PredCard({
@@ -183,13 +206,11 @@ const PredCard = memo(function PredCard({
   isUniform
 }) {
   const nums = combo.split('-');
-  const normScore = maxScore > 0 ? Math.round(score / maxScore * 100) : 0;
-  const badge = getRankingBadge(normScore);
-  // Use server-computed confidence (35–80% range, varies by score spread)
-  // Falls back to rank-based estimate if not provided
-  const confidence = confFromServer != null ? confFromServer : Math.max(35, Math.round(80 - rank * 4.5));
+  const badge = getRankingBadge(rank, zScore, sessNorm, isUniform);
   // Calibrated hit rate at this rank position from walk-forward backtest
   const calHitPct = calBuckets ? calBuckets.find(b => b.rank === rank + 1)?.hitPct : null;
+  // Display calibrated hit rate when available, else server confidence
+  const displayConf = calHitPct != null ? calHitPct : confFromServer;
   const patLabel = {
     triple: '♦ Triple',
     pair: '◆ Pair',
@@ -306,13 +327,13 @@ const PredCard = memo(function PredCard({
     style: {
       color: '#64748b'
     }
-  }, "stability"), /*#__PURE__*/React.createElement("span", {
+  }, "ch\u01B0a v\u1EC1"), /*#__PURE__*/React.createElement("span", {
     style: {
-      color: '#e2e8f0',
+      color: comboGap > 500 ? '#FF6B3D' : comboGap > 250 ? '#FFC857' : '#94a3b8',
       textAlign: 'right',
       fontWeight: 700
     }
-  }, stability != null ? stability.toFixed(2) : '—'), /*#__PURE__*/React.createElement("span", {
+  }, comboGap != null ? `${comboGap}k` : '—'), /*#__PURE__*/React.createElement("span", {
     style: {
       color: '#64748b'
     }
@@ -381,17 +402,17 @@ const PredCard = memo(function PredCard({
       color: '#64748b',
       marginBottom: 4
     }
-  }, /*#__PURE__*/React.createElement("span", null, "confidence", calHitPct != null ? /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("span", null, calHitPct != null ? 'lịch sử' : 'confidence', calHitPct != null && /*#__PURE__*/React.createElement("span", {
     style: {
       color: '#475569',
       fontWeight: 400
     }
-  }, " \xB7 l\u1ECBch s\u1EED: ", calHitPct, "%") : ''), /*#__PURE__*/React.createElement("span", {
+  }, " (backtest)")), /*#__PURE__*/React.createElement("span", {
     style: {
-      color: badge.color,
+      color: calHitPct != null ? '#34d399' : badge.color,
       fontWeight: 700
     }
-  }, confidence, "%")), /*#__PURE__*/React.createElement("div", {
+  }, calHitPct != null ? `${calHitPct}%` : displayConf != null ? `${displayConf}%` : '—')), /*#__PURE__*/React.createElement("div", {
     style: {
       height: 5,
       background: 'rgba(255,255,255,0.06)',
@@ -400,9 +421,9 @@ const PredCard = memo(function PredCard({
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
-      width: `${confidence}%`,
+      width: `${Math.min(100, (displayConf || 0) * (calHitPct != null ? 50 : 1))}%`,
       height: '100%',
-      background: `linear-gradient(90deg,${badge.color}88,${badge.color})`,
+      background: calHitPct != null ? 'linear-gradient(90deg,#34d39988,#34d399)' : `linear-gradient(90deg,${badge.color}88,${badge.color})`,
       borderRadius: 3,
       transition: 'width 0.6s ease'
     }
@@ -1590,6 +1611,74 @@ function NewDrawToast({
   }, "+", info.added, " k\u1EF3 v\u1EEBa m\u1EDF th\u01B0\u1EDFng \u2014 d\u1EF1 \u0111o\xE1n \u0111\xE3 c\u1EADp nh\u1EADt"));
 }
 
+/* ─────────────────────────── SumPredPanel ─────────────────────────────── */
+const SumPredPanel = memo(function SumPredPanel({
+  data
+}) {
+  if (!data || !data.sums || data.sums.length === 0) return null;
+  const top5 = data.sums.slice(0, 5);
+  const maxScore = top5[0]?.score || 1;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: 'rgba(255,255,255,0.03)',
+      border: '1px solid rgba(99,102,241,0.2)',
+      borderRadius: 10,
+      padding: '12px 14px',
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: '#6366f1',
+      fontWeight: 700,
+      textTransform: 'uppercase',
+      letterSpacing: '0.08em',
+      marginBottom: 8
+    }
+  }, "\uD83C\uDFAF D\u1EF1 \u0111o\xE1n Sum (16 outcomes \xB7 Markov + z-score)", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#475569',
+      fontWeight: 400,
+      textTransform: 'none',
+      marginLeft: 8
+    }
+  }, "\xB7 sum tr\u01B0\u1EDBc: ", data.prevSum, " \xB7 ", data.session)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap'
+    }
+  }, top5.map((s, i) => /*#__PURE__*/React.createElement("div", {
+    key: s.sum,
+    style: {
+      flex: '1 1 80px',
+      minWidth: 75,
+      background: i === 0 ? 'rgba(99,102,241,0.15)' : 'rgba(255,255,255,0.04)',
+      border: `1px solid ${i === 0 ? 'rgba(99,102,241,0.4)' : 'rgba(255,255,255,0.08)'}`,
+      borderRadius: 8,
+      padding: '8px 10px',
+      textAlign: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 22,
+      fontWeight: 900,
+      color: i === 0 ? '#a5b4fc' : '#e2e8f0'
+    }
+  }, s.sum), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: '#64748b',
+      marginTop: 4
+    }
+  }, "z=", s.z, " \xB7 Mk ", s.mkProb, "%"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: s.z > 1 ? '#FF6B3D' : '#475569'
+    }
+  }, "gap ", s.curGap, s.avgGap ? `/${s.avgGap}` : '')))));
+});
+
 /* ─────────────────────────── App ──────────────────────────────────────── */
 function App() {
   const [preds, setPreds] = useState([]);
@@ -1605,12 +1694,16 @@ function App() {
   const histETagRef = React.useRef(null);
   const overdueETagRef = React.useRef(null);
   const statsETagRef = React.useRef(null);
+  const predictBasisRef = React.useRef(null);
+  const basisFlashTimerRef = React.useRef(null);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [updated, setUpdated] = useState('—');
   const [toast, setToast] = useState(null);
   const [liveKy, setLiveKy] = useState(null);
+  const [predictBasisKy, setPredictBasisKy] = useState(null);
+  const [basisJustChanged, setBasisJustChanged] = useState(false);
   const [sseConnected, setSseConnected] = useState(false);
   const [stats, setStats] = useState(null);
   const [statsLoading, setStatsLoading] = useState(true);
@@ -1619,11 +1712,13 @@ function App() {
   const [crawling, setCrawling] = useState(false);
   const [tripleSignal, setTripleSignal] = useState(null);
   const [modelContrib, setModelContrib] = useState(null);
+  const [verdict, setVerdict] = useState(null);
+  const [sumPreds, setSumPreds] = useState(null);
 
   // Bingo18 operating hours: 06:00–21:54 Vietnam time (UTC+7)
   const isNowOperating = () => {
     const vnMin = (new Date().getUTCHours() + 7) % 24 * 60 + new Date().getUTCMinutes();
-    return vnMin >= 360 && vnMin <= 1314;
+    return vnMin >= 360 && vnMin <= 1320;
   };
   const [bingoClosed, setBingoClosed] = React.useState(!isNowOperating());
   const loadOverdue = useCallback(async () => {
@@ -1677,11 +1772,13 @@ function App() {
       const histH = histETagRef.current ? {
         'If-None-Match': histETagRef.current
       } : {};
-      const [pRaw, hRaw] = await Promise.all([fetch('/predict', {
+      const [pRaw, hRaw, sumRaw] = await Promise.all([fetch('/predict', {
         cache: 'no-cache',
         headers: predH
       }), fetch('/history?limit=1000', {
         headers: histH
+      }), fetch('/predict-sum', {
+        cache: 'no-cache'
       })]);
 
       // Both unchanged — nothing to do, skip all state updates
@@ -1693,14 +1790,23 @@ function App() {
         const etag = pRaw.headers.get('ETag');
         if (etag) predETagRef.current = etag;
         const newPreds = pRes.next || [];
-        const nextSig = predsSignature(newPreds);
+        const nextBasisKy = pRes.latestKy || null;
+        const nextSig = predsSignature(newPreds, nextBasisKy || pRes.total);
         if (nextSig !== predsRef.current) {
           predsRef.current = nextSig;
           setPreds(newPreds);
         }
+        if (nextBasisKy && predictBasisRef.current && nextBasisKy !== predictBasisRef.current) {
+          setBasisJustChanged(true);
+          clearTimeout(basisFlashTimerRef.current);
+          basisFlashTimerRef.current = setTimeout(() => setBasisJustChanged(false), 20_000);
+        }
+        predictBasisRef.current = nextBasisKy;
         setMaxScore(pRes.maxScore || 1);
+        setPredictBasisKy(nextBasisKy);
         setTripleSignal(pRes.tripleSignal || null);
         setModelContrib(pRes.modelContrib || null);
+        setVerdict(pRes.verdict || null);
         setSumStats(pRes.sumStats || []);
         setTotal(pRes.total || 0);
         setUpdated(new Date().toLocaleTimeString('vi-VN'));
@@ -1714,6 +1820,12 @@ function App() {
           historyRef.current = nextSig;
           setHistory(newHistory);
         }
+      }
+      // Sum prediction response
+      if (sumRaw.ok) {
+        try {
+          setSumPreds(await sumRaw.json());
+        } catch (_) {}
       }
     } catch (e) {
       setError(e.message);
@@ -1735,18 +1847,27 @@ function App() {
   useEffect(() => {
     loadOverdueRef.current = loadOverdue;
   }, [loadOverdue]);
+  useEffect(() => () => clearTimeout(basisFlashTimerRef.current), []);
 
   // ── SSE subscription ──────────────────────────────────────────────────
   useEffect(() => {
     let es;
     let reconnectTimer;
     let mounted = true;
+    let everConnected = false;
     function connect() {
       if (!mounted) return;
       setSseConnected(false);
       es = new EventSource('/events');
       es.onopen = () => {
-        if (mounted) setSseConnected(true);
+        if (!mounted) return;
+        setSseConnected(true);
+        if (everConnected) {
+          // Reconnected after drop — might have missed a draw while offline.
+          // Re-fetch without clearing ETags; server returns 304 if nothing changed, 200 if a new draw came in.
+          loadRef.current(true);
+        }
+        everConnected = true;
       };
       es.addEventListener('new-draw', e => {
         if (!mounted) return;
@@ -1787,7 +1908,7 @@ function App() {
   useEffect(() => {
     function isOperatingHours() {
       const vnMin = (new Date().getUTCHours() + 7) % 24 * 60 + new Date().getUTCMinutes();
-      return vnMin >= 360 && vnMin <= 1314; // 06:00–21:54 VN
+      return vnMin >= 360 && vnMin <= 1320; // 06:00–22:00 VN
     }
     load();
     loadStats();
@@ -1818,10 +1939,10 @@ function App() {
     style: C.header
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: C.logo
-  }, "\uD83C\uDFB0 Bingo18 AI"), /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDCCA Bingo18 Analyzer"), /*#__PURE__*/React.createElement("div", {
     style: C.sub,
     className: "hide-mobile"
-  }, "Th\u1ED1ng k\xEA \u0111a d\u1EA1ng h\xF3a combo \xB7 Realtime SSE \xB7 Walk-forward Backtest (p=0.51 \u2014 ch\u01B0a c\xF3 edge)")), /*#__PURE__*/React.createElement("div", {
+  }, "Ph\xE2n t\xEDch th\u1ED1ng k\xEA combo \xB7 Realtime SSE \xB7 Walk-forward Backtest")), /*#__PURE__*/React.createElement("div", {
     className: "header-actions"
   }, /*#__PURE__*/React.createElement("span", {
     style: C.pill
@@ -1878,14 +1999,19 @@ function App() {
     disabled: crawling || loading
   }, crawling ? 'Đang tải…' : loading ? 'Loading…' : '⬇ Cập nhật'))), /*#__PURE__*/React.createElement("div", {
     style: {
-      background: 'rgba(15,23,42,0.8)',
-      borderBottom: '1px solid rgba(99,102,241,0.15)',
-      padding: '7px 24px',
+      background: 'rgba(251,191,36,0.08)',
+      borderBottom: '1px solid rgba(251,191,36,0.25)',
+      padding: '8px 24px',
       textAlign: 'center',
-      fontSize: 11,
-      color: '#64748b'
+      fontSize: 12,
+      color: '#fbbf24',
+      fontWeight: 600,
+      position: 'sticky',
+      top: 0,
+      zIndex: 100,
+      backdropFilter: 'blur(8px)'
     }
-  }, "\u26A0\uFE0F C\xF4ng c\u1EE5 th\u1ED1ng k\xEA gi\u1EA3i tr\xED. Top-10 l\xE0 portfolio \u0111a d\u1EA1ng, kh\xF4ng ph\u1EA3i AI \"bi\u1EBFt tr\u01B0\u1EDBc\" k\u1EBFt qu\u1EA3. Ch\u01A1i c\xF3 tr\xE1ch nhi\u1EC7m."), /*#__PURE__*/React.createElement("div", {
+  }, "\u26A0\uFE0F H\u1EC7 th\u1ED1ng n\xE0y ch\u1ECDn combo \u0111a d\u1EA1ng \u2014 kh\xF4ng d\u1EF1 \u0111o\xE1n k\u1EBFt qu\u1EA3. Bingo18 l\xE0 tr\xF2 ch\u01A1i ng\u1EABu nhi\xEAn (autocorr p=0.41)."), /*#__PURE__*/React.createElement("div", {
     style: {
       maxWidth: 1120,
       margin: '0 auto',
@@ -1920,7 +2046,8 @@ function App() {
     style: {
       display: 'flex',
       alignItems: 'center',
-      gap: 12
+      gap: 12,
+      flexWrap: 'wrap'
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: C.label
@@ -1929,7 +2056,22 @@ function App() {
       fontSize: 10,
       color: '#475569'
     }
-  }, "\u27F3 ", updated)), /*#__PURE__*/React.createElement("div", {
+  }, "\u27F3 ", updated), predictBasisKy && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: '#94a3b8'
+    }
+  }, "D\u1EF1a tr\xEAn k\u1EF3 #", predictBasisKy), basisJustChanged && predictBasisKy && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: '#34d399',
+      border: '1px solid rgba(52,211,153,0.35)',
+      background: 'rgba(52,211,153,0.08)',
+      borderRadius: 999,
+      padding: '3px 8px',
+      fontWeight: 700
+    }
+  }, "\u0110\xE3 nh\u1EADn k\u1EF3 m\u1EDBi #", predictBasisKy)), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: '#475569'
@@ -1938,6 +2080,8 @@ function App() {
   }, "% = t\u1EF7 l\u1EC7 trong top-10 \xB7 X.Xx = s\u1ED1 l\u1EA7n qu\xE1 h\u1EA1n so v\u1EDBi k\u1EF3 v\u1ECDng (1x = b\xECnh th\u01B0\u1EDDng, >1x = l\xE2u ch\u01B0a v\u1EC1)")), /*#__PURE__*/React.createElement(TripleSignalCard, {
     signal: tripleSignal,
     anyTriple: overdue?.anyTriple
+  }), /*#__PURE__*/React.createElement(SumPredPanel, {
+    data: sumPreds
   }), modelContrib && /*#__PURE__*/React.createElement("div", {
     style: {
       background: 'rgba(255,255,255,0.03)',
@@ -1955,14 +2099,14 @@ function App() {
       letterSpacing: '0.08em',
       marginBottom: 6
     }
-  }, "\u0110\xF3ng g\xF3p model th\u1EF1c t\u1EBF", modelContrib._uniform && /*#__PURE__*/React.createElement("span", {
+  }, modelContrib._uniform ? '⚪ Chế độ: Diversity Selection' : 'Đóng góp model thực tế', modelContrib._uniform && /*#__PURE__*/React.createElement("span", {
     style: {
       marginLeft: 6,
-      color: '#fbbf24',
+      color: '#94a3b8',
       fontWeight: 400,
       textTransform: 'none'
     }
-  }, "\xB7 no_pattern \u2192 uniform (portfolio diversity only)")), !modelContrib._uniform ? /*#__PURE__*/React.createElement("div", {
+  }, "\xB7 kh\xF4ng ph\xE1t hi\u1EC7n pattern \u2192 ch\u1ECDn combo \u0111a d\u1EA1ng, ph\xE2n b\u1ED5 \u0111\u1EC1u")), !modelContrib._uniform ? /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       gap: 2,
@@ -2045,7 +2189,7 @@ function App() {
       fontSize: 13
     }
   }, "Ch\u01B0a c\xF3 d\u1EF1 \u0111o\xE1n."), preds.map((p, i) => /*#__PURE__*/React.createElement(PredCard, {
-    key: p.combo,
+    key: `${predictBasisKy || 'base'}:${p.combo}`,
     combo: p.combo,
     pct: p.pct,
     rank: i,
