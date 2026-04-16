@@ -955,7 +955,7 @@ app.get('/experiments/markov-reality', async (_req, res) => {
 })
 
 // ── Start ──────────────────────────────────────────────────────────────────
-const CRAWL_INTERVAL_MS = 30_000  // poll every 30s — halved to reduce lag; still 12× margin vs 6-min draw frequency
+const CRAWL_INTERVAL_MS = 12_000  // poll every 12s — AJAX-only (~200ms/call), draws every ~6min; 30× margin
 
 function startCrawlerLoop() {
   async function tick() {

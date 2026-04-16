@@ -16,13 +16,10 @@ const crypto = require('crypto')
 
 const FILE = path.join(__dirname, '../dataset/history.json')
 const BACKUP_FILE = `${FILE}.bak`
-// Source config: old xoso web is primary (currently fastest/freshest).
-const SOURCES = {
-  primary: { name: 'xoso.net.vn', liveUrl: 'https://xoso.net.vn/xs-bingo-18.html', moreUrl: 'https://xoso.net.vn/XSDienToan/GetKetQuaBinGo18More' },
-}
+// Source: xoso.net.vn AJAX endpoint — faster & less cached than the full HTML page.
+// HTML page: ~700ms, 122KB  |  AJAX: ~200ms, 15KB  → AJAX only.
+const AJAX_URL = 'https://xoso.net.vn/XSDienToan/GetKetQuaBinGo18More'
 const BASE_URL = 'https://xoso.net.vn'
-const LIVE_URL = SOURCES.primary.liveUrl
-const MORE_URL = SOURCES.primary.moreUrl
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -106,77 +103,37 @@ function parseBlocks($) {
   return results
 }
 
-/** Fetch and parse latest draws.
- *  Strategy: fetch HTML page and AJAX endpoint IN PARALLEL, merge unique records.
- *
- *  Rationale: the HTML page (xs-bingo-18.html) may be server-side cached by
- *  xoso.net.vn for several minutes. The `?_t=timestamp` cache-buster bypasses
- *  CDN/proxy caches but NOT the origin server's application cache. The AJAX
- *  endpoint (GetKetQuaBinGo18More) is a data endpoint and typically returns
- *  real-time results. Sequential HTML-first → AJAX-fallback caused 2-3 draw lag
- *  because stale HTML was always returned, AJAX was never tried.
- *
- *  Merging both sources guarantees we get the freshest ky from either source
- *  on every tick without doubling the overall request rate.
+/** Fetch and parse latest draws — AJAX only.
+ *  xoso.net.vn AJAX endpoint (~200ms, 15KB) vs HTML page (~700ms, 122KB).
+ *  HTML is server-side cached for several minutes; AJAX returns real-time data.
  */
 async function crawl() {
   const ts = Date.now()
-
-  const fetchHtml = async () => {
-    try {
-      const r = await axios.get(`${LIVE_URL}?_t=${ts}`, { timeout: 8_000, headers: HEADERS })
-      return parseBlocks(cheerio.load(r.data))
-    } catch (err) {
-      console.warn(`[crawl] html failed: ${err.message}`)
+  try {
+    const r = await axios.get(AJAX_URL, {
+      params: { pageIndex: 1, _t: ts },
+      timeout: 8_000,
+      headers: HEADERS,
+    })
+    if (!r.data || r.data.trim().length < 50) {
+      console.log('[crawl] ajax empty response')
       return []
     }
-  }
-
-  const fetchAjax = async () => {
-    try {
-      const r = await axios.get(MORE_URL, {
-        params: { pageIndex: 1, _t: ts },
-        timeout: 8_000,
-        headers: HEADERS,
-      })
-      return (r.data && r.data.trim().length > 50) ? parseBlocks(cheerio.load(r.data)) : []
-    } catch (err) {
-      console.warn(`[crawl] ajax failed: ${err.message}`)
-      return []
-    }
-  }
-
-  // Fetch HTML and AJAX simultaneously — merge unique records.
-  // HTML may be stale (server cache); AJAX is typically real-time.
-  // Merging gives the union of both so stale HTML never blocks fresh AJAX draws.
-  const [htmlRecs, ajaxRecs] = await Promise.all([fetchHtml(), fetchAjax()])
-
-  const seenIds = new Set(htmlRecs.map(r => r.id))
-  const extra = ajaxRecs.filter(r => !seenIds.has(r.id))
-  const merged = [...htmlRecs, ...extra]
-
-  const maxKyOf = rs => rs.length ? Math.max(...rs.map(r => Number(r.ky))) : 0
-  const htmlMax = maxKyOf(htmlRecs)
-  const ajaxMax = maxKyOf(ajaxRecs)
-  const mergedMax = maxKyOf(merged)
-
-  if (merged.length === 0) {
-    console.log('[crawl] both sources empty')
+    const records = parseBlocks(cheerio.load(r.data))
+    const maxKy = records.length ? Math.max(...records.map(r => Number(r.ky))) : 0
+    console.log(`[crawl] ajax: ${records.length} records (ky≤${maxKy})`)
+    return records
+  } catch (err) {
+    console.warn(`[crawl] ajax failed: ${err.message}`)
     return []
   }
-
-  const fresher = ajaxMax > htmlMax ? 'ajax' : 'html'
-  console.log(`[crawl] html:${htmlRecs.length}(ky≤${htmlMax}) ajax:${ajaxRecs.length}(ky≤${ajaxMax}) merged:${merged.length}(ky≤${mergedMax}) fresher:${fresher}`)
-  await new Promise(r => setTimeout(r, 100))
-  return merged
 }
 
 /** Fetch one paginated page of history (pageIndex = 1, 2, 3…). Used by crawlAll().
  * Only works for primary source (xoso.net.vn); xomo doesn't support pagination.
  */
 async function crawlPage(pageIndex) {
-  if (!MORE_URL) return []
-  const res = await axios.get(MORE_URL, {
+  const res = await axios.get(AJAX_URL, {
     params: { pageIndex },
     timeout: 12_000,
     headers: HEADERS,
