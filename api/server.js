@@ -587,12 +587,32 @@ app.get('/predict', withCache('predict', 5 * 60_000,
   async () => buildPredictPayload(await loadHistory())
 ))
 
-/** GET /predict-sum — sum-level prediction (16 outcomes, Markov-1 + z-score).
+/** GET /predict-sum — sum-level prediction (16 outcomes, Markov-1 + z-score + theoretical weight).
  *  Lower dimensionality than combo → converges with less data.
+ *  Score is weighted by sqrt(P(sum) / P_max) so rare sums (sum=3) don't outscore
+ *  common ones (sum=10) purely due to overdue status.
  *  Cached for 5 min alongside combo predictions. */
 app.get('/predict-sum', withCache('predict-sum', 5 * 60_000,
   async () => predict.predictSum(await loadHistory())
 ))
+
+/** GET /predict-hierarchical — P1 hierarchical prediction.
+ *  Step 1: predict sum → top-{sumFilter} buckets.
+ *  Step 2: portfolio-select combos restricted to those sum buckets only.
+ *  Returns same format as /predict plus sumBuckets[] and sumFiltered flag.
+ *  Query param: ?top=N (default 5) — how many sum buckets to consider.
+ *  Not cached here: used for testing; integrate via /predict?sumFilter=N once validated. */
+app.get('/predict-hierarchical', async (req, res) => {
+  try {
+    const topN = Math.max(1, Math.min(16, parseInt(req.query.top) || 5))
+    const data = await loadHistory()
+    const result = predict.ranked(data, { sumFilter: topN })
+    res.json({ ...result, _mode: 'hierarchical', _sumFilter: topN })
+  } catch (e) {
+    console.error('[/predict-hierarchical]', e.message)
+    res.status(500).json({ error: e.message })
+  }
+})
 
 /** GET /overdue — overdue stats for triples/pairs/sums (disk-persisted, always warm) */
 app.get('/overdue', withCache('overdue', 5 * 60_000,

@@ -1,21 +1,22 @@
 {
-  "date": "2026-04-16T02:48:48.308Z",
-  "totalRecords": 41698,
+  "date": "2026-04-16T05:00:40.100Z",
+  "model": "full",
+  "totalRecords": 41736,
   "window": 50,
-  "startIndex": 12509,
+  "startIndex": 12520,
   "sampleEvery": 83,
   "tested": 352,
-  "top1Hit": 24,
-  "top3Hit": 90,
-  "top5Hit": 163,
+  "top1Hit": 46,
+  "top3Hit": 114,
+  "top5Hit": 189,
   "accuracy": {
-    "top1": 0.0682,
-    "top3": 0.2557,
-    "top5": 0.4631
+    "top1": 0.1307,
+    "top3": 0.3239,
+    "top5": 0.5369
   },
   "pValues": {
-    "top1": 0.6597,
-    "top3": 0.001,
+    "top1": 0,
+    "top3": 0,
     "top5": 0
   },
   "baseline": {

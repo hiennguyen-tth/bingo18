@@ -32,6 +32,7 @@
 const path = require('path')
 const fs = require('fs-extra')
 const { getModelScores } = require('../predictor/ensemble')
+const { runStatTests } = require('../predictor/stats_tests')
 
 const HISTORY_FILE = path.join(__dirname, '../dataset/history.json')
 const WEIGHTS_FILE = path.join(__dirname, '../dataset/model.json')
@@ -47,16 +48,44 @@ function sigmoid(x) { return 1 / (1 + Math.exp(-x)) }
 const LAMBDA = 0.01   // L2 regularisation coefficient
 const BASELINE_TOP10 = 10 / 216   // random baseline ≈04.63% — objective must beat this
 
+// ── P2: production-equivalent shrink ─────────────────────────────────────
+// Mirror the Bayesian shrink logic from ensemble.js so that weights learned
+// during training reflect the same effective behaviour as production.
+// When a training window shows no_pattern, wA/wB/wD are zeroed — just like
+// in production. Weights optimised without this tend to over-value A/B/D
+// which are suppressed to 0 most of the time in practice.
+function computeShrink(statRes) {
+  const sigCount = [
+    statRes.chiSquare?.significant,
+    statRes.autocorr?.significant,
+    statRes.runs?.significant,
+  ].filter(Boolean).length
+
+  if (sigCount === 0) return 0.0  // no_pattern → kill A, B, D
+
+  const pVals = [statRes.chiSquare, statRes.autocorr, statRes.runs]
+    .filter(t => t && t.pValue !== null)
+    .map(t => t.pValue)
+  const pMin = pVals.length ? Math.min(...pVals) : 1
+  return Math.max(0.5, Math.min(1.0, (0.5 - pMin) / 0.45))
+}
+
 // ── Scoring ──────────────────────────────────────────────────────
 
-/** Top-10 hit rate with optional L2 regularisation. */
+/** Top-10 hit rate with optional L2 regularisation.
+ *  Each sample may carry a `shrink` factor (from P2: production-equivalent shrink).
+ *  When shrink=0 (no_pattern window), wA/wB/wD are effectively zeroed — exactly
+ *  as in production. This prevents the optimiser from over-valuing A/B/D.
+ */
 function hitRate(samples, wA, wB, wC, wD, wE, bias, lambda = 0) {
     let hits = 0
-    for (const { perCombo, actual } of samples) {
+    for (const { perCombo, actual, shrink = 1 } of samples) {
         const scored = []
         for (const [combo, s] of Object.entries(perCombo)) {
             const { sA, sB, sC, sD, sE = 0 } = s
-            scored.push({ combo, score: wA * sA + wB * sB + wC * sC + wD * sD + wE * sE + bias })
+            // Apply per-sample shrink to pattern-detecting weights (A, B, D)
+            // Leave session (C) and GBM (E) unchanged — they stay active under no_pattern
+            scored.push({ combo, score: (wA * shrink) * sA + (wB * shrink) * sB + wC * sC + (wD * shrink) * sD + wE * sE + bias })
         }
         scored.sort((a, b) => b.score - a.score)
         if (scored.slice(0, 10).some(r => r.combo === actual)) hits++
@@ -67,6 +96,11 @@ function hitRate(samples, wA, wB, wC, wD, wE, bias, lambda = 0) {
 }
 
 // ── Pre-compute model scores ───────────────────────────────────────────────
+// For each training step i, compute per-combo model scores and the Bayesian
+// shrink factor matching production behaviour (P2 fix). The stat tests run on
+// the slice data[0..i-1] — same window as the model scores.
+// Computing runStatTests() per step is O(N) per step, total O(N^2/step) — fast
+// for N~40k with step=50 (~(40000/2 * 800)/50 ≈ 320ms total).
 
 async function precompute(chron, from, to, step) {
     const samples = []
@@ -76,7 +110,10 @@ async function precompute(chron, from, to, step) {
         const perCombo = getModelScores(slice)
         if (!perCombo || Object.keys(perCombo).length === 0) continue
         const actual = `${chron[i].n1}-${chron[i].n2}-${chron[i].n3}`
-        samples.push({ perCombo, actual })
+        // P2: compute production-equivalent shrink for this slice window
+        const statRes = runStatTests(slice)
+        const shrink = computeShrink(statRes)
+        samples.push({ perCombo, actual, shrink })
         if (process.stdout.isTTY && samples.length % 20 === 0) {
             process.stdout.write(`.`)
         }

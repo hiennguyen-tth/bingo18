@@ -810,13 +810,38 @@ function rebalanceTripleRanks(top10, overdueRatio, verdict) {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-function predictRanked(data) {
+/**
+ * Ranked top-10 combo prediction with optional hierarchical sum filter (P1).
+ * opts.sumFilter {number}: if > 0, restrict portfolio selection to combos in the
+ *   top-N predicted sum buckets (e.g. opts.sumFilter=5 → top-5 sums → ~162 combos).
+ *   Falls back to all 216 if fewer than 15 combos survive the filter.
+ */
+function predictRanked(data, opts = {}) {
   if (!data) data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'))
   if (!data || data.length < 2) return { top10: [], tripleSignal: null }
   const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
   const now = new Date()
   const statRes = runStatTests(chron)
   const { results: all, effectiveWeights } = ensembleAll(chron, now)
+
+  // P1: hierarchical sum filter — restrict portfolio to top-N sum buckets.
+  // predictSum is fast (O(N)) so running it here (on already-sorted chron) is cheap.
+  let pool = all
+  let sumBuckets = null
+  let sumFiltered = false
+  if (opts.sumFilter > 0) {
+    const sumResult = predictSum(chron, {})  // chron already sorted
+    const topSums = new Set(sumResult.sums.slice(0, opts.sumFilter).map(s => s.sum))
+    const filtered = {}
+    for (const [k, v] of Object.entries(all)) {
+      if (topSums.has(v.sum)) filtered[k] = v
+    }
+    if (Object.keys(filtered).length >= 15) {
+      pool = filtered
+      sumBuckets = [...topSums].sort((a, b) => a - b)
+      sumFiltered = true
+    }
+  }
 
   // ── Triple signal: single O(N) pass for all triple stats ────────────
   const EXPECTED_GAP = 36 // 6/216 — one triple every 36 draws on average
@@ -838,7 +863,7 @@ function predictRanked(data) {
     : EXPECTED_GAP
 
   const boostMult = tripleBoostMult(chron)
-  let top10 = selectTop10(all)
+  let top10 = selectTop10(pool)  // pool = filtered (hierarchical) or full set
   top10 = rebalanceTripleRanks(top10, overdueRatio, statRes.verdict)
 
   // Show all triples that made it into top10 — if a triple is here it earned
@@ -879,7 +904,9 @@ function predictRanked(data) {
     chiNorm: 0,
   }))
 
-  return { top10: mapped, tripleSignal, effectiveWeights, verdict: statRes.verdict }
+  const result = { top10: mapped, tripleSignal, effectiveWeights, verdict: statRes.verdict }
+  if (sumBuckets !== null) { result.sumBuckets = sumBuckets; result.sumFiltered = sumFiltered }
+  return result
 }
 
 /** Score map for all 216 combos — used by /stats backtest. */
@@ -948,8 +975,24 @@ predict.reloadGBM = loadGBMScores
 
 const SUM_THEORETICAL = {}  // P(sum=s) = count(combos with that sum) / 216
 for (const [a, b, c] of ALL_COMBOS) SUM_THEORETICAL[a + b + c] = (SUM_THEORETICAL[a + b + c] || 0) + 1 / 216
+// Maximum theoretical probability across all sums (sum=10 and sum=11 each = 27/216)
+const SUM_MAX_THEO = 27 / 216
 
-function predictSum(data) {
+/**
+ * Predict which sum (3–18) is most likely to appear next.
+ * opts.model: 'full' | 'zscore-only' | 'markov-only' | 'session-only'
+ *   Defaults to 'full'. Ablation modes are used by backtest --model flag.
+ *
+ * After computing the overdue/Markov/session signal, the raw score is multiplied by
+ * sqrt(SUM_THEORETICAL[s] / SUM_MAX_THEO). This accounts for the inherent differences
+ * in how often each sum can physically appear:
+ *   sum=3 (only 1 way: 1+1+1) → theoWeight=0.19  ← heavy penalty even when overdue
+ *   sum=10 (27 ways)           → theoWeight=1.0   ← no penalty
+ * Without this correction, an overdue sum=3 (z=2) would outscore a normal sum=10
+ * despite sum=10 being 27× more likely to appear in any given draw.
+ */
+function predictSum(data, opts = {}) {
+  const model = opts.model || 'full'  // ablation mode
   if (!data || data.length < 30) return { sums: [], mode: 'insufficient' }
   const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
   const N = chron.length
@@ -1017,10 +1060,24 @@ function predictSum(data) {
     // sessDeficit: higher when sum appeared less than expected in current session
     const sessDeficit = Math.max(0, 1 - sessRatio) * 0.3  // 0–0.3 range
 
-    const score = 0.4 * zClamp + 0.4 * (mkProb * 16) + 0.2 * sessDeficit  // weighted
+    // Ablation: use only the requested signal component
+    let rawScore
+    if (model === 'zscore-only')    rawScore = zClamp               // [0, 3]
+    else if (model === 'markov-only')  rawScore = mkProb * 16       // normalised ~[0, 2.5]
+    else if (model === 'session-only') rawScore = sessDeficit        // [0, 0.30]
+    else                               rawScore = 0.4 * zClamp + 0.4 * (mkProb * 16) + 0.2 * sessDeficit
+
+    // Theoretical probability weight: scale by sqrt(P(sum=s) / P(sum=10)).
+    // Prevents rare sums (sum=3: 1/216) from outranking common sums (sum=10: 27/216)
+    // even when very overdue, because their absolute appearance rate is much lower.
+    const theoWeight = Math.sqrt((SUM_THEORETICAL[s] || 0) / SUM_MAX_THEO)  // [0.19 .. 1.0]
+    const score = rawScore * theoWeight
+
     results.push({
       sum: s,
       score: +score.toFixed(3),
+      rawScore: +rawScore.toFixed(3),
+      theoWeight: +theoWeight.toFixed(3),
       z: +zInfo.z.toFixed(2),
       curGap: zInfo.curGap,
       avgGap: zInfo.avgGap != null ? +zInfo.avgGap.toFixed(1) : null,
