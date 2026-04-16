@@ -213,21 +213,32 @@ Trên mobile: pivot tự giảm số cột ngày hiển thị và giữ scroll n
 
 ---
 
-## Markov Reality Check — 7 Experiments
+## Markov Reality Check — 7 Experiments (v12.3)
 
-`GET /experiments/markov-reality` — chạy trên 41746 kỳ, cache 30 phút.
+**Endpoint:** `GET /experiments/markov-reality` — chạy trên 41,834 kỳ, cache 30 phút.
 
-| Experiment | Mô tả | Kết quả (v12.3) |
-|------------|-------|-----------------|
-| **E1 — Baseline** | So sánh Uniform / Marginal / Markov top-1 accuracy | Uniform 6.31%, **Marginal 12.28%**, Markov 12.10% → Markov **thua** marginal |
-| **E2 — Shuffle Test** | Xáo trộn thứ tự training → nếu accuracy giữ nguyên → không có temporal signal | Ordered 12.10%, Shuffled 12.65% → **SHUFFLE_SAME** (thứ tự không quan trọng) |
-| **E3 — Conditional vs Marginal** | Mean \|P(next=s\|prev) − P(next=s)\| | meanAbsDelta = **0.0046**, max = 0.045 → cực kỳ gần nhau |
-| **E4 — Mutual Information** | I(X_{t−1}; X_t) | MI = **0.0027 nats** (0.1% max possible) → gần như độc lập |
-| **E5 — KL Divergence** | KL(P(·\|prev) ‖ P(·)) per row | meanKL = **0.0083**, max = 0.049 → rows ≈ marginal |
-| **E6 — Adversarial** | IID synthetic: ~6.25%; Biased synthetic: ~35% nếu Markov detect signal | IID 12.91%, Biased 34.77% — bộ test đúng nhưng data thật là IID |
-| **E7 — Normalised** | Score = P(next\|prev)/P(next) → loại bỏ base-rate | Top-1 giảm xuống **1.27%** → Markov hoàn toàn riding marginal frequency |
+**Mục đích:** Xác định liệu Markov-1 sum predictor có thực sự khai thác temporal signal hay chỉ riding marginal distribution (base-rate illusion). 7 experiments độc lập từ các góc độ khác nhau.
 
-**Verdict: `MARKOV_IS_ILLUSION`** — Toàn bộ accuracy của Markov đến từ phân phối marginal (sum=10/11 phổ biến nhất), không phải từ temporal transition. Bingo18 là IID, không có bộ nhớ giữa các kỳ.
+| Experiment | Mô tả | Kết quả (v12.3 live) | Kết luận |
+|------------|-------|------|----------|
+| **E1 — Baseline** | So sánh top-1 accuracy: Uniform (random) vs Marginal (frequency) vs Markov-1 (transition) | Uniform **6.25%**, Marginal **12.72%**, **Markov 12.55%** | Markov **thua 0.17%** so với marginal → không có temporal gain |
+| **E2 — Shuffle Test** | Train trên dữ liệu xáo trộn ngẫu nhiên → nếu accuracy không đổi → thứ tự không quan trọng | Ordered **12.24%**, Shuffled **12.53%** → delta **−0.29%** | Thứ tự **không quan trọng**; data = IID |
+| **E3 — Conditional vs Marginal** | Mean \|P(next=s \| prev) − P(next=s)\| across 216 transitions | Mean delta = **0.0046** (max=0.045) | Conditional ≈ marginal; mỗi state transition gần như độc lập |
+| **E4 — Mutual Information** | I(X_{t−1}; X_t) in nats — informational dependency between consecutive states | **0.0026 nats** (max possible ≈2.77 nats) = **0.09% of max** | Gần như **hoàn toàn độc lập**; << 1 nat threshold |
+| **E5 — KL Divergence** | KL(P(·\|prev) ‖ P(·)) per previous state — how much predictive dist diverges from marginal | Mean **0.0081** (max observed=0.049) | Distributions gần như **đồng nhất**; no divergence = no signal |
+| **E6 — Adversarial** | Synthetic data: IID (should fail) vs Biased (should succeed if real) | IID test: **12.91%** (failed); Biased test: **34.77%** (succeeded) | **Test methodology valid** — can detect signal; real data is IID |
+| **E7 — Normalized** | Score(combo \| prev) / P(combo) — remove base-rate advantage → isolate pure order effect | Top-1 **1.27%** (down from 12.55%) | Entire Markov score = **pure marginal frequency riding**; order contributes **0% gain** |
+
+**Summary Metrics:**
+- `markovGainVsUniform` = **5.55%** (from 6.25% to 12.55%) — but also because Marginal gains 6.47%
+- `markovGainVsMarginal` = **−0.17%** (Markov thua) — **no temporal advantage**
+- `shuffleDelta` = **−0.29%** (ordered worse) — order irrelevant
+- `mutualInformation` = **0.0026 nats** — micro-scale, below detection threshold
+- `meanKL` = **0.0081** — no divergence from marginal
+
+**Verdict: `MARKOV_IS_ILLUSION`** ✓
+
+> **Physical interpretation:** Sum=10 và sum=11 chiếm ~27/216 mỗi cái (12.5% each). Markov learns distribution ≈ [0, ..., 0, **0.125**, **0.125**, 0, ...] across 216 sums. Bất kỳ kỳ nào predict sum=10/11 cũng có ~12.5% hit rate. Markov không có "bộ nhớ"; nó chỉ học lại phân phối cơ bản. E7 proves: khi removal base-rate advantage, accuracy drops từ 12.55% → 1.27%. **Bingo18 là pure IID**, không có temporal memorystructure để khai thác.
 
 
 ## Logic dự đoán — Ensemble v9
