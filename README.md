@@ -1,8 +1,53 @@
 # Bingo18 Analyzer
 
-Hệ thống **phân tích thống kê** Bingo18 dùng **5-model Ensemble v9** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học (walk-forward + L2 regularisation)**. Model A được bổ sung 4 tín hiệu phụ (S3–S6 với S5/S6 loại trừ nhau), Model B dùng Laplace smoothing, và ensemble dùng **Bayesian p-value shrink**: khi `no_pattern` → wA=wB=wD=0 (kill hoàn toàn); khi có pattern → shrink liên tục theo confidence. Top-10 dùng **portfolio selection** (maximize P(hit ≥ 1)). Crawler dùng **xoso.net.vn** làm primary và **xomo.com** làm fallback, phục vụ qua REST API + Dashboard React, deploy trên Fly.io.
+Hệ thống **phân tích thống kê** Bingo18 dùng **5-model Ensemble** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học**. Crawler dùng **dual-source race** (HTML + AJAX xoso.net.vn song song, source nào về trước ghi vào history trước), phục vụ qua REST API + Dashboard React, deploy trên Fly.io.
 
-**Reframe (v10):** Hệ thống được reframe từ "AI Predictor" thành "Analyzer" — trung thực về khả năng. UI hiển thị **diversity-aware badges** (Quá hạn / Hiếm / Đa dạng) thay vì HOT/STRONG misleading. **Calibrated hit rate** từ backtest thay cho confidence score. **Sticky disclaimer** nhắc user rằng đây là trò chơi ngẫu nhiên.
+> **Production:** https://xs-bingo18.fly.dev
+
+---
+
+## v13 Changes (current — 2026-04-16)
+
+### Crawl — Pure Dual-Source Race
+- **Rewrite crawl.js:** Bỏ logic phức tạp (retry 8s/12s/15s khi gap), về lại **crawl thuần 2 source song song**.
+- **Write queue serialization:** Source A (HTML, ~700ms, luôn có kỳ mới nhất) và Source B (AJAX, ~200ms, cache lag 10–15 kỳ) fire đồng thời. Whichever arrives first → `merge()` ngay. Source kia khi về → merge tiếp (idempotent). No concurrent file access.
+- **Data safety:** `merge()` chỉ thêm/patch, không bao giờ xóa. Atomic write (write tmp → move). Backup file cập nhật sau mỗi write thành công.
+- **New log format:** `A(html): 15 recs (ky≤162488) +1 new` | `B(ajax): 15 recs (ky≤162472) +0 new`
+
+### Server — Stability Fixes
+- **Crawl interval 12s → 60s:** Bingo18 draws ~5–6 phút/kỳ. 12s gây rate-limiting xoso.net.vn → 2h data gap. 60s đủ nhanh (5–6× margin), giảm request volume 5×.
+- **Bỏ startup `crawlSince(lastKy, 50)`:** Cũ làm 50+ AJAX requests ngay khi boot, có thể trigger rate-limit và block crawl loop. Thay bằng **1 crawl đơn giản** tại startup để catch-up.
+- **Consecutive fail counter:** `_consecutiveCrawlFails` tăng khi cả 2 source đều trả rỗng trong operating hours. Cảnh báo log sau 5 ticks liên tiếp (~5 phút không có data).
+- **Health endpoint bổ sung:** `lastSuccessfulCrawlAt`, `crawlLagMs`, `consecutiveCrawlFails` — dễ debug khi data đứng im.
+- **Graceful shutdown (SIGTERM/SIGINT):** Đóng tất cả SSE client trước khi exit → Fly deploy không để client stuck.
+- **Stats TRAIN_CAP:** 10k → 5k records/slice để giảm memory spike (OOM risk trên 1GB Fly VM với 44k+ records).
+- **Security headers:** `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`.
+- **Deep recovery:** Giảm từ 30 pages → 10 pages (gentle, max 150 kỳ fill mỗi lần).
+
+### Data Recovery
+- **44,728 records** (tăng từ 41,903): Filled các gap lớn từ thời kỳ server offline:
+  - ky 159638→160710: +1,055 kỳ (Apr 6–10 gap)
+  - ky 111878–118440: +1,748 kỳ (old historical gaps)
+- Các gap ~81 kỳ đều là **overnight gaps** (21:54–06:00 VN, ~8.1h × 10draws/h ≈ 81 kỳ) — bình thường, không phải lỗi.
+
+---
+
+## Kiến trúc Crawl
+
+```
+Mỗi 60 giây (06:00–22:00 VN):
+  ┌─ Source A: HTML page (xoso.net.vn/xs-bingo-18.html)
+  │   Thời gian: ~700ms | Dữ liệu: kỳ mới nhất | Cache-busted với ?_t=timestamp
+  └─ Source B: AJAX API  (xoso.net.vn/XSDienToan/GetKetQuaBinGo18More)
+      Thời gian: ~200ms | Dữ liệu: lag 10–15 kỳ | Nhanh hơn nhưng stale hơn
+
+  → Cả hai fire đồng thời
+  → B về trước (~200ms): merge() ngay → ghi vào history.json
+  → A về sau (~700ms): merge() tiếp → bổ sung các kỳ mới mà B chưa có
+  → Kết quả: luôn có union đầy đủ nhất có thể trong 1 tick
+```
+
+---
 
 **v11 Changes:**
 - **Digit-position recency cooldown:** Top-10 giờ xoay tích cực hơn — combo chia sẻ ≥2 digit-position với 3 kỳ gần nhất bị penalty exponential (ví dụ: kỳ vừa ra 1-1-2 → combo 1-1-x bị giảm ~45% score)

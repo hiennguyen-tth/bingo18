@@ -428,16 +428,21 @@ async function _computeStatsBackground() {
       forward: { top1: 0, top3: 0, top10: 0, tested: 0 },
     }
 
-    // Dynamic SAMPLE_EVERY: target ~300 test windows regardless of dataset size.
-    // Yield after EVERY iteration so health-check (/health) is never blocked > 200ms.
-    const SAMPLE_EVERY = Math.max(1, Math.floor(N / 300))
+    // Dynamic SAMPLE_EVERY: target ~150 test windows regardless of dataset size.
+    // TRAIN_CAP: cap training slice at 5k records so predict.ranked() stays fast.
+    // Was 10k — on 41k-record dataset each predict call was holding ~8MB slices in
+    // memory simultaneously during all SAMPLE_EVERY iterations, risking OOM on Fly 1GB.
+    const SAMPLE_EVERY = Math.max(1, Math.floor(N / 150))
+    const TRAIN_CAP = 5_000   // max records per training slice (5k → ~3MB per slice)
     // Start from 30% mark — early windows have too little training data.
     const START_I = Math.max(WINDOW, Math.floor(N * 0.3))
 
     for (let i = START_I; i < N; i += SAMPLE_EVERY) {
-      await new Promise(resolve => setImmediate(resolve))  // yield EVERY iteration
-      const slice = chron.slice(0, i)
+      await new Promise(resolve => setImmediate(resolve))  // yield before predict
+      const sliceStart = i > TRAIN_CAP ? i - TRAIN_CAP : 0
+      const slice = chron.slice(sliceStart, i)
       const { top10: tp } = predict.ranked(slice)
+      await new Promise(resolve => setImmediate(resolve))  // yield after predict (health checks)
       if (!tp || tp.length === 0) continue
 
       const actual = `${chron[i].n1}-${chron[i].n2}-${chron[i].n3}`
@@ -503,6 +508,7 @@ async function _computeStatsBackground() {
       baseline, segments, statTests, calBuckets,
       _computedAt: Date.now(),
       _sampleEvery: SAMPLE_EVERY,
+      _trainCap: TRAIN_CAP,
     }
     _lastStatsCompute = Date.now()
     _lastStatsTotal = N
@@ -578,7 +584,17 @@ app.get('/sitemap.xml', (_req, res) => { res.setHeader('Content-Type', 'applicat
 app.get('/ads.txt', (_req, res) => { res.setHeader('Content-Type', 'text/plain; charset=utf-8'); res.sendFile(path.join(WEB_DIR, 'ads.txt')) })
 
 // Static assets (app.js, heatmap.js, etc.) — index.html excluded above
-app.use(express.static(WEB_DIR, { index: false }))
+// Long cache for JS/CSS (1y), short for HTML (5 min)
+app.use(express.static(WEB_DIR, {
+  index: false,
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.js') || filePath.endsWith('.css')) {
+      res.set('Cache-Control', 'public, max-age=31536000, immutable')
+    } else if (filePath.endsWith('.html')) {
+      res.set('Cache-Control', 'public, max-age=300')  // 5 min
+    }
+  },
+}))
 
 // ── API Routes ─────────────────────────────────────────────────────────────
 
@@ -793,11 +809,13 @@ app.get('/events', (req, res) => {
   req.on('close', () => { clearInterval(hb); sseClients.delete(res); console.log(`[SSE] -1 client (total: ${sseClients.size})`) })
 })
 
-/** GET /health — liveness probe (fast: uses in-memory predict cache instead of re-reading full file) */
+/** GET /health — liveness probe (always fast: uses only in-memory state, no file I/O) */
 app.get('/health', (_req, res) => {
   try {
     const predictHit = apiCache.get('predict')
     const historyTotal = predictHit?.data?.total ?? 0
+    const now = Date.now()
+    const crawlLagMs = lastSuccessfulCrawl ? now - lastSuccessfulCrawl : null
     res.json({
       ok: true,
       status: 'ok',
@@ -805,6 +823,9 @@ app.get('/health', (_req, res) => {
       statsComputing: _statsComputing,
       crawlerStatus: isOperatingHours() ? 'operating' : 'offline',
       lastCrawlAttemptAt: lastCrawlAttempt ? new Date(lastCrawlAttempt).toISOString() : null,
+      lastSuccessfulCrawlAt: lastSuccessfulCrawl ? new Date(lastSuccessfulCrawl).toISOString() : null,
+      crawlLagMs,
+      consecutiveCrawlFails: _consecutiveCrawlFails,
       uptime: Math.floor(process.uptime()),
       sseClients: sseClients.size,
       cacheKeys: [...apiCache.keys()],
@@ -825,7 +846,10 @@ app.post('/crawl', async (_req, res) => {
 // ── Crawler loop ───────────────────────────────────────────────────────────
 let lastKnownTotal = 0
 let lastCrawlAttempt = 0
+let lastSuccessfulCrawl = 0       // epoch ms — last tick that got data (or 0 empty with no error)
 let _crawlRunning = false
+let _consecutiveCrawlFails = 0   // empty ticks during operating hours; reset on any success
+const MAX_CRAWL_FAILS_WARN = 5   // warn after 5 min of empty results (5 × 60s)
 
 function isOperatingHours() {
   const now = new Date()
@@ -835,7 +859,6 @@ function isOperatingHours() {
 
 async function crawlTick({ manual = false } = {}) {
   if (!manual && !isOperatingHours()) {
-    console.log('[crawler] off-hours (before 06:00 or after 22:00 VN) -- skipping')
     return { skipped: true, reason: 'off-hours', added: 0, total: lastKnownTotal, latestKy: null, changed: false }
   }
   if (_crawlRunning) {
@@ -844,56 +867,48 @@ async function crawlTick({ manual = false } = {}) {
   }
   _crawlRunning = true
   lastCrawlAttempt = Date.now()
-  console.log(`[crawler] ${new Date().toLocaleTimeString('vi-VN')} -- crawling...`)
   try {
-    let { total, added, newRecords } = await crawlRun()
-    const latestKy = newRecords[0]?.ky || null
+    const { total, added, newRecords, changed } = await crawlRun()
+    const latestKy = newRecords?.[0]?.ky || null
 
-    // Gap recovery: when new draws are found but ky sequence still has a gap,
-    // the source website sometimes publishes draws with 3-10s delay.
-    // Retry up to 3 times (8s, 12s, 15s) to fill gaps — before broadcasting
-    // SSE — so predictions are built from fully-filled data.
-    if (added > 0) {
-      const retryDelays = [8000, 12000, 15000]
-      for (let attempt = 0; attempt < retryDelays.length; attempt++) {
-        const freshKys = (await loadHistory()).slice(0, 50).map(r => Number(r.ky)).sort((a, b) => b - a)
-        const hasGap = freshKys.some((k, i) => i > 0 && freshKys[i - 1] - k > 1)
-        if (!hasGap) break
-        console.log(`[crawler] ky gap in recent draws — recovery attempt ${attempt + 1}/${retryDelays.length} in ${retryDelays[attempt] / 1000}s...`)
-        await new Promise(r => setTimeout(r, retryDelays[attempt]))
-        const rec = await crawlRun()
-        if (rec.added > 0) {
-          console.log(`[crawler] gap recovery ${attempt + 1}: +${rec.added} records (latestKy: ${rec.newRecords[0]?.ky})`)
-          total = rec.total
-        }
+    // Track consecutive failures (both sources returned empty).
+    if (added === 0 && total === lastKnownTotal && isOperatingHours()) {
+      _consecutiveCrawlFails++
+      if (_consecutiveCrawlFails >= MAX_CRAWL_FAILS_WARN) {
+        console.error(`[crawler] WARNING: ${_consecutiveCrawlFails} consecutive empty ticks — xoso.net.vn may be down or rate-limiting`)
       }
+    } else {
+      // Any successful crawl resets the counter.
+      _consecutiveCrawlFails = 0
+      lastSuccessfulCrawl = Date.now()
     }
 
-    let changed = false
-    if (added > 0 || total !== lastKnownTotal) {
-      if (added > 0) {
-        console.log(`[crawler] ${added} ky moi (latest: #${latestKy}) -- push SSE -> ${sseClients.size} client(s)`)
-        invalidateCache()
-        // Broadcast full-reload event so all clients refresh predictions, history, sum, overdue
-        broadcast('new-draw', { added, latestKy: latestKy || '?', total, ts: new Date().toISOString(), reload: true })
-      } else {
-        console.log(`[crawler] total changed ${lastKnownTotal}->${total} -- invalidating cache`)
-        invalidateCache()
-      }
+    if (added > 0) {
+      console.log(`[crawler] +${added} kỳ mới (latest: #${latestKy}) — SSE → ${sseClients.size} client(s)`)
+      invalidateCache()
+      broadcast('new-draw', { added, latestKy: latestKy || '?', total, ts: new Date().toISOString(), reload: true })
       lastKnownTotal = total
-      changed = true
-    } else {
-      // No new draws this tick — check for historical gaps periodically
+    } else if (total !== lastKnownTotal) {
+      invalidateCache()
+      lastKnownTotal = total
+    } else if (!changed) {
+      // No new draws — check for gaps periodically (once per 10 min).
       await runDeepRecovery()
     }
+
     return { busy: false, skipped: false, added, total, latestKy, changed }
-  } catch (err) { console.error('[crawler] ERROR:', err.message) }
-  finally { _crawlRunning = false }
+  } catch (err) {
+    _consecutiveCrawlFails++
+    console.error('[crawler] ERROR:', err.message)
+  } finally {
+    _crawlRunning = false
+  }
   return { busy: false, skipped: false, added: 0, total: lastKnownTotal, latestKy: null, changed: false }
 }
 
-// ── Deep recovery: fill recent gaps by fetching pages targeting the last known ky ──
-// Fires at most once every 10 min when recent ky sequence has gaps.
+// ── Deep recovery: fill recent gaps once per 10 min when sequence has holes ──────────
+// Only fires when no new draws were found this tick (avoids concurrent crawls).
+// Checks last 30 kys for gaps; if found, runs crawlSince(lastKy, 10).
 let _lastDeepRecovery = 0
 async function runDeepRecovery() {
   const now = Date.now()
@@ -903,17 +918,15 @@ async function runDeepRecovery() {
   const data = await loadHistory()
   if (data.length < 30) return
 
-  // Check last 30 records (sorted newest first) for consecutive ky gaps
   const recent = data.slice(0, 30).map(r => Number(r.ky)).sort((a, b) => b - a)
   const hasGap = recent.some((k, i) => i > 0 && recent[i - 1] - k > 1)
   if (!hasGap) return
 
-  const lastKy = recent[0]
-  console.log(`[crawler] deep recovery: gaps detected, crawlSince ky=${lastKy}...`)
+  console.log(`[crawler] deep recovery: gaps in last 30 kys, crawlSince ${recent[0]}...`)
   try {
-    const { totalAdded } = await crawlSince(lastKy, 30)
+    const { totalAdded } = await crawlSince(recent[0], 10)  // gentle: max 10 pages
     if (totalAdded > 0) {
-      console.log(`[crawler] deep recovery: filled ${totalAdded} missing draws`)
+      console.log(`[crawler] deep recovery: +${totalAdded} draws filled`)
       invalidateCache()
       const data2 = await loadHistory()
       broadcast('new-draw', { added: totalAdded, latestKy: data2[0]?.ky || '?', total: data2.length, ts: new Date().toISOString(), source: 'deep-recovery' })
@@ -949,7 +962,9 @@ app.get('/experiments/markov-reality', async (_req, res) => {
 })
 
 // ── Start ──────────────────────────────────────────────────────────────────
-const CRAWL_INTERVAL_MS = 12_000  // poll every 12s — AJAX-only (~200ms/call), draws every ~6min; 30× margin
+// Bingo18 draws every ~5–6 min. 60s crawl is 5–6× faster than one draw cycle — ample margin.
+// Faster polling (12s) risked rate-limiting by xoso.net.vn, causing observed 2h data gaps.
+const CRAWL_INTERVAL_MS = 60_000
 
 function startCrawlerLoop() {
   async function tick() {
@@ -965,6 +980,17 @@ function startCrawlerLoop() {
   tick()
 }
 
+// ── Graceful shutdown ──────────────────────────────────────────────────────
+// Close all SSE connections cleanly before exit so clients reconnect quickly.
+function gracefulShutdown(signal) {
+  console.log(`[shutdown] ${signal} — closing ${sseClients.size} SSE connection(s)...`)
+  for (const res of sseClients) { try { res.end() } catch (_) { } }
+  sseClients.clear()
+  process.exit(0)
+}
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.once('SIGINT', () => gracefulShutdown('SIGINT'))
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Bingo AI API  ->  http://localhost:${PORT}`)
   console.log(`Dashboard     ->  http://localhost:${PORT}/`)
@@ -976,26 +1002,24 @@ app.listen(PORT, '0.0.0.0', () => {
   // Pre-warm after 2s: fills any missing disk caches and ensures freshness.
   setTimeout(() => _prewarmCaches(), 2_000)
 
-  // Startup gap recovery: crawl from the last known ky in history forward,
-  // filling any gaps caused by server restarts or outages (uses page-binary-search).
+  // Startup: run one crawl immediately to pick up kys missed while offline.
+  // The regular 60s loop then handles ongoing updates. Simple is more reliable —
+  // the old crawlSince(lastKy, 50) fired 50+ AJAX requests at startup and could
+  // trigger rate-limiting, blocking the regular crawl loop for minutes afterward.
   setTimeout(async () => {
     try {
-      const data = await loadHistory()
-      const lastKy = data.length > 0 ? Number(data[0].ky) : 0
-      if (lastKy > 0) {
-        console.log(`[startup] gap recovery: crawlSince ky=${lastKy} (last known)...`)
-        const { totalAdded } = await crawlSince(lastKy, 50)
-        if (totalAdded > 0) {
-          console.log(`[startup] gap recovery: filled ${totalAdded} missing records`)
-          invalidateCache()
-        } else {
-          console.log('[startup] gap recovery: no missing records found')
-        }
+      const result = await crawlRun()
+      if (result.added > 0) {
+        console.log(`[startup] crawl: +${result.added} new kys, cache invalidated`)
+        invalidateCache()
+      } else {
+        console.log('[startup] crawl: data is current')
       }
+      lastSuccessfulCrawl = Date.now()
     } catch (err) {
-      console.error('[startup] gap recovery error:', err.message)
+      console.error('[startup] crawl error:', err.message)
     }
-  }, 5_000)
+  }, 4_000)
 
   // Kick off stats if not cached yet or cache is > 24h old.
   setTimeout(() => {
