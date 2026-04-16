@@ -16,8 +16,11 @@ const crypto = require('crypto')
 
 const FILE = path.join(__dirname, '../dataset/history.json')
 const BACKUP_FILE = `${FILE}.bak`
-// Source: xoso.net.vn AJAX endpoint — faster & less cached than the full HTML page.
-// HTML page: ~700ms, 122KB  |  AJAX: ~200ms, 15KB  → AJAX only.
+// Source: xoso.net.vn — HTML + AJAX parallel, merge unique records.
+// HTML page: ~700ms, 122KB — has NEWER kỳ (updated instantly by xoso).
+// AJAX endpoint: ~200ms, 15KB — server-side cached, lags 5–15 kỳ behind HTML.
+// Strategy: fetch both simultaneously, union by id/ky → always gets the freshest set.
+const LIVE_URL = 'https://xoso.net.vn/xs-bingo-18.html'
 const AJAX_URL = 'https://xoso.net.vn/XSDienToan/GetKetQuaBinGo18More'
 const BASE_URL = 'https://xoso.net.vn'
 const HEADERS = {
@@ -103,30 +106,64 @@ function parseBlocks($) {
   return results
 }
 
-/** Fetch and parse latest draws — AJAX only.
- *  xoso.net.vn AJAX endpoint (~200ms, 15KB) vs HTML page (~700ms, 122KB).
- *  HTML is server-side cached for several minutes; AJAX returns real-time data.
+/** Fetch and parse latest draws — HTML + AJAX in parallel, merge unique records.
+ *
+ *  Benchmark (xoso.net.vn):
+ *    HTML page: ~700ms, 122KB — always contains the freshest kỳ (published instantly)
+ *    AJAX endpoint: ~200ms, 15KB — server-side cached, typically lags 5–15 kỳ behind HTML
+ *
+ *  Conclusion: AJAX alone misses the latest kỳ. HTML alone is slow. Parallel merge gives
+ *  the union: real-time freshness from HTML, AJAX as a fast backup if HTML is temporarily
+ *  slow or returns stale data. Total per-tick cost: 2 requests (rate-friendly).
  */
 async function crawl() {
   const ts = Date.now()
-  try {
-    const r = await axios.get(AJAX_URL, {
-      params: { pageIndex: 1, _t: ts },
-      timeout: 8_000,
-      headers: HEADERS,
-    })
-    if (!r.data || r.data.trim().length < 50) {
-      console.log('[crawl] ajax empty response')
+
+  const fetchHtml = async () => {
+    try {
+      const r = await axios.get(`${LIVE_URL}?_t=${ts}`, { timeout: 10_000, headers: HEADERS })
+      const recs = parseBlocks(cheerio.load(r.data))
+      return recs
+    } catch (err) {
+      console.warn(`[crawl] html failed: ${err.message}`)
       return []
     }
-    const records = parseBlocks(cheerio.load(r.data))
-    const maxKy = records.length ? Math.max(...records.map(r => Number(r.ky))) : 0
-    console.log(`[crawl] ajax: ${records.length} records (ky≤${maxKy})`)
-    return records
-  } catch (err) {
-    console.warn(`[crawl] ajax failed: ${err.message}`)
+  }
+
+  const fetchAjax = async () => {
+    try {
+      const r = await axios.get(AJAX_URL, {
+        params: { pageIndex: 1, _t: ts },
+        timeout: 8_000,
+        headers: HEADERS,
+      })
+      return (r.data && r.data.trim().length > 50) ? parseBlocks(cheerio.load(r.data)) : []
+    } catch (err) {
+      console.warn(`[crawl] ajax failed: ${err.message}`)
+      return []
+    }
+  }
+
+  // Fetch both simultaneously — HTML for freshness, AJAX for speed/redundancy.
+  const [htmlRecs, ajaxRecs] = await Promise.all([fetchHtml(), fetchAjax()])
+
+  const seenIds = new Set(htmlRecs.map(r => r.id))
+  const extra = ajaxRecs.filter(r => !seenIds.has(r.id))
+  const merged = [...htmlRecs, ...extra]
+
+  const maxKyOf = rs => rs.length ? Math.max(...rs.map(r => Number(r.ky))) : 0
+  const htmlMax = maxKyOf(htmlRecs)
+  const ajaxMax = maxKyOf(ajaxRecs)
+  const mergedMax = maxKyOf(merged)
+
+  if (merged.length === 0) {
+    console.log('[crawl] both sources empty')
     return []
   }
+
+  const fresher = htmlMax >= ajaxMax ? 'html' : 'ajax'
+  console.log(`[crawl] html:${htmlRecs.length}(ky≤${htmlMax}) ajax:${ajaxRecs.length}(ky≤${ajaxMax}) merged:${merged.length}(ky≤${mergedMax}) fresher:${fresher}`)
+  return merged
 }
 
 /** Fetch one paginated page of history (pageIndex = 1, 2, 3…). Used by crawlAll().
