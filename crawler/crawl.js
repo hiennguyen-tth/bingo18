@@ -107,23 +107,27 @@ function parseBlocks($) {
 }
 
 /** Fetch and parse latest draws.
- *  Strategy:
- *    1) xoso HTML live page (old web) as primary source.
- *    2) xoso AJAX endpoint only as fallback when HTML fails/empty.
+ *  Strategy: fetch HTML page and AJAX endpoint IN PARALLEL, merge unique records.
  *
- *  Cache-busting: appending _t=<timestamp> forces a fresh fetch past CDN edge caches
- *  that may ignore Cache-Control headers.
+ *  Rationale: the HTML page (xs-bingo-18.html) may be server-side cached by
+ *  xoso.net.vn for several minutes. The `?_t=timestamp` cache-buster bypasses
+ *  CDN/proxy caches but NOT the origin server's application cache. The AJAX
+ *  endpoint (GetKetQuaBinGo18More) is a data endpoint and typically returns
+ *  real-time results. Sequential HTML-first → AJAX-fallback caused 2-3 draw lag
+ *  because stale HTML was always returned, AJAX was never tried.
+ *
+ *  Merging both sources guarantees we get the freshest ky from either source
+ *  on every tick without doubling the overall request rate.
  */
 async function crawl() {
   const ts = Date.now()
-  const bust = `_t=${ts}`   // CDN cache-buster
 
   const fetchHtml = async () => {
     try {
-      const r = await axios.get(`${LIVE_URL}?${bust}`, { timeout: 10_000, headers: HEADERS })
+      const r = await axios.get(`${LIVE_URL}?_t=${ts}`, { timeout: 8_000, headers: HEADERS })
       return parseBlocks(cheerio.load(r.data))
     } catch (err) {
-      console.warn(`[crawl] ${SOURCES.primary.name} HTML failed: ${err.message}`)
+      console.warn(`[crawl] html failed: ${err.message}`)
       return []
     }
   }
@@ -137,26 +141,34 @@ async function crawl() {
       })
       return (r.data && r.data.trim().length > 50) ? parseBlocks(cheerio.load(r.data)) : []
     } catch (err) {
-      console.warn(`[crawl] AJAX fallback failed: ${err.message}`)
+      console.warn(`[crawl] ajax failed: ${err.message}`)
       return []
     }
   }
 
-  const htmlRecs = await fetchHtml()
-  if (htmlRecs.length > 0) {
-    const maxKy = Math.max(...htmlRecs.map(r => Number(r.ky)))
-    console.log(`[crawl] source:html count:${htmlRecs.length} maxKy:${maxKy}`)
-    await new Promise(r => setTimeout(r, 120))
-    return htmlRecs
+  // Fetch HTML and AJAX simultaneously — merge unique records.
+  // HTML may be stale (server cache); AJAX is typically real-time.
+  // Merging gives the union of both so stale HTML never blocks fresh AJAX draws.
+  const [htmlRecs, ajaxRecs] = await Promise.all([fetchHtml(), fetchAjax()])
+
+  const seenIds = new Set(htmlRecs.map(r => r.id))
+  const extra = ajaxRecs.filter(r => !seenIds.has(r.id))
+  const merged = [...htmlRecs, ...extra]
+
+  const maxKyOf = rs => rs.length ? Math.max(...rs.map(r => Number(r.ky))) : 0
+  const htmlMax = maxKyOf(htmlRecs)
+  const ajaxMax = maxKyOf(ajaxRecs)
+  const mergedMax = maxKyOf(merged)
+
+  if (merged.length === 0) {
+    console.log('[crawl] both sources empty')
+    return []
   }
 
-  const ajaxRecs = await fetchAjax()
-  const maxKy = ajaxRecs.length ? Math.max(...ajaxRecs.map(r => Number(r.ky))) : '—'
-  console.log(`[crawl] source:ajax-fallback count:${ajaxRecs.length} maxKy:${maxKy}`)
-
-  // Polite delay after fetch
-  await new Promise(r => setTimeout(r, 150))
-  return ajaxRecs
+  const fresher = ajaxMax > htmlMax ? 'ajax' : 'html'
+  console.log(`[crawl] html:${htmlRecs.length}(ky≤${htmlMax}) ajax:${ajaxRecs.length}(ky≤${ajaxMax}) merged:${merged.length}(ky≤${mergedMax}) fresher:${fresher}`)
+  await new Promise(r => setTimeout(r, 100))
+  return merged
 }
 
 /** Fetch one paginated page of history (pageIndex = 1, 2, 3…). Used by crawlAll().

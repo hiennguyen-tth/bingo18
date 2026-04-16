@@ -55,19 +55,19 @@ const BASELINE_TOP10 = 10 / 216   // random baseline ≈04.63% — objective mus
 // in production. Weights optimised without this tend to over-value A/B/D
 // which are suppressed to 0 most of the time in practice.
 function computeShrink(statRes) {
-  const sigCount = [
-    statRes.chiSquare?.significant,
-    statRes.autocorr?.significant,
-    statRes.runs?.significant,
-  ].filter(Boolean).length
+    const sigCount = [
+        statRes.chiSquare?.significant,
+        statRes.autocorr?.significant,
+        statRes.runs?.significant,
+    ].filter(Boolean).length
 
-  if (sigCount === 0) return 0.0  // no_pattern → kill A, B, D
+    if (sigCount === 0) return 0.0  // no_pattern → kill A, B, D
 
-  const pVals = [statRes.chiSquare, statRes.autocorr, statRes.runs]
-    .filter(t => t && t.pValue !== null)
-    .map(t => t.pValue)
-  const pMin = pVals.length ? Math.min(...pVals) : 1
-  return Math.max(0.5, Math.min(1.0, (0.5 - pMin) / 0.45))
+    const pVals = [statRes.chiSquare, statRes.autocorr, statRes.runs]
+        .filter(t => t && t.pValue !== null)
+        .map(t => t.pValue)
+    const pMin = pVals.length ? Math.min(...pVals) : 1
+    return Math.max(0.5, Math.min(1.0, (0.5 - pMin) / 0.45))
 }
 
 // ── Scoring ──────────────────────────────────────────────────────

@@ -930,7 +930,7 @@ async function runDeepRecovery() {
 }
 
 // ── Start ──────────────────────────────────────────────────────────────────
-const CRAWL_INTERVAL_MS = 60_000  // poll every 60s (1 draw per 6 min → ample margin)
+const CRAWL_INTERVAL_MS = 30_000  // poll every 30s — halved to reduce lag; still 12× margin vs 6-min draw frequency
 
 function startCrawlerLoop() {
   async function tick() {

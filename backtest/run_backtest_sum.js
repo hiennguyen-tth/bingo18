@@ -26,16 +26,16 @@ const WINDOW = 50  // minimum records before first sum prediction
 // ── CLI flags ────────────────────────────────────────────────────────────
 const VALID_MODELS = ['full', 'zscore-only', 'markov-only', 'session-only']
 const modelArg = (() => {
-  const idx = process.argv.indexOf('--model')
-  if (idx >= 0 && process.argv[idx + 1]) {
-    const m = process.argv[idx + 1]
-    if (!VALID_MODELS.includes(m)) {
-      console.error(`[backtest-sum] Unknown --model "${m}". Valid: ${VALID_MODELS.join(', ')}`)
-      process.exit(1)
+    const idx = process.argv.indexOf('--model')
+    if (idx >= 0 && process.argv[idx + 1]) {
+        const m = process.argv[idx + 1]
+        if (!VALID_MODELS.includes(m)) {
+            console.error(`[backtest-sum] Unknown --model "${m}". Valid: ${VALID_MODELS.join(', ')}`)
+            process.exit(1)
+        }
+        return m
     }
-    return m
-  }
-  return 'full'
+    return 'full'
 })()
 const sumOpts = { model: modelArg }  // passed to predict.predictSum()
 

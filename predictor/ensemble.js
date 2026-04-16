@@ -1062,10 +1062,10 @@ function predictSum(data, opts = {}) {
 
     // Ablation: use only the requested signal component
     let rawScore
-    if (model === 'zscore-only')    rawScore = zClamp               // [0, 3]
-    else if (model === 'markov-only')  rawScore = mkProb * 16       // normalised ~[0, 2.5]
+    if (model === 'zscore-only') rawScore = zClamp               // [0, 3]
+    else if (model === 'markov-only') rawScore = mkProb * 16       // normalised ~[0, 2.5]
     else if (model === 'session-only') rawScore = sessDeficit        // [0, 0.30]
-    else                               rawScore = 0.4 * zClamp + 0.4 * (mkProb * 16) + 0.2 * sessDeficit
+    else rawScore = 0.4 * zClamp + 0.4 * (mkProb * 16) + 0.2 * sessDeficit
 
     // Theoretical probability weight: scale by sqrt(P(sum=s) / P(sum=10)).
     // Prevents rare sums (sum=3: 1/216) from outranking common sums (sum=10: 27/216)
