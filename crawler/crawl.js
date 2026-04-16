@@ -284,7 +284,7 @@ async function crawlSince(fromKy, maxPages = 200) {
   try {
     const livePage = await crawlPage(1)
     if (livePage.length > 0) liveKy = Math.max(...livePage.map(r => Number(r.ky)))
-  } catch (_) {}
+  } catch (_) { }
 
   // Estimate the page that contains fromKy (add 10-page buffer to catch nearby gaps).
   const estimatedStartPage = Math.max(1, Math.ceil((liveKy - fromKy) / KY_PER_PAGE) + 10)
@@ -303,7 +303,7 @@ async function crawlSince(fromKy, maxPages = 200) {
         startPage = Math.max(1, estimatedStartPage - Math.ceil((fromKy - pageMinKy) / KY_PER_PAGE))
       }
     }
-  } catch (_) {}
+  } catch (_) { }
 
   console.log(`[crawlSince] liveKy=${liveKy} fromKy=${fromKy} startPage=${startPage}`)
 
