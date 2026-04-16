@@ -252,7 +252,6 @@ async function crawlAll(maxPages = 60) {
       const result = await merge(records)
       totalAdded += result.added
       process.stdout.write(`  page ${String(page).padStart(3)}: ${result.added} new | total: ${result.total}\r`)
-      // polite delay
       await new Promise(r => setTimeout(r, 400))
     } catch (err) {
       console.error(`\n[crawlAll] page ${page} error: ${err.message}`)
@@ -262,12 +261,104 @@ async function crawlAll(maxPages = 60) {
   console.log(`\n[crawlAll] Done. Added ${totalAdded} | total on disk: ${final.length}`)
 }
 
-module.exports = { crawl, crawlPage, crawlAll, run, merge }
+/**
+ * Crawl pages covering draws >= fromKy, then sweep toward page 1 (newest).
+ * Much faster than crawlAll() for filling recent gaps after outages.
+ *
+ * Page model: page 1 = newest ky. Higher page number = older ky.
+ * Sweep direction: start at estimated "fromKy page", walk toward page 1.
+ *
+ * @param {number} fromKy  – include all draws with ky >= fromKy
+ * @param {number} maxPages – hard cap on total pages crawled (default 200)
+ * @returns {{ totalAdded, total }}
+ */
+async function crawlSince(fromKy, maxPages = 200) {
+  console.log(`[crawlSince] looking for draws >= ky ${fromKy}, max ${maxPages} pages...`)
+
+  // Approximate live ky by fetching page 1 to calibrate the linear model.
+  // Page model: page ≈ (liveKy - targetKy) / kyPerPage
+  // Each AJAX page returns 15 consecutive ky draws.
+  const KY_PER_PAGE = 15
+
+  let liveKy = fromKy + 60  // fallback estimate if page-1 fetch fails
+  try {
+    const livePage = await crawlPage(1)
+    if (livePage.length > 0) liveKy = Math.max(...livePage.map(r => Number(r.ky)))
+  } catch (_) {}
+
+  // Estimate the page that contains fromKy (add 10-page buffer to catch nearby gaps).
+  const estimatedStartPage = Math.max(1, Math.ceil((liveKy - fromKy) / KY_PER_PAGE) + 10)
+
+  // Refine: sample one page near the estimate and adjust.
+  let startPage = estimatedStartPage
+  try {
+    const sample = await crawlPage(estimatedStartPage)
+    if (sample.length > 0) {
+      const pageMinKy = Math.min(...sample.map(r => Number(r.ky)))
+      if (pageMinKy > fromKy + 60) {
+        // Landed too recent (newer than fromKy) — go to a higher page (deeper/older).
+        startPage = estimatedStartPage + Math.ceil((pageMinKy - fromKy) / KY_PER_PAGE)
+      } else if (pageMinKy < fromKy - 100) {
+        // Landed too old — back up toward page 1.
+        startPage = Math.max(1, estimatedStartPage - Math.ceil((fromKy - pageMinKy) / KY_PER_PAGE))
+      }
+    }
+  } catch (_) {}
+
+  console.log(`[crawlSince] liveKy=${liveKy} fromKy=${fromKy} startPage=${startPage}`)
+
+  // Sweep from startPage → page 1 (oldest → newest), fetching everything >= fromKy.
+  let totalAdded = 0
+  let consecutiveEmpty = 0
+
+  for (let i = 0; i < maxPages; i++) {
+    const page = startPage - i  // sweep toward page 1 (newest)
+    if (page < 1) break
+
+    try {
+      const records = await crawlPage(page)
+      if (records.length === 0) {
+        if (++consecutiveEmpty >= 3) break
+        continue
+      }
+      consecutiveEmpty = 0
+
+      // Once we're fetching pages where all records are already well past fromKy
+      // and we're at page 1 or 2, we're done.
+      const maxKyOnPage = Math.max(...records.map(r => Number(r.ky)))
+      const minKyOnPage = Math.min(...records.map(r => Number(r.ky)))
+
+      // If this page is entirely older than fromKy - 60 buffer, skip but continue
+      // (we may have overshot; next pages toward 1 will be newer).
+      if (maxKyOnPage < fromKy - 60) {
+        continue
+      }
+
+      const result = await merge(records)
+      totalAdded += result.added
+      if (result.added > 0) {
+        process.stdout.write(`  page ${String(page).padStart(4)}: +${result.added} new (ky ${minKyOnPage}-${maxKyOnPage}) | total: ${result.total}\r`)
+      }
+      await new Promise(r => setTimeout(r, 350))
+    } catch (err) {
+      console.error(`\n[crawlSince] page ${page} error: ${err.message}`)
+    }
+  }
+
+  const final = await fs.readJSON(FILE).catch(() => [])
+  console.log(`\n[crawlSince] Done. Added ${totalAdded} | total on disk: ${final.length}`)
+  return { totalAdded, total: final.length }
+}
+
+module.exports = { crawl, crawlPage, crawlAll, crawlSince, run, merge }
 
 if (require.main === module) {
   const all = process.argv.includes('--all')
+  const since = process.argv.find(a => a.startsWith('--since='))?.split('=')[1]
   const pages = parseInt(process.argv.find(a => a.startsWith('--pages='))?.split('=')[1]) || 60
-  if (all) {
+  if (since) {
+    crawlSince(Number(since), pages || 200).catch(err => { console.error(err.message); process.exit(1) })
+  } else if (all) {
     crawlAll(pages).catch(err => { console.error(err.message); process.exit(1) })
   } else {
     run().catch(err => { console.error('[crawl] ERROR:', err.message); process.exit(1) })

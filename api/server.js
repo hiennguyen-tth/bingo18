@@ -57,7 +57,7 @@ const predict = require('../predictor/ensemble')
 const frequency = require('../predictor/frequency')
 const features = require('../predictor/features')
 const { runStatTests } = require('../predictor/stats_tests')
-const { run: crawlRun, crawlPage, merge: crawlMerge } = require('../crawler/crawl')
+const { run: crawlRun, crawlPage, crawlSince, merge: crawlMerge } = require('../crawler/crawl')
 
 const app = express()
 const PORT = parseInt(process.env.PORT) || 8080
@@ -892,7 +892,7 @@ async function crawlTick({ manual = false } = {}) {
   return { busy: false, skipped: false, added: 0, total: lastKnownTotal, latestKy: null, changed: false }
 }
 
-// ── Deep recovery: fill recent gaps by fetching extra pages ──────────────────
+// ── Deep recovery: fill recent gaps by fetching pages targeting the last known ky ──
 // Fires at most once every 10 min when recent ky sequence has gaps.
 let _lastDeepRecovery = 0
 async function runDeepRecovery() {
@@ -908,24 +908,18 @@ async function runDeepRecovery() {
   const hasGap = recent.some((k, i) => i > 0 && recent[i - 1] - k > 1)
   if (!hasGap) return
 
-  console.log('[crawler] deep recovery: gaps detected in recent records, fetching 3 extra pages...')
-  let totalAdded = 0
-  for (let page = 1; page <= 3; page++) {
-    try {
-      const recs = await crawlPage(page)
-      if (!recs.length) break
-      const res = await crawlMerge(recs)
-      totalAdded += res.added
-      await new Promise(r => setTimeout(r, 350))
-    } catch (err) {
-      console.error(`[crawler] deep recovery page ${page}:`, err.message)
+  const lastKy = recent[0]
+  console.log(`[crawler] deep recovery: gaps detected, crawlSince ky=${lastKy}...`)
+  try {
+    const { totalAdded } = await crawlSince(lastKy, 30)
+    if (totalAdded > 0) {
+      console.log(`[crawler] deep recovery: filled ${totalAdded} missing draws`)
+      invalidateCache()
+      const data2 = await loadHistory()
+      broadcast('new-draw', { added: totalAdded, latestKy: data2[0]?.ky || '?', total: data2.length, ts: new Date().toISOString(), source: 'deep-recovery' })
     }
-  }
-  if (totalAdded > 0) {
-    console.log(`[crawler] deep recovery: filled ${totalAdded} missing draws`)
-    invalidateCache()
-    const data2 = await loadHistory()
-    broadcast('new-draw', { added: totalAdded, latestKy: data2[0]?.ky || '?', total: data2.length, ts: new Date().toISOString(), source: 'deep-recovery' })
+  } catch (err) {
+    console.error('[crawler] deep recovery error:', err.message)
   }
 }
 
@@ -982,27 +976,24 @@ app.listen(PORT, '0.0.0.0', () => {
   // Pre-warm after 2s: fills any missing disk caches and ensures freshness.
   setTimeout(() => _prewarmCaches(), 2_000)
 
-  // Startup gap recovery: crawl 5 pages in background to fill any recent gaps
-  // caused by server restarts or outages. Runs once per container start.
+  // Startup gap recovery: crawl from the last known ky in history forward,
+  // filling any gaps caused by server restarts or outages (uses page-binary-search).
   setTimeout(async () => {
-    console.log('[startup] gap recovery: crawling 5 historical pages to fill recent gaps...')
-    let recoverAdded = 0
-    for (let page = 1; page <= 5; page++) {
-      try {
-        const recs = await crawlPage(page)
-        if (!recs.length) break
-        const res = await crawlMerge(recs)
-        recoverAdded += res.added
-        await new Promise(r => setTimeout(r, 400))
-      } catch (err) {
-        console.error(`[startup] recovery page ${page}:`, err.message)
+    try {
+      const data = await loadHistory()
+      const lastKy = data.length > 0 ? Number(data[0].ky) : 0
+      if (lastKy > 0) {
+        console.log(`[startup] gap recovery: crawlSince ky=${lastKy} (last known)...`)
+        const { totalAdded } = await crawlSince(lastKy, 50)
+        if (totalAdded > 0) {
+          console.log(`[startup] gap recovery: filled ${totalAdded} missing records`)
+          invalidateCache()
+        } else {
+          console.log('[startup] gap recovery: no missing records found')
+        }
       }
-    }
-    if (recoverAdded > 0) {
-      console.log(`[startup] gap recovery: filled ${recoverAdded} missing records`)
-      invalidateCache()
-    } else {
-      console.log('[startup] gap recovery: no missing records found')
+    } catch (err) {
+      console.error('[startup] gap recovery error:', err.message)
     }
   }, 5_000)
 
