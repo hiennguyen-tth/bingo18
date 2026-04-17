@@ -357,6 +357,9 @@ async function crawlSince(fromKy, maxPages = 30) {
 
   const estimatedStartPage = Math.max(1, Math.ceil((liveKy - fromKy) / KY_PER_PAGE) + 5)
 
+  // Minimum pages needed to reach fromKy from liveKy (floor to never under-shoot).
+  const minStartPage = Math.max(1, Math.ceil((liveKy - fromKy) / KY_PER_PAGE))
+
   let startPage = estimatedStartPage
   try {
     const sample = await crawlPage(estimatedStartPage)
@@ -370,7 +373,10 @@ async function crawlSince(fromKy, maxPages = 30) {
     }
   } catch (_) { }
 
-  console.log(`[crawlSince] liveKy=${liveKy} fromKy=${fromKy} startPage=${startPage}`)
+  // Never let refinement reduce startPage below the minimum needed to reach fromKy.
+  if (startPage < minStartPage) startPage = minStartPage + 2
+
+  console.log(`[crawlSince] liveKy=${liveKy} fromKy=${fromKy} startPage=${startPage} (min=${minStartPage})`)
 
   let totalAdded = 0
   let consecutiveEmpty = 0
