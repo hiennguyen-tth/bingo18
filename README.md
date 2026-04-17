@@ -6,12 +6,39 @@ Hệ thống **phân tích thống kê** Bingo18 dùng **5-model Ensemble** — 
 
 ---
 
-## v14 Changes (current — 2026-04-17)
+## v15 Changes (current — 2026-04-17)
+
+### Crawl — Vietlott AjaxPro + xoso fallback
+
+**Phát hiện gốc rễ:** Vietlott trả **403 Forbidden** từ IP Fly.io (Singapore). Source A (HTML) im lặng. Vietlott AjaxPro cũng bị 403. Chỉ xoso.net.vn là hoạt động từ overseas hosting.
+
+- **`crawlPage()` — Vietlott AjaxPro (primary) + xoso AJAX (fallback):**
+  - Thử **Vietlott AjaxPro** trước (`POST /ajaxpro/...GameBingoCompareWebPart.ashx`, 6 draws/page, nguồn chính thức, không rate-limit). Hoạt động từ VN/local.
+  - Nếu 403 (overseas IP bị chặn) → tự động fall back sang **xoso AJAX** (15 draws/page).
+  - Đảm bảo gap recovery (`crawlSince`, `crawlAll`) hoạt động trên cả môi trường local và Fly.io.
+- **`fetchVietlott()` 403 im lặng:** 403 không còn log warning (biết chắc là IP block, không phải lỗi), giữ log sạch trên production.
+- **Deep recovery cải tiến:** Chạy ngay khi startup (không cần chờ `!changed`), kiểm tra 60 ky gần nhất (thay vì 30), dùng 20 pages (≈120 draws ≈ 10h buffer).
+
+### Crawl — kiến trúc tổng quan
+
+```
+Mỗi 60 giây:
+  Source A [PRIORITY]: vietlott.vn HTML — 6 kỳ mới nhất, chính thức.
+                       403 từ Fly.io → im lặng, xoso lo phần này.
+  Source B [BACKUP]:   xoso.net.vn HTML — 15 kỳ + HH:MM drawTime.
+
+  crawlPage() cho gap recovery (crawlSince / crawlAll):
+    └─ Try: Vietlott AjaxPro (6/page, nhanh, chính xác, hoạt động từ VN)
+    └─ 403? → Fallback: xoso AJAX (15/page, hoạt động từ mọi IP)
+```
+
+---
+
+## v14 Changes (2026-04-17)
 
 ### Crawl — thêm vietlott.vn (nguồn chính thức ưu tiên)
 - **Source A (priority): vietlott.vn** — nguồn chính thức của Vietlott, cập nhật ngay sau mỗi kỳ. Parse bảng HTML `.bong_tron_bingo` với ky dạng `#0162535` (strip leading zeros).
 - **Source B: xoso.net.vn HTML** — backup, cung cấp `drawTime` (HH:MM) để enrich record chất lượng.
-- **Bỏ AJAX xoso.net.vn khỏi real-time run()** — AJAX chỉ còn dùng cho `crawlAll()` / `crawlSince()` (historical bulk pagination). User báo AJAX không trả kết quả mới nhất.
 - Cả 2 source vẫn fire song song; write-queue đảm bảo không race condition.
 
 ### UI — toast thông báo thay vì auto-rerender
@@ -50,6 +77,7 @@ Hệ thống **phân tích thống kê** Bingo18 dùng **5-model Ensemble** — 
 Mỗi 60 giây (06:00–22:00 VN):
   ┌─ Source A [PRIORITY]: vietlott.vn/...winning-number-bingo18
   │   Thời gian: ~800ms | Dữ liệu: 6 kỳ mới nhất | Nguồn chính thức
+  │   ⚠ 403 từ Fly.io Singapore → im lặng, xoso cover
   └─ Source B [BACKUP]: xoso.net.vn/xs-bingo-18.html
       Thời gian: ~700ms | Dữ liệu: 15 kỳ + HH:MM drawTime
 
@@ -58,8 +86,9 @@ Mỗi 60 giây (06:00–22:00 VN):
   → Source còn lại → merge tiếp, bổ sung recs còn thiếu / enrich drawTime
   → Kết quả: luôn có union đầy đủ nhất
 
-  Historical (crawlAll / crawlSince — chạy thủ công):
-    xoso.net.vn AJAX API — phân trang /pageIndex=N, lag OK vì không cần realtime
+  Historical (crawlAll / crawlSince — gap recovery tự động mỗi 10 phút):
+    crawlPage(n) → Try: Vietlott AjaxPro (POST /ajaxpro/..., 6/page, từ VN)
+                → 403? → Fallback: xoso AJAX (GET /pageIndex=N, 15/page, từ mọi IP)
 ```
 
 ---

@@ -37,6 +37,8 @@ const VIETLOTT_AJAXPRO_RENDER_URL = 'https://vietlott.vn/ajaxpro/Vietlott.Utilit
 const VIETLOTT_AJAXPRO_DRAW_URL = 'https://vietlott.vn/ajaxpro/Vietlott.PlugIn.WebParts.GameBingoCompareWebPart,Vietlott.PlugIn.WebParts.ashx'
 // Source B: xoso.net.vn HTML page — backup, ~15 draws, includes HH:MM drawTime.
 const HTML_URL = 'https://xoso.net.vn/xs-bingo-18.html'
+// xoso AJAX — fallback for crawlPage() when Vietlott AjaxPro is blocked (e.g. 403 from overseas IPs).
+const XOSO_AJAX_URL = 'https://xoso.net.vn/XSDienToan/GetKetQuaBinGo18More'
 
 // ── Write serialization queue ──────────────────────────────────────────────
 // Prevents concurrent merge() calls from racing on the same file.
@@ -196,13 +198,18 @@ function parseVietlott($) {
   return results
 }
 
-/** Source A (priority): vietlott.vn official — fastest publication, authoritative. */
+/** Source A (priority): vietlott.vn official — fastest publication, authoritative.
+ *  Returns [] silently on 403 (Vietlott blocks overseas IPs; xoso.net.vn covers this case).
+ */
 async function fetchVietlott() {
   try {
     const r = await axios.get(`${VIETLOTT_URL}?nocache=${Date.now()}`, { timeout: 12_000, headers: HEADERS })
     return parseVietlott(cheerio.load(r.data))
   } catch (err) {
-    console.warn(`[crawl] A(vietlott) failed: ${err.message}`)
+    // 403 = Vietlott blocks this IP (common on overseas hosting). Silent — xoso covers it.
+    if (err.response?.status !== 403) {
+      console.warn(`[crawl] A(vietlott) failed: ${err.message}`)
+    }
     return []
   }
 }
@@ -218,39 +225,56 @@ async function fetchHtml() {
   }
 }
 
-/** Fetch one paginated page of Vietlott history via AjaxPro (pageIndex = 1, 2, 3…).
- *  Used by crawlAll() and crawlSince() for bulk / gap-recovery operations.
- *  PageIndex 1 → Vietlott AjaxPro PageIndex 0 (newest 6 draws), and so on.
- *  Each page has 6 draws. No rate-limiting risk — same domain as the HTML source.
+/** Fetch one paginated page of history for bulk / gap-recovery.
+ *  Tries Vietlott AjaxPro first (6 draws/page, official source, no rate-limit).
+ *  Falls back to xoso.net.vn AJAX (15 draws/page) if Vietlott is blocked (403).
+ *  This ensures gap recovery works from overseas hosting (e.g. Fly.io Singapore).
  */
 async function crawlPage(pageIndex) {
-  const renderInfo = await getVietlottRenderInfo()
-  if (!renderInfo) throw new Error('Could not get Vietlott RenderInfo')
+  // ── Try Vietlott AjaxPro (primary) ───────────────────────────────────────
+  try {
+    const renderInfo = await getVietlottRenderInfo()
+    if (renderInfo) {
+      const body = JSON.stringify({
+        ORenderInfo: renderInfo,
+        GameId: '8',
+        GameDrawNo: '',
+        number: '',
+        DrawDate: '',
+        PageIndex: pageIndex - 1,  // crawlPage is 1-based; AjaxPro uses 0-based
+        TotalRow: 0,
+      })
+      const res = await axios.post(VIETLOTT_AJAXPRO_DRAW_URL, body, {
+        headers: {
+          ...HEADERS,
+          'X-AjaxPro-Method': 'ServerSideDrawResult',
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Origin': 'https://vietlott.vn',
+          'Referer': VIETLOTT_URL,
+        },
+        timeout: 14_000,
+        responseType: 'json',
+      })
+      const html = res.data?.value?.HtmlContent || ''
+      if (html && html.trim().length > 50) return parseVietlott(cheerio.load(html))
+    }
+  } catch (err) {
+    if (err.response?.status !== 403) {
+      console.warn(`[crawl] crawlPage AjaxPro p${pageIndex} failed: ${err.message} — trying xoso fallback`)
+    }
+    // 403 = blocked by IP → fall through to xoso silently
+    // Reset cached RenderInfo so next crawlPage re-attempts (in case IP changes)
+    _vietlottRenderInfo = null
+  }
 
-  const body = JSON.stringify({
-    ORenderInfo: renderInfo,
-    GameId: '8',
-    GameDrawNo: '',
-    number: '',
-    DrawDate: '',
-    PageIndex: pageIndex - 1,  // crawlPage is 1-based; AjaxPro uses 0-based
-    TotalRow: 99999,
-  })
-
-  const res = await axios.post(VIETLOTT_AJAXPRO_DRAW_URL, body, {
-    headers: {
-      ...HEADERS,
-      'X-AjaxPro-Method': 'ServerSideDrawResult',
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Referer': VIETLOTT_URL,
-    },
+  // ── Fallback: xoso.net.vn AJAX (15 draws/page) ──────────────────────────
+  const res = await axios.get(XOSO_AJAX_URL, {
+    params: { pageIndex },
     timeout: 14_000,
-    responseType: 'json',
+    headers: HEADERS,
   })
-
-  const html = res.data?.value?.HtmlContent || ''
-  if (!html || html.trim().length < 50) return []
-  return parseVietlott(cheerio.load(html))
+  if (!res.data || res.data.trim().length < 50) return []
+  return parseBlocks(cheerio.load(res.data))
 }
 
 
@@ -395,6 +419,9 @@ async function crawlAll(maxPages = 200) {
 async function crawlSince(fromKy, maxPages = 50) {
   console.log(`[crawlSince] looking for draws >= ky ${fromKy}, max ${maxPages} pages...`)
 
+  // KY_PER_PAGE: use 6 (Vietlott AjaxPro, primary) so estimates are conservative —
+  // going slightly past the target is harmless; stopping short would miss draws.
+  // xoso fallback returns 15/page so it finds the target in fewer pages, also fine.
   const KY_PER_PAGE = 6
 
   let liveKy = fromKy + 200  // fallback estimate
