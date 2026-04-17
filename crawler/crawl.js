@@ -31,10 +31,12 @@ const BACKUP_FILE = `${FILE}.bak`
 // Source A (PRIORITY): official Vietlott results — published immediately after each draw.
 //   HTML table with up to 6 most-recent draws. No drawTime (date only), but authoritative.
 const VIETLOTT_URL = 'https://vietlott.vn/vi/trung-thuong/ket-qua-trung-thuong/winning-number-bingo18'
+// Vietlott AjaxPro — same official source, used for multi-page historical recovery.
+// PageIndex 0 = newest 6 draws, each subsequent page goes 6 draws further back.
+const VIETLOTT_AJAXPRO_RENDER_URL = 'https://vietlott.vn/ajaxpro/Vietlott.Utility.WebEnvironments,Vietlott.Utility.ashx'
+const VIETLOTT_AJAXPRO_DRAW_URL = 'https://vietlott.vn/ajaxpro/Vietlott.PlugIn.WebParts.GameBingoCompareWebPart,Vietlott.PlugIn.WebParts.ashx'
 // Source B: xoso.net.vn HTML page — backup, ~15 draws, includes HH:MM drawTime.
 const HTML_URL = 'https://xoso.net.vn/xs-bingo-18.html'
-// Historical pagination only (crawlAll / crawlSince) — NOT used in real-time run().
-const AJAX_URL = 'https://xoso.net.vn/XSDienToan/GetKetQuaBinGo18More'
 
 // ── Write serialization queue ──────────────────────────────────────────────
 // Prevents concurrent merge() calls from racing on the same file.
@@ -62,6 +64,30 @@ const HEADERS = {
   'Cache-Control': 'no-cache',
   'Pragma': 'no-cache',
   'Referer': 'https://www.google.com.vn/',
+}
+
+// ── Vietlott AjaxPro helpers ───────────────────────────────────────────────
+// Cache RenderInfo — it is site-scoped (no session), so one fetch per process lifetime is fine.
+let _vietlottRenderInfo = null
+
+async function getVietlottRenderInfo() {
+  if (_vietlottRenderInfo) return _vietlottRenderInfo
+  const r = await axios.post(
+    VIETLOTT_AJAXPRO_RENDER_URL,
+    '{"SiteId":"main.frontend.vi"}',
+    {
+      headers: {
+        ...HEADERS,
+        'X-AjaxPro-Method': 'ServerSideFrontEndCreateRenderInfo',
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Referer': VIETLOTT_URL,
+      },
+      timeout: 10_000,
+      responseType: 'json',
+    },
+  )
+  _vietlottRenderInfo = r.data?.value || null
+  return _vietlottRenderInfo
 }
 
 /** Derive a stable id from ky + balls — idempotent across re-crawls. */
@@ -192,17 +218,39 @@ async function fetchHtml() {
   }
 }
 
-/** Fetch one paginated page of AJAX history (pageIndex = 1, 2, 3…).
+/** Fetch one paginated page of Vietlott history via AjaxPro (pageIndex = 1, 2, 3…).
  *  Used by crawlAll() and crawlSince() for bulk / gap-recovery operations.
+ *  PageIndex 1 → Vietlott AjaxPro PageIndex 0 (newest 6 draws), and so on.
+ *  Each page has 6 draws. No rate-limiting risk — same domain as the HTML source.
  */
 async function crawlPage(pageIndex) {
-  const res = await axios.get(AJAX_URL, {
-    params: { pageIndex },
-    timeout: 14_000,
-    headers: HEADERS,
+  const renderInfo = await getVietlottRenderInfo()
+  if (!renderInfo) throw new Error('Could not get Vietlott RenderInfo')
+
+  const body = JSON.stringify({
+    ORenderInfo: renderInfo,
+    GameId: '8',
+    GameDrawNo: '',
+    number: '',
+    DrawDate: '',
+    PageIndex: pageIndex - 1,  // crawlPage is 1-based; AjaxPro uses 0-based
+    TotalRow: 99999,
   })
-  if (!res.data || res.data.trim().length < 50) return []
-  return parseBlocks(cheerio.load(res.data))
+
+  const res = await axios.post(VIETLOTT_AJAXPRO_DRAW_URL, body, {
+    headers: {
+      ...HEADERS,
+      'X-AjaxPro-Method': 'ServerSideDrawResult',
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Referer': VIETLOTT_URL,
+    },
+    timeout: 14_000,
+    responseType: 'json',
+  })
+
+  const html = res.data?.value?.HtmlContent || ''
+  if (!html || html.trim().length < 50) return []
+  return parseVietlott(cheerio.load(html))
 }
 
 
@@ -307,10 +355,10 @@ async function run() {
   }
 }
 
-/** Crawl full history via AJAX pagination (run once to seed, or after long outage).
- * @param {number} maxPages – pages to fetch (default 100 ≈ 1500 draws ≈ 10 days)
+/** Crawl full history via Vietlott AjaxPro pagination (run once to seed, or after long outage).
+ * @param {number} maxPages – pages to fetch (default 200 ≈ 1200 draws ≈ 100 hours)
  */
-async function crawlAll(maxPages = 100) {
+async function crawlAll(maxPages = 200) {
   console.log(`[crawlAll] fetching up to ${maxPages} pages of history…`)
   let totalAdded = 0
 
@@ -341,13 +389,13 @@ async function crawlAll(maxPages = 100) {
  * Estimates startPage from (liveKy - fromKy) / KY_PER_PAGE, then sweeps toward page 1.
  *
  * @param {number} fromKy   – include draws with ky >= fromKy
- * @param {number} maxPages – hard cap (default 30 ≈ 450 draws; use --pages=N for more)
+ * @param {number} maxPages – hard cap (default 50 ≈ 300 draws; use --pages=N for more)
  * @returns {{ totalAdded, total }}
  */
-async function crawlSince(fromKy, maxPages = 30) {
+async function crawlSince(fromKy, maxPages = 50) {
   console.log(`[crawlSince] looking for draws >= ky ${fromKy}, max ${maxPages} pages...`)
 
-  const KY_PER_PAGE = 15
+  const KY_PER_PAGE = 6
 
   let liveKy = fromKy + 200  // fallback estimate
   try {

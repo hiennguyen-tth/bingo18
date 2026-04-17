@@ -998,10 +998,8 @@ app.listen(PORT, '0.0.0.0', () => {
   // Pre-warm after 2s: fills any missing disk caches and ensures freshness.
   setTimeout(() => _prewarmCaches(), 2_000)
 
-  // Startup: run one crawl immediately to pick up kys missed while offline.
-  // The regular 60s loop then handles ongoing updates. Simple is more reliable —
-  // the old crawlSince(lastKy, 50) fired 50+ AJAX requests at startup and could
-  // trigger rate-limiting, blocking the regular crawl loop for minutes afterward.
+  // Startup: run one crawl immediately to pick up kys missed while offline,
+  // then run gap recovery via Vietlott AjaxPro (no rate-limit risk, same official source).
   setTimeout(async () => {
     try {
       const result = await crawlRun()
@@ -1012,6 +1010,9 @@ app.listen(PORT, '0.0.0.0', () => {
         console.log('[startup] crawl: data is current')
       }
       lastSuccessfulCrawl = Date.now()
+      // Run gap recovery on startup unconditionally — catches outage gaps
+      // even when the latest draws were already fetched above.
+      await runDeepRecovery()
     } catch (err) {
       console.error('[startup] crawl error:', err.message)
     }
