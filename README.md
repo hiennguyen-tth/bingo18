@@ -1,34 +1,46 @@
 # Bingo18 Analyzer
 
-Hệ thống **phân tích thống kê** Bingo18 dùng **5-model Ensemble** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học**. Crawler dùng **dual-source race** (HTML + AJAX xoso.net.vn song song, source nào về trước ghi vào history trước), phục vụ qua REST API + Dashboard React, deploy trên Fly.io.
+Hệ thống **phân tích thống kê** Bingo18 dùng **5-model Ensemble** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học**. Crawler dùng **dual-source race** (vietlott.vn ưu tiên + xoso.net.vn song song, source nào về trước ghi vào history trước), phục vụ qua REST API + Dashboard React, deploy trên Fly.io.
 
 > **Production:** https://xs-bingo18.fly.dev
 
 ---
 
-## v13 Changes (current — 2026-04-16)
+## v14 Changes (current — 2026-04-17)
+
+### Crawl — thêm vietlott.vn (nguồn chính thức ưu tiên)
+- **Source A (priority): vietlott.vn** — nguồn chính thức của Vietlott, cập nhật ngay sau mỗi kỳ. Parse bảng HTML `.bong_tron_bingo` với ky dạng `#0162535` (strip leading zeros).
+- **Source B: xoso.net.vn HTML** — backup, cung cấp `drawTime` (HH:MM) để enrich record chất lượng.
+- **Bỏ AJAX xoso.net.vn khỏi real-time run()** — AJAX chỉ còn dùng cho `crawlAll()` / `crawlSince()` (historical bulk pagination). User báo AJAX không trả kết quả mới nhất.
+- Cả 2 source vẫn fire song song; write-queue đảm bảo không race condition.
+
+### UI — toast thông báo thay vì auto-rerender
+- **SSE `new-draw`:** khi có kỳ mới, chỉ hiện toast thông báo, **không tự rerender**.
+- **Nhấn "↻ Cập nhật ngay"** trên toast → force-refresh toàn bộ dữ liệu (predict, history, overdue, stats).
+- **Nhấn "Bỏ qua"** → tắt toast, giữ nguyên view hiện tại.
+- Toast tự tắt sau 12s (tăng từ 6s để có thêm thời gian đọc).
+
+### History display — tách hiển thị vs. training
+- `/history?limit=800` thay vì 1000 — hiển thị ~5 ngày gần nhất (5 × 159 kỳ/ngày = 795).
+- Label "**hiển thị 800 / 47k kỳ**" — rõ ràng phân biệt data đang xem vs. tổng data training.
+- Training model vẫn dùng toàn bộ history.json (47k+ records) qua `/predict`.
+
+---
+
+## v13 Changes (2026-04-16)
 
 ### Crawl — Pure Dual-Source Race
 - **Rewrite crawl.js:** Bỏ logic phức tạp (retry 8s/12s/15s khi gap), về lại **crawl thuần 2 source song song**.
-- **Write queue serialization:** Source A (HTML, ~700ms, luôn có kỳ mới nhất) và Source B (AJAX, ~200ms, cache lag 10–15 kỳ) fire đồng thời. Whichever arrives first → `merge()` ngay. Source kia khi về → merge tiếp (idempotent). No concurrent file access.
+- **Write queue serialization:** `_writeQueue + queuedMerge()` — serialize concurrent merge calls, no concurrent file writes.
 - **Data safety:** `merge()` chỉ thêm/patch, không bao giờ xóa. Atomic write (write tmp → move). Backup file cập nhật sau mỗi write thành công.
-- **New log format:** `A(html): 15 recs (ky≤162488) +1 new` | `B(ajax): 15 recs (ky≤162472) +0 new`
 
 ### Server — Stability Fixes
-- **Crawl interval 12s → 60s:** Bingo18 draws ~5–6 phút/kỳ. 12s gây rate-limiting xoso.net.vn → 2h data gap. 60s đủ nhanh (5–6× margin), giảm request volume 5×.
-- **Bỏ startup `crawlSince(lastKy, 50)`:** Cũ làm 50+ AJAX requests ngay khi boot, có thể trigger rate-limit và block crawl loop. Thay bằng **1 crawl đơn giản** tại startup để catch-up.
-- **Consecutive fail counter:** `_consecutiveCrawlFails` tăng khi cả 2 source đều trả rỗng trong operating hours. Cảnh báo log sau 5 ticks liên tiếp (~5 phút không có data).
-- **Health endpoint bổ sung:** `lastSuccessfulCrawlAt`, `crawlLagMs`, `consecutiveCrawlFails` — dễ debug khi data đứng im.
-- **Graceful shutdown (SIGTERM/SIGINT):** Đóng tất cả SSE client trước khi exit → Fly deploy không để client stuck.
-- **Stats TRAIN_CAP:** 10k → 5k records/slice để giảm memory spike (OOM risk trên 1GB Fly VM với 44k+ records).
-- **Security headers:** `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`.
-- **Deep recovery:** Giảm từ 30 pages → 10 pages (gentle, max 150 kỳ fill mỗi lần).
-
-### Data Recovery
-- **44,728 records** (tăng từ 41,903): Filled các gap lớn từ thời kỳ server offline:
-  - ky 159638→160710: +1,055 kỳ (Apr 6–10 gap)
-  - ky 111878–118440: +1,748 kỳ (old historical gaps)
-- Các gap ~81 kỳ đều là **overnight gaps** (21:54–06:00 VN, ~8.1h × 10draws/h ≈ 81 kỳ) — bình thường, không phải lỗi.
+- **Crawl interval 12s → 60s:** 12s gây rate-limiting xoso.net.vn → 2h data gap. 60s đủ nhanh (5–6× margin), giảm request 5×.
+- **Bỏ startup `crawlSince(lastKy, 50)`:** Thay bằng 1 crawl đơn giản tại startup.
+- **Consecutive fail counter + Health fields:** `lastSuccessfulCrawlAt`, `crawlLagMs`, `consecutiveCrawlFails`.
+- **Graceful shutdown:** SIGTERM/SIGINT đóng SSE clients sạch.
+- **Stats TRAIN_CAP:** 10k → 5k records/slice (OOM prevention).
+- **Security headers:** `X-Content-Type-Options`, `X-Frame-Options`.
 
 ---
 
@@ -36,15 +48,18 @@ Hệ thống **phân tích thống kê** Bingo18 dùng **5-model Ensemble** — 
 
 ```
 Mỗi 60 giây (06:00–22:00 VN):
-  ┌─ Source A: HTML page (xoso.net.vn/xs-bingo-18.html)
-  │   Thời gian: ~700ms | Dữ liệu: kỳ mới nhất | Cache-busted với ?_t=timestamp
-  └─ Source B: AJAX API  (xoso.net.vn/XSDienToan/GetKetQuaBinGo18More)
-      Thời gian: ~200ms | Dữ liệu: lag 10–15 kỳ | Nhanh hơn nhưng stale hơn
+  ┌─ Source A [PRIORITY]: vietlott.vn/...winning-number-bingo18
+  │   Thời gian: ~800ms | Dữ liệu: 6 kỳ mới nhất | Nguồn chính thức
+  └─ Source B [BACKUP]: xoso.net.vn/xs-bingo-18.html
+      Thời gian: ~700ms | Dữ liệu: 15 kỳ + HH:MM drawTime
 
-  → Cả hai fire đồng thời
-  → B về trước (~200ms): merge() ngay → ghi vào history.json
-  → A về sau (~700ms): merge() tiếp → bổ sung các kỳ mới mà B chưa có
-  → Kết quả: luôn có union đầy đủ nhất có thể trong 1 tick
+  → Cả hai fire đồng thời (Promise.allSettled)
+  → Source nào về trước → queuedMerge() ngay → ghi vào history.json
+  → Source còn lại → merge tiếp, bổ sung recs còn thiếu / enrich drawTime
+  → Kết quả: luôn có union đầy đủ nhất
+
+  Historical (crawlAll / crawlSince — chạy thủ công):
+    xoso.net.vn AJAX API — phân trang /pageIndex=N, lag OK vì không cần realtime
 ```
 
 ---
