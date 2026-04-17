@@ -323,7 +323,7 @@ async function crawlAll(maxPages = 100) {
       }
       const result = await merge(records)
       totalAdded += result.added
-  process.stdout.write(`  page ${String(page).padStart(3)}: +${result.added} new | total: ${result.total}\r`)
+      process.stdout.write(`  page ${String(page).padStart(3)}: +${result.added} new | total: ${result.total}\r`)
       await new Promise(r => setTimeout(r, 400))
     } catch (err) {
       console.error(`\n[crawlAll] page ${page} error: ${err.message}`)

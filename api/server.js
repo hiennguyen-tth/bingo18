@@ -224,22 +224,17 @@ function buildPredictPayload(data) {
   const { top10, tripleSignal, effectiveWeights, verdict } = predict.ranked(data)
   const top10Total = top10.reduce((s, r) => s + r.score, 0) || 1
 
-  // Use true max/min across all scores (not positional, since rebalanceTripleRanks
-  // can reorder top-10 so top10[0] is not necessarily the highest-scoring combo).
-  const allScores = top10.map(r => r.score)
-  const trueMaxScore = allScores.length ? Math.max(...allScores) : 1
-  const trueMinScore = allScores.length ? Math.min(...allScores) : 0
-  const scoreSpread = trueMaxScore - trueMinScore
+  // top10Total used for pct normalisation. max/min/spread no longer needed
+  // (rankStrength comes from scoreRankPct computed across 216 combos in ensemble.js).
 
-  const next = top10.map((r, idx) => ({
+  const next = top10.map((r) => ({
     combo: r.combo,
-    score: +r.score.toFixed(3),
+    score: +r.score.toFixed(5),
     pct: +(r.score / top10Total * 100).toFixed(1),
-    // Rank-based confidence fallback when scores are nearly uniform (spread < 0.005):
-    //   all combos have score≈0.5 → no meaningful score differentiation → use rank position.
-    confidence: scoreSpread < 0.005
-      ? Math.max(35, Math.round(80 - idx * 5))   // 80%, 75%, …, 35% by rank
-      : Math.round(35 + ((r.score - trueMinScore) / scoreSpread) * 45),
+    // rankStrength: percentile of this combo in the full 216-combo score distribution.
+    // 100 = top-ranked across all combos; 0 = bottom. Replaces the old "confidence"
+    // label which implied a win probability — misleading for a near-random game.
+    rankStrength: r.scoreRankPct ?? 50,
     overdueRatio: r.overdueRatio != null ? +r.overdueRatio.toFixed(2) : null,
     comboGap: r.comboGap,
     sumOD: +(r.sumOD ?? 0).toFixed(2),
@@ -250,6 +245,7 @@ function buildPredictPayload(data) {
     mk2Norm: r.mk2Norm ?? 0,
     sessNorm: r.sessNorm ?? 0,
     mlNorm: r.mlNorm ?? 0,
+    gbmNorm: r.gbmNorm ?? 0,
     coreNorm: r.coreNorm ?? 0,  // legacy compat
     chiNorm: 0,
   }))
@@ -269,7 +265,7 @@ function buildPredictPayload(data) {
     total: data.length,
     latestKy: latestRecord?.ky ?? null,
     latestDrawTime: latestRecord?.drawTime ?? null,
-    maxScore: +trueMaxScore.toFixed(3)
+    maxScore: next.length ? +Math.max(...next.map(r => r.score)).toFixed(5) : 0
   }
 }
 

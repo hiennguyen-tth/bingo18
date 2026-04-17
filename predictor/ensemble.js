@@ -525,8 +525,11 @@ function tripleBoostMult(chron) {
   }
   const EXPECTED_GAP = 36     // 1-in-36 draws is a triple
   const ratio = sinceTriple / EXPECTED_GAP
-  if (ratio <= 1.0) return 1.0
-  return Math.min(1.020, 1 + (ratio - 1.0) * 0.005)
+  // Threshold raised to 1.2 (20% beyond average): ignores normal variance,
+  // only fires when gap is clearly overdue. Slope 0.008 gives ~1.5% boost at
+  // ratio=2.0 and caps at 3.0% — enough to move a triple 3–5 rank positions.
+  if (ratio <= 1.2) return 1.0
+  return Math.min(1.030, 1 + (ratio - 1.2) * 0.008)
 }
 
 // ── ENSEMBLE ──────────────────────────────────────────────────────────────
@@ -539,8 +542,14 @@ function ensembleAll(chron, now) {
   const statRes = runStatTests(chron)
 
   // Direction 3+4: Bayesian shrink via signal confidence derived from p-values.
-  //   no_pattern (sigCount=0) → shrink=0 → kill A, B, D; fallback to session+GBM+uniform
-  //   weak/strong pattern     → shrink ∝ min(p-values): continuous ramp 0.5 → 1.0
+  //   no_pattern (sigCount=0) → shrink=MIN_SHRINK → A,B,D contribute at floor level
+  //   weak/strong pattern     → shrink ∝ min(p-values): continuous ramp MIN_SHRINK → 1.0
+  //
+  // MIN_SHRINK prevents any active model from being zeroed out entirely.
+  // Without the floor, no_pattern zeroed wA/wB/wD leaving only wC (sess=0.05) active
+  // → effectiveWeights showed sess=100% while all scores clustered at ~0.475.
+  const MIN_SHRINK = 0.30
+
   const sigCount = [
     statRes.chiSquare.significant,
     statRes.autocorr.significant,
@@ -549,14 +558,14 @@ function ensembleAll(chron, now) {
 
   let shrink
   if (sigCount === 0) {
-    shrink = 0.0   // no detectable pattern: wA=wB=wD effectively zeroed
+    shrink = MIN_SHRINK   // floor: stat/mk2/knn still contribute; session+GBM retain full weight
   } else {
     const pVals = [statRes.chiSquare, statRes.autocorr, statRes.runs]
       .filter(t => t.pValue !== null)
       .map(t => t.pValue)
     const pMin = Math.min(...pVals)
-    // pMin≈0.05 → shrink≈1.0;  pMin≈0.49 → shrink→0.5 (clamped minimum)
-    shrink = Math.max(0.5, Math.min(1.0, (0.5 - pMin) / 0.45))
+    // pMin≈0.05 → shrink≈1.0;  pMin≈0.49 → shrink→MIN_SHRINK (clamped minimum)
+    shrink = Math.max(MIN_SHRINK, Math.min(1.0, (0.5 - pMin) / 0.45))
   }
 
   const { scores: rawA, zMap, gapMeta } = modelA(chron)  // gapMeta built in same O(N) pass
@@ -650,6 +659,16 @@ function ensembleAll(chron, now) {
       }
     }
 
+    // ── Pattern-type Bayesian prior ─────────────────────────────────────────
+    // Per-combo base-rate is 1/216 for all types (IID uniform).
+    // However the overdue triple signal boosts all 6 triple combos simultaneously
+    // → mild dampener prevents triple over-representation at the top without
+    //   breaking the legitimate triple boost when sinceTriple >> 36.
+    // triple (6 combos): −10%  pair (90 combos): −5%  normal (120 combos): +3%
+    if (pat === 'triple') score *= 0.90
+    else if (pat === 'pair') score *= 0.95
+    else score *= 1.03
+
     results[k] = {
       combo: k,
       pat,
@@ -667,7 +686,26 @@ function ensembleAll(chron, now) {
     }
   }
 
-  // Compute score range across all 216 combos for confidence normalization
+  // ── Temperature softmax: sharpen score distribution ───────────────────────
+  // Problem: sigmoid outputs cluster at 0.46–0.48 (spread ≈0.02) when weights are
+  // small, making combo ranking nearly arbitrary (noise-driven tie-breaks).
+  // Fix: softmax with SOFTMAX_SCALE amplifies score differences before normalising,
+  // converting raw scores into P(combo k = next draw) with visible discrimination.
+  // Rank order is preserved (softmax is monotone) — only spread changes.
+  // SOFTMAX_SCALE=20: at raw spread=0.016, top/bottom ratio becomes ~2.4×.
+  const SOFTMAX_SCALE = 20
+  let expTotal = 0
+  const expMap = {}
+  for (const r of Object.values(results)) {
+    const e = Math.exp(r.score * SOFTMAX_SCALE)
+    expMap[r.combo] = e
+    expTotal += e
+  }
+  for (const r of Object.values(results)) {
+    r.score = expMap[r.combo] / expTotal
+  }
+
+  // Compute score percentile across all 216 combos (used for rankStrength in UI)
   const allScores = Object.values(results).map(r => r.score)
   const scoreMin = Math.min(...allScores)
   const scoreMax = Math.max(...allScores)

@@ -19,7 +19,7 @@ function fmtTime(iso) {
 }
 
 function predsSignature(preds, latestKy) {
-  return `${latestKy || '0'}::${preds.map(p => `${p.combo}:${p.score}:${p.confidence}`).join('|')}`
+  return `${latestKy || '0'}::${preds.map(p => `${p.combo}:${p.score}:${p.rankStrength}`).join('|')}`
 }
 
 function historySignature(records) {
@@ -63,7 +63,7 @@ function getRankingBadge(rank, zScore, sessNorm, isUniform) {
   return { label: '⚠️ OK', color: '#9D8DF1', bg: 'rgba(157,141,241,0.13)', border: 'rgba(157,141,241,0.4)' }
 }
 
-const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability, zScore, statNorm, mk2Norm, sessNorm, confidence: confFromServer, calBuckets, isUniform }) {
+const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxScore, overdueRatio, comboGap, pat, stability, zScore, statNorm, mk2Norm, sessNorm, rankStrength: confFromServer, calBuckets, isUniform }) {
   const nums = combo.split('-')
   const badge = getRankingBadge(rank, zScore, sessNorm, isUniform)
   // Calibrated hit rate at this rank position from walk-forward backtest
@@ -169,7 +169,7 @@ const PredCard = memo(function PredCard({ combo, pct, rank, maxPct, score, maxSc
       {/* Row 5: calibrated hit rate (replaces misleading confidence %) */}
       <div>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#64748b', marginBottom: 4 }}>
-          <span>{calHitPct != null ? 'lịch sử' : 'confidence'}{calHitPct != null && <span style={{ color: '#475569', fontWeight: 400 }}> (backtest)</span>}</span>
+          <span>{calHitPct != null ? 'lịch sử' : 'rank strength'}{calHitPct != null && <span style={{ color: '#475569', fontWeight: 400 }}> (backtest)</span>}</span>
           <span style={{ color: calHitPct != null ? '#34d399' : badge.color, fontWeight: 700 }}>{calHitPct != null ? `${calHitPct}%` : displayConf != null ? `${displayConf}%` : '—'}</span>
         </div>
         <div style={{ height: 5, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden' }}>
@@ -1267,7 +1267,7 @@ function App() {
                 pat={p.pat} stability={p.stability}
                 zScore={p.zScore} statNorm={p.statNorm ?? p.coreNorm}
                 mk2Norm={p.mk2Norm} sessNorm={p.sessNorm}
-                confidence={p.confidence} calBuckets={stats?.calBuckets}
+                rankStrength={p.rankStrength} calBuckets={stats?.calBuckets}
                 isUniform={!!modelContrib?._uniform} />
             ))}
           </div>

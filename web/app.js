@@ -23,7 +23,7 @@ function fmtTime(iso) {
   return `${hh}:${mi} ${dd}/${mo}/${yy}`;
 }
 function predsSignature(preds, latestKy) {
-  return `${latestKy || '0'}::${preds.map(p => `${p.combo}:${p.score}:${p.confidence}`).join('|')}`;
+  return `${latestKy || '0'}::${preds.map(p => `${p.combo}:${p.score}:${p.rankStrength}`).join('|')}`;
 }
 function historySignature(records) {
   if (!records || records.length === 0) return '0';
@@ -201,7 +201,7 @@ const PredCard = memo(function PredCard({
   statNorm,
   mk2Norm,
   sessNorm,
-  confidence: confFromServer,
+  rankStrength: confFromServer,
   calBuckets,
   isUniform
 }) {
@@ -402,7 +402,7 @@ const PredCard = memo(function PredCard({
       color: '#64748b',
       marginBottom: 4
     }
-  }, /*#__PURE__*/React.createElement("span", null, calHitPct != null ? 'lịch sử' : 'confidence', calHitPct != null && /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("span", null, calHitPct != null ? 'lịch sử' : 'rank strength', calHitPct != null && /*#__PURE__*/React.createElement("span", {
     style: {
       color: '#475569',
       fontWeight: 400
@@ -2237,7 +2237,7 @@ function App() {
     statNorm: p.statNorm ?? p.coreNorm,
     mk2Norm: p.mk2Norm,
     sessNorm: p.sessNorm,
-    confidence: p.confidence,
+    rankStrength: p.rankStrength,
     calBuckets: stats?.calBuckets,
     isUniform: !!modelContrib?._uniform
   })))), overdue && /*#__PURE__*/React.createElement("div", {
