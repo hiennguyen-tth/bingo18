@@ -1394,7 +1394,7 @@ const DrawPivotTable = memo(function DrawPivotTable({
       color: '#334155',
       marginLeft: 4
     }
-  }, total.toLocaleString(), " k\u1EF3 t\u1ED5ng \xB7 159 k\u1EF3/ng\xE0y \xB7 ", dates.length, " ng\xE0y"), /*#__PURE__*/React.createElement("div", {
+  }, history.length, " / ", total.toLocaleString(), " k\u1EF3 \xB7 159 k\u1EF3/ng\xE0y \xB7 ", dates.length, " ng\xE0y"), /*#__PURE__*/React.createElement("div", {
     style: {
       marginLeft: isMobile ? 0 : 'auto',
       width: isMobile ? '100%' : 'auto',
@@ -1566,13 +1566,18 @@ const DrawPivotTable = memo(function DrawPivotTable({
 /* ─────────────────────────── NewDrawToast ──────────────────────────────── */
 function NewDrawToast({
   info,
-  onDismiss
+  onDismiss,
+  onRefresh
 }) {
   useEffect(() => {
-    const t = setTimeout(onDismiss, 6_000);
+    const t = setTimeout(onDismiss, 12_000);
     return () => clearTimeout(t);
   }, [info]);
   if (!info) return null;
+  const handleRefresh = () => {
+    onRefresh();
+    onDismiss();
+  };
   return /*#__PURE__*/React.createElement("div", {
     style: {
       position: 'fixed',
@@ -1586,13 +1591,11 @@ function NewDrawToast({
       padding: '14px 20px',
       boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
       border: '1px solid rgba(52,211,153,0.4)',
-      maxWidth: 320,
-      width: 'min(320px, calc(100vw - 24px))',
+      maxWidth: 340,
+      width: 'min(340px, calc(100vw - 24px))',
       marginLeft: 'auto',
-      animation: 'fadeIn 0.3s ease',
-      cursor: 'pointer'
-    },
-    onClick: onDismiss
+      animation: 'fadeIn 0.3s ease'
+    }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
       fontWeight: 800,
@@ -1602,9 +1605,39 @@ function NewDrawToast({
   }, "\uD83C\uDFAF K\u1EF3 m\u1EDBi! #", info.latestKy), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 12,
-      opacity: 0.85
+      opacity: 0.85,
+      marginBottom: 10
     }
-  }, "+", info.added, " k\u1EF3 v\u1EEBa m\u1EDF th\u01B0\u1EDFng \u2014 d\u1EF1 \u0111o\xE1n \u0111\xE3 c\u1EADp nh\u1EADt"));
+  }, "+", info.added, " k\u1EF3 v\u1EEBa m\u1EDF th\u01B0\u1EDFng \u2014 nh\u1EA5n \u0111\u1EC3 xem k\u1EBFt qu\u1EA3 m\u1EDBi"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: handleRefresh,
+    style: {
+      flex: 1,
+      background: 'rgba(52,211,153,0.25)',
+      border: '1px solid rgba(52,211,153,0.5)',
+      color: '#ecfdf5',
+      borderRadius: 8,
+      padding: '6px 0',
+      cursor: 'pointer',
+      fontSize: 12,
+      fontWeight: 700
+    }
+  }, "\u21BB C\u1EADp nh\u1EADt ngay"), /*#__PURE__*/React.createElement("button", {
+    onClick: onDismiss,
+    style: {
+      background: 'rgba(255,255,255,0.1)',
+      border: '1px solid rgba(255,255,255,0.2)',
+      color: '#ecfdf5',
+      borderRadius: 8,
+      padding: '6px 12px',
+      cursor: 'pointer',
+      fontSize: 12
+    }
+  }, "B\u1ECF qua")));
 }
 
 /* ─────────────────────────── SumPredPanel ─────────────────────────────── */
@@ -1771,7 +1804,7 @@ function App() {
       const [pRaw, hRaw, sumRaw] = await Promise.all([fetch('/predict', {
         cache: 'no-cache',
         headers: predH
-      }), fetch('/history?limit=1000', {
+      }), fetch('/history?limit=800', {
         headers: histH
       }), fetch('/predict-sum', {
         cache: 'no-cache'
@@ -1869,15 +1902,10 @@ function App() {
         if (!mounted) return;
         const info = JSON.parse(e.data);
         setLiveKy(info.latestKy);
+        // Show toast only — user clicks "↻ Cập nhật ngay" to force-refresh.
+        // Auto-rerender on every draw causes jarring mid-session updates;
+        // the 60s polling is already a silent safety net.
         setToast(info);
-        // Force full refresh after a confirmed new draw event.
-        predETagRef.current = null;
-        histETagRef.current = null;
-        overdueETagRef.current = null;
-        statsETagRef.current = null;
-        loadRef.current(true);
-        loadStatsRef.current();
-        loadOverdueRef.current();
       });
       es.onerror = () => {
         if (!mounted) return;
@@ -1930,7 +1958,16 @@ function App() {
     style: C.app
   }, /*#__PURE__*/React.createElement(NewDrawToast, {
     info: toast,
-    onDismiss: () => setToast(null)
+    onDismiss: () => setToast(null),
+    onRefresh: () => {
+      predETagRef.current = null;
+      histETagRef.current = null;
+      overdueETagRef.current = null;
+      statsETagRef.current = null;
+      loadRef.current(true);
+      loadStatsRef.current();
+      loadOverdueRef.current();
+    }
   }), /*#__PURE__*/React.createElement("div", {
     style: C.header
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
@@ -2247,7 +2284,14 @@ function App() {
       ...C.label,
       marginBottom: 14
     }
-  }, "L\u1ECBch s\u1EED theo gi\u1EDD (", total.toLocaleString(), " k\u1EF3)"), /*#__PURE__*/React.createElement(DrawPivotTable, {
+  }, "L\u1ECBch s\u1EED theo gi\u1EDD", /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 400,
+      textTransform: 'none',
+      color: '#475569',
+      marginLeft: 8
+    }
+  }, "(hi\u1EC3n th\u1ECB ", history.length.toLocaleString(), " / ", total.toLocaleString(), " k\u1EF3)")), /*#__PURE__*/React.createElement(DrawPivotTable, {
     history: history,
     total: total
   })), sumStats.length > 0 && /*#__PURE__*/React.createElement("div", {

@@ -712,7 +712,7 @@ const DrawPivotTable = memo(function DrawPivotTable({ history, total }) {
             borderRadius: 6, padding: isMobile ? '4px 9px' : '4px 11px', cursor: 'pointer', fontSize: isMobile ? 10 : 11,
           }}>{l}</button>
         ))}
-        <span style={{ fontSize: isMobile ? 10 : 11, color: '#334155', marginLeft: 4 }}>{total.toLocaleString()} kỳ tổng · 159 kỳ/ngày · {dates.length} ngày</span>
+        <span style={{ fontSize: isMobile ? 10 : 11, color: '#334155', marginLeft: 4 }}>{history.length} / {total.toLocaleString()} kỳ · 159 kỳ/ngày · {dates.length} ngày</span>
         <div style={{ marginLeft: isMobile ? 0 : 'auto', width: isMobile ? '100%' : 'auto', display: 'flex', gap: 10, fontSize: 10, color: '#64748b', flexWrap: 'wrap', alignItems: 'center' }}>
           {[['rgba(251,191,36,0.40)', 'HOA'], ['rgba(125,211,252,0.35)', 'Đôi'], ['rgba(251,113,133,0.35)', 'Same Tổng'], ['rgba(167,139,250,0.35)', 'Same Đôi']].map(([c, l]) => (
             <span key={l} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -782,13 +782,16 @@ const DrawPivotTable = memo(function DrawPivotTable({ history, total }) {
 })
 
 /* ─────────────────────────── NewDrawToast ──────────────────────────────── */
-function NewDrawToast({ info, onDismiss }) {
+function NewDrawToast({ info, onDismiss, onRefresh }) {
   useEffect(() => {
-    const t = setTimeout(onDismiss, 6_000)
+    const t = setTimeout(onDismiss, 12_000)
     return () => clearTimeout(t)
   }, [info])
 
   if (!info) return null
+
+  const handleRefresh = () => { onRefresh(); onDismiss() }
+
   return (
     <div style={{
       position: 'fixed', top: 18, right: 12, left: 12, zIndex: 9999,
@@ -796,14 +799,25 @@ function NewDrawToast({ info, onDismiss }) {
       color: '#ecfdf5', borderRadius: 12, padding: '14px 20px',
       boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
       border: '1px solid rgba(52,211,153,0.4)',
-      maxWidth: 320, width: 'min(320px, calc(100vw - 24px))', marginLeft: 'auto', animation: 'fadeIn 0.3s ease',
-      cursor: 'pointer',
-    }} onClick={onDismiss}>
+      maxWidth: 340, width: 'min(340px, calc(100vw - 24px))', marginLeft: 'auto', animation: 'fadeIn 0.3s ease',
+    }}>
       <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 4 }}>
         🎯 Kỳ mới! #{info.latestKy}
       </div>
-      <div style={{ fontSize: 12, opacity: 0.85 }}>
-        +{info.added} kỳ vừa mở thưởng — dự đoán đã cập nhật
+      <div style={{ fontSize: 12, opacity: 0.85, marginBottom: 10 }}>
+        +{info.added} kỳ vừa mở thưởng — nhấn để xem kết quả mới
+      </div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button onClick={handleRefresh} style={{
+          flex: 1, background: 'rgba(52,211,153,0.25)', border: '1px solid rgba(52,211,153,0.5)',
+          color: '#ecfdf5', borderRadius: 8, padding: '6px 0', cursor: 'pointer',
+          fontSize: 12, fontWeight: 700,
+        }}>↻ Cập nhật ngay</button>
+        <button onClick={onDismiss} style={{
+          background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)',
+          color: '#ecfdf5', borderRadius: 8, padding: '6px 12px', cursor: 'pointer',
+          fontSize: 12,
+        }}>Bỏ qua</button>
       </div>
     </div>
   )
@@ -926,7 +940,7 @@ function App() {
       const histH = histETagRef.current ? { 'If-None-Match': histETagRef.current } : {}
       const [pRaw, hRaw, sumRaw] = await Promise.all([
         fetch('/predict', { cache: 'no-cache', headers: predH }),
-        fetch('/history?limit=1000', { headers: histH }),
+        fetch('/history?limit=800', { headers: histH }),
         fetch('/predict-sum', { cache: 'no-cache' }),
       ])
 
@@ -1020,15 +1034,10 @@ function App() {
         if (!mounted) return
         const info = JSON.parse(e.data)
         setLiveKy(info.latestKy)
+        // Show toast only — user clicks "↻ Cập nhật ngay" to force-refresh.
+        // Auto-rerender on every draw causes jarring mid-session updates;
+        // the 60s polling is already a silent safety net.
         setToast(info)
-        // Force full refresh after a confirmed new draw event.
-        predETagRef.current = null
-        histETagRef.current = null
-        overdueETagRef.current = null
-        statsETagRef.current = null
-        loadRef.current(true)
-        loadStatsRef.current()
-        loadOverdueRef.current()
       })
 
       es.onerror = () => {
@@ -1084,7 +1093,15 @@ function App() {
 
   return (
     <div style={C.app}>
-      <NewDrawToast info={toast} onDismiss={() => setToast(null)} />
+      <NewDrawToast info={toast} onDismiss={() => setToast(null)} onRefresh={() => {
+        predETagRef.current = null
+        histETagRef.current = null
+        overdueETagRef.current = null
+        statsETagRef.current = null
+        loadRef.current(true)
+        loadStatsRef.current()
+        loadOverdueRef.current()
+      }} />
 
       {/* ── Header ── */}
       <div style={C.header}>
@@ -1277,7 +1294,12 @@ function App() {
 
         {/* ── Daily schedule pivot table (replaces flat history list) ── */}
         <div style={{ ...C.card, marginBottom: 28 }}>
-          <div style={{ ...C.label, marginBottom: 14 }}>Lịch sử theo giờ ({total.toLocaleString()} kỳ)</div>
+          <div style={{ ...C.label, marginBottom: 14 }}>
+            Lịch sử theo giờ
+            <span style={{ fontWeight: 400, textTransform: 'none', color: '#475569', marginLeft: 8 }}>
+              (hiển thị {history.length.toLocaleString()} / {total.toLocaleString()} kỳ)
+            </span>
+          </div>
           <DrawPivotTable history={history} total={total} />
         </div>
 

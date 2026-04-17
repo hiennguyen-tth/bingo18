@@ -4,12 +4,13 @@
  * Fetches Bingo18 results from TWO independent sources simultaneously.
  *
  * Strategy ("crawl 2 web cùng lúc — web nào tới trước thì ghi vào history"):
- *   Source A: xoso.net.vn HTML page  — freshest data, published instantly (~600–900ms)
- *   Source B: xoso.net.vn AJAX API   — fast backup, server-cached (~150–300ms, may lag 10–15 kỳ)
+ *   Source A: vietlott.vn (official)   — PRIORITY. Published instantly after each draw.
+ *             HTML table, ~6 most-recent draws per page load. Always authoritative.
+ *   Source B: xoso.net.vn HTML page   — backup. Shows ~15 draws, published quickly.
  *
  *   Both fire in parallel via a write-queue so each source merges to disk as soon as it
  *   resolves — no waiting for the other. The slower source fills any gaps left by the faster.
- *   Result: always gets the freshest AND most complete set of draws in one tick.
+ *   AJAX endpoint kept only for crawlAll() / crawlSince() historical bulk pagination.
  *
  * CLI Modes:
  *   node crawler/crawl.js               – one-shot dual-source run
@@ -27,11 +28,12 @@ const FILE = path.join(__dirname, '../dataset/history.json')
 const BACKUP_FILE = `${FILE}.bak`
 
 // ── Source URLs ────────────────────────────────────────────────────────────
-// Source A (HTML): always contains the absolute latest kỳ (published instantly).
-//   Cache-busted with ?_t=timestamp. Larger payload (~122KB), ~700ms avg.
-// Source B (AJAX): server-cached, much faster (~200ms) but lags 10–15 kỳ behind.
-//   Fast backup: gets older-but-certain draws immediately.
+// Source A (PRIORITY): official Vietlott results — published immediately after each draw.
+//   HTML table with up to 6 most-recent draws. No drawTime (date only), but authoritative.
+const VIETLOTT_URL = 'https://vietlott.vn/vi/trung-thuong/ket-qua-trung-thuong/winning-number-bingo18'
+// Source B: xoso.net.vn HTML page — backup, ~15 draws, includes HH:MM drawTime.
 const HTML_URL = 'https://xoso.net.vn/xs-bingo-18.html'
+// Historical pagination only (crawlAll / crawlSince) — NOT used in real-time run().
 const AJAX_URL = 'https://xoso.net.vn/XSDienToan/GetKetQuaBinGo18More'
 
 // ── Write serialization queue ──────────────────────────────────────────────
@@ -136,29 +138,56 @@ function parseBlocks($) {
   return results
 }
 
-/** Source A: HTML live page — always has the absolute latest kỳ, published instantly. */
+/** Parse draw records from the Vietlott results table.
+ *  Rows: <td>dd/MM/yyyy #0162535</td> <td><span class="bong_tron_bingo small">N</span>…</td> <td>sum</td>
+ */
+function parseVietlott($) {
+  const results = []
+  $('table.table-hover tbody tr').each((_, row) => {
+    const tds = $(row).find('td')
+    if (tds.length < 3) return  // skip header / empty rows
+
+    // Ky: "#0162535" → strip leading zeros → "162535"
+    const kyMatch = $(tds[0]).text().match(/#(\d+)/)
+    if (!kyMatch) return
+    const ky = String(parseInt(kyMatch[1], 10))
+
+    // Date: "17/04/2026" → ISO (no time from vietlott, use midnight VN)
+    const dateText = $(tds[0]).find('a').first().text().trim()
+    const dm = dateText.match(/(\d{2})\/(\d{2})\/(\d{4})/)
+    const drawTime = dm ? `${dm[3]}-${dm[2]}-${dm[1]}T00:00:00+07:00` : null
+
+    // Balls from <span class="bong_tron_bingo small">
+    const balls = []
+    $(tds[1]).find('.bong_tron_bingo').each((_, el) => {
+      const v = parseInt($(el).text().trim(), 10)
+      if (v >= 1 && v <= 6) balls.push(v)
+    })
+    if (balls.length < 3) return
+    const [n1, n2, n3] = balls
+    results.push({ id: makeId(ky, n1, n2, n3), ky, drawTime, n1, n2, n3, sum: n1 + n2 + n3, pattern: classify(n1, n2, n3) })
+  })
+  return results
+}
+
+/** Source A (priority): vietlott.vn official — fastest publication, authoritative. */
+async function fetchVietlott() {
+  try {
+    const r = await axios.get(`${VIETLOTT_URL}?nocache=${Date.now()}`, { timeout: 12_000, headers: HEADERS })
+    return parseVietlott(cheerio.load(r.data))
+  } catch (err) {
+    console.warn(`[crawl] A(vietlott) failed: ${err.message}`)
+    return []
+  }
+}
+
+/** Source B: xoso.net.vn HTML — backup, includes HH:MM drawTime for history quality. */
 async function fetchHtml() {
   try {
     const r = await axios.get(`${HTML_URL}?_t=${Date.now()}`, { timeout: 12_000, headers: HEADERS })
     return parseBlocks(cheerio.load(r.data))
   } catch (err) {
-    console.warn(`[crawl] A(html) failed: ${err.message}`)
-    return []
-  }
-}
-
-/** Source B: AJAX page-1 — server-cached, fastest (~200ms), may lag 10–15 kỳ. */
-async function fetchAjax() {
-  try {
-    const r = await axios.get(AJAX_URL, {
-      params: { pageIndex: 1, _t: Date.now() },
-      timeout: 10_000,
-      headers: HEADERS,
-    })
-    if (!r.data || r.data.trim().length < 50) return []
-    return parseBlocks(cheerio.load(r.data))
-  } catch (err) {
-    console.warn(`[crawl] B(ajax) failed: ${err.message}`)
+    console.warn(`[crawl] B(html) failed: ${err.message}`)
     return []
   }
 }
@@ -232,20 +261,20 @@ async function run() {
   let htmlResult = null
   let ajaxResult = null
 
-  // Source A: start HTML fetch and merge as soon as it resolves.
-  const pA = fetchHtml().then(async (recs) => {
+  // Source A (priority): vietlott.vn — official source, fire first.
+  const pA = fetchVietlott().then(async (recs) => {
     if (recs.length === 0) return
     htmlResult = await queuedMerge(recs)
     const maxKy = Math.max(...recs.map(r => Number(r.ky)))
-    console.log(`[crawl] A(html): ${recs.length} recs (ky≤${maxKy}) +${htmlResult.added} new`)
+    console.log(`[crawl] A(vietlott): ${recs.length} recs (ky≤${maxKy}) +${htmlResult.added} new`)
   }).catch(err => console.warn('[crawl] source A error:', err.message))
 
-  // Source B: start AJAX fetch and merge as soon as it resolves (likely first).
-  const pB = fetchAjax().then(async (recs) => {
+  // Source B: xoso.net.vn HTML — includes drawTime (HH:MM) to enrich existing records.
+  const pB = fetchHtml().then(async (recs) => {
     if (recs.length === 0) return
     ajaxResult = await queuedMerge(recs)
     const maxKy = Math.max(...recs.map(r => Number(r.ky)))
-    console.log(`[crawl] B(ajax): ${recs.length} recs (ky≤${maxKy}) +${ajaxResult.added} new`)
+    console.log(`[crawl] B(html): ${recs.length} recs (ky≤${maxKy}) +${ajaxResult.added} new`)
   }).catch(err => console.warn('[crawl] source B error:', err.message))
 
   // Wait for both to complete (each has already written independently).
