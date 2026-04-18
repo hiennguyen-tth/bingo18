@@ -609,6 +609,20 @@ const DrawPivotTable = memo(function DrawPivotTable({ refreshKey = 0, onSelect }
       .catch(e => { setError(e.message); setLoading(false) })
   }, [days, refreshKey])
 
+  // Silent auto-reload every 60s during operating hours (no loading indicator)
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.hidden) return
+      const vnMin = ((new Date().getUTCHours() + 7) % 24) * 60 + new Date().getUTCMinutes()
+      if (vnMin < 360 || vnMin > 1320) return  // 06:00–22:00 VN only
+      fetch(`/api/history-grid?days=${days}&_t=${Date.now()}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d) setGridData(d) })
+        .catch(() => { })
+    }, 60_000)
+    return () => clearInterval(timer)
+  }, [days])
+
   const DAY_VN = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7']
   function fmtDateHdr(ds) {
     const [y, mo, dd] = ds.split('-').map(Number)
@@ -619,8 +633,8 @@ const DrawPivotTable = memo(function DrawPivotTable({ refreshKey = 0, onSelect }
   function cellBg(cell) {
     const { sum, pattern } = cell
     if (pattern === 'triple') return 'rgba(255,215,0,0.30)'   // gold override for HOA
-    if (sum <= 9) return 'rgba(147,197,253,0.12)'              // low sum → subtle blue
-    if (sum >= 12) return 'rgba(253,186,116,0.12)'             // high sum → subtle warm
+    if (sum <= 9) return 'rgba(96,165,250,0.22)'               // low sum → blue (brighter)
+    if (sum >= 12) return 'rgba(251,146,60,0.22)'              // high sum → orange (brighter)
     return ''                                                   // 10/11 → neutral (no bg)
   }
 
@@ -895,6 +909,261 @@ const SumPredPanel = memo(function SumPredPanel({ data }) {
   )
 })
 
+/* ─────────────── HoaForecastBlock (block-based Hoa prediction) ─────────── */
+const PATTERN_LABELS = { 111: '⚪ 111', 222: '🟢 222', 333: '🔵 333', 444: '🟡 444', 555: '🟣 555', 666: '🔴 666' }
+const PATTERN_COLORS = { 111: '#e2e8f0', 222: '#4ade80', 333: '#60a5fa', 444: '#fbbf24', 555: '#c084fc', 666: '#f87171' }
+
+const HoaForecastBlock = memo(function HoaForecastBlock() {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [view, setView] = useState('hourly')  // 'hourly' | 'streak' | 'detail'
+  const [isMobile, setIsMobile] = useState((typeof window !== 'undefined') ? window.innerWidth < 720 : false)
+
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth < 720)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  useEffect(() => {
+    fetch('/api/hoa-forecast')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d) setData(d); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [])
+
+  if (loading) return <div style={{ padding: '16px 0', color: '#475569', fontSize: 13, textAlign: 'center' }}>Đang tải dự báo HOA...</div>
+  if (!data || !data.blocks || data.blocks.length === 0) return null
+
+  const { hourly, blockHotness, patternStreaks, totalPeriods, days, computedAt } = data
+
+  // Current VN hour for highlighting
+  const vnNowH = ((new Date().getUTCHours() + 7) % 24)
+
+  // Find hot hours (top 3 by hoaPct)
+  const sortedHours = hourly ? [...hourly].sort((a, b) => b.hoaPct - a.hoaPct) : []
+  const hotHourBlocks = new Set(sortedHours.slice(0, 3).filter(h => h.hoaPct > 1.5).map(h => h.block))
+
+  // Status badges for streaks
+  const streakBadge = (status) => {
+    if (status === 'hot') return { label: '🔥 ĐANG NỔ MẠNH', color: '#f87171', bg: 'rgba(248,113,113,0.15)', border: 'rgba(248,113,113,0.4)' }
+    if (status === 'warm') return { label: '⚡ ĐANG NỔ', color: '#fbbf24', bg: 'rgba(251,191,36,0.12)', border: 'rgba(251,191,36,0.35)' }
+    if (status === 'cold') return { label: '❄️ ĐANG NGHỈ', color: '#60a5fa', bg: 'rgba(96,165,250,0.12)', border: 'rgba(96,165,250,0.35)' }
+    return { label: '○ BÌNH THƯỜNG', color: '#94a3b8', bg: 'rgba(148,163,184,0.08)', border: 'rgba(148,163,184,0.25)' }
+  }
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+        <div style={{ fontSize: 10, color: '#6366f1', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+          🌸 Dự báo HOA theo Block (30 ngày · {totalPeriods} kỳ)
+          <span style={{ color: '#475569', fontWeight: 400, textTransform: 'none', marginLeft: 8 }}>
+            · Cập nhật: {computedAt ? new Date(computedAt).toLocaleDateString('vi-VN') : '—'}
+          </span>
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {[['hourly', 'Theo giờ'], ['streak', 'Chuỗi HOA'], ['detail', 'Chi tiết']].map(([v, l]) => (
+            <button key={v} onClick={() => setView(v)} style={{
+              background: view === v ? 'rgba(99,102,241,0.22)' : 'rgba(255,255,255,0.04)',
+              color: view === v ? '#a5b4fc' : '#475569',
+              border: view === v ? '1px solid rgba(99,102,241,0.45)' : '1px solid rgba(255,255,255,0.08)',
+              borderRadius: 6, padding: '3px 10px', cursor: 'pointer', fontSize: 11,
+            }}>{l}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Block Hotness Bar */}
+      {blockHotness && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 10, color: '#475569', marginBottom: 6, fontWeight: 600 }}>Tỷ lệ HOA theo giờ — khung vàng = giờ dễ nổ HOA nhất</div>
+          <div style={{ display: 'flex', gap: 2, alignItems: 'flex-end', height: 48, flexWrap: 'nowrap', overflowX: 'auto' }}>
+            {Object.entries(blockHotness).sort(([a], [b]) => +a - +b).map(([h, pct]) => {
+              const maxH = Math.max(...Object.values(blockHotness), 1)
+              const barH = Math.max(4, (pct / maxH) * 40)
+              const isCurrent = +h === vnNowH
+              const isHot = hotHourBlocks.has(+h)
+              return (
+                <div key={h} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flex: '1 1 0', minWidth: isMobile ? 18 : 24 }}>
+                  <div style={{ fontSize: 7, color: isHot ? '#fbbf24' : 'transparent', marginBottom: 1, fontWeight: 700 }}>{pct > 0 ? pct + '%' : ''}</div>
+                  <div style={{
+                    width: '100%', maxWidth: isMobile ? 18 : 28, height: barH, borderRadius: 3,
+                    background: isCurrent ? '#6366f1' : isHot ? 'rgba(251,191,36,0.7)' : pct > 2 ? 'rgba(251,191,36,0.35)' : 'rgba(255,255,255,0.12)',
+                    border: isCurrent ? '2px solid #818cf8' : isHot ? '1px solid rgba(251,191,36,0.6)' : 'none',
+                    transition: 'height 0.3s',
+                  }} title={`${h}h: ${pct}% HOA`} />
+                  <span style={{ fontSize: 8, color: isCurrent ? '#a5b4fc' : isHot ? '#fbbf24' : '#475569', marginTop: 2, fontWeight: isHot ? 700 : 400 }}>{h}</span>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Hourly Summary View — actual stats */}
+      {view === 'hourly' && hourly && (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                {['Giờ', 'Tổng kỳ', 'HOA xuất hiện', 'Tỷ lệ HOA', 'HOA phổ biến nhất', 'HOA chưa ra', 'Mức độ'].map(h => (
+                  <th key={h} style={{ padding: isMobile ? '6px 4px' : '8px 12px', textAlign: 'left', color: '#64748b', fontSize: isMobile ? 9 : 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {hourly.map(row => {
+                const isCurrent = row.block === vnNowH
+                const isHot = hotHourBlocks.has(row.block)
+                const hot = row.hoaPct
+                const levelColor = hot >= 4 ? '#f87171' : hot >= 3 ? '#fbbf24' : hot >= 2 ? '#818cf8' : '#475569'
+                const levelLabel = hot >= 4 ? '🔥 Rất nóng' : hot >= 3 ? '⚡ Nóng' : hot >= 2 ? '○ TB' : '· Thấp'
+                return (
+                  <tr key={row.block} style={{
+                    borderBottom: '1px solid rgba(255,255,255,0.04)',
+                    background: isCurrent ? 'rgba(99,102,241,0.10)' : isHot ? 'rgba(251,191,36,0.06)' : 'transparent',
+                  }}>
+                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px', fontWeight: 700, color: isCurrent ? '#a5b4fc' : isHot ? '#fbbf24' : '#e2e8f0', whiteSpace: 'nowrap' }}>
+                      {String(row.block).padStart(2, '0')}:00
+                      {isCurrent && <span style={{ fontSize: 9, color: '#6366f1', marginLeft: 4 }}>◀</span>}
+                      {isHot && !isCurrent && <span style={{ fontSize: 9, marginLeft: 4 }}>🔥</span>}
+                    </td>
+                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px', color: '#94a3b8' }}>{row.totalDraws}</td>
+                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px', fontWeight: 700, color: row.totalHoa > 0 ? '#fbbf24' : '#475569' }}>
+                      {row.totalHoa} lần
+                    </td>
+                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px', minWidth: isMobile ? 60 : 100 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <div style={{ flex: 1, height: 6, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden', maxWidth: isMobile ? 50 : 80 }}>
+                          <div style={{ width: `${Math.min(hot * 12, 100)}%`, height: '100%', background: hot >= 3 ? '#fbbf24' : hot >= 2 ? '#818cf8' : '#334155', borderRadius: 3, transition: 'width 0.3s' }} />
+                        </div>
+                        <span style={{ fontSize: 11, color: hot >= 3 ? '#fbbf24' : '#94a3b8', fontWeight: 700, minWidth: 34 }}>{hot}%</span>
+                      </div>
+                    </td>
+                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px' }}>
+                      <span style={{ color: PATTERN_COLORS[row.topPattern] || '#e2e8f0', fontWeight: 700 }}>
+                        {PATTERN_LABELS[row.topPattern] || row.topPattern}
+                      </span>
+                      <span style={{ fontSize: 9, color: '#64748b', marginLeft: 4 }}>({row.topPatternCount} lần)</span>
+                    </td>
+                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px' }}>
+                      {row.missingPatterns && row.missingPatterns.length > 0 ? (
+                        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                          {row.missingPatterns.map(p => (
+                            <span key={p} style={{ color: PATTERN_COLORS[p] || '#e2e8f0', fontWeight: 600, fontSize: 11, background: 'rgba(255,255,255,0.06)', borderRadius: 4, padding: '1px 5px' }}>
+                              {p}
+                            </span>
+                          ))}
+                        </div>
+                      ) : (
+                        <span style={{ fontSize: 10, color: '#4ade80' }}>✓ Đủ</span>
+                      )}
+                    </td>
+                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px' }}>
+                      <span style={{ fontSize: 10, color: levelColor, fontWeight: 600 }}>{levelLabel}</span>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Streak View — HOA pattern streak analysis */}
+      {view === 'streak' && patternStreaks && (
+        <div>
+          <div style={{ fontSize: 10, color: '#475569', marginBottom: 10 }}>Chuỗi ngày liên tiếp có HOA xuất hiện (30 ngày gần nhất)</div>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(2, 1fr)', gap: 8 }}>
+            {patternStreaks.map(ps => {
+              const badge = streakBadge(ps.status)
+              return (
+                <div key={ps.pattern} style={{
+                  background: badge.bg, border: `1px solid ${badge.border}`,
+                  borderRadius: 10, padding: '12px 14px',
+                  display: 'flex', alignItems: 'center', gap: 12,
+                }}>
+                  <div style={{ fontSize: 24, fontWeight: 900, color: PATTERN_COLORS[ps.pattern], minWidth: 50, textAlign: 'center' }}>
+                    {ps.pattern}
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: badge.color, marginBottom: 3 }}>
+                      {badge.label}
+                      {ps.streak > 0 && <span style={{ fontWeight: 400, marginLeft: 4 }}>— chuỗi {ps.streak} ngày liên</span>}
+                    </div>
+                    <div style={{ fontSize: 10, color: '#64748b' }}>
+                      Tổng: {ps.totalCount} lần / 30 ngày · TB {ps.avgPerDay}/ngày
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Detail View — show each period's top-3 patterns + missing */}
+      {view === 'detail' && (
+        <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: isMobile ? 400 : 500 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.08)', position: 'sticky', top: 0, background: '#1e293b', zIndex: 2 }}>
+                {['Kỳ', 'Giờ', 'Top 1', 'Top 2', 'Top 3', 'HOA chưa ra'].map(h => (
+                  <th key={h} style={{ padding: isMobile ? '6px 6px' : '8px 10px', textAlign: 'center', color: '#64748b', fontSize: 10, fontWeight: 700, textTransform: 'uppercase' }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {data.blocks.map((b, idx) => {
+                const top3 = b.scores.slice(0, 3)
+                const missing = b.missingPatterns || []
+                return (
+                  <tr key={idx} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                    <td style={{ padding: isMobile ? '4px 4px' : '5px 10px', textAlign: 'center', color: '#64748b', fontSize: 11 }}>{b.period}</td>
+                    <td style={{ padding: isMobile ? '4px 4px' : '5px 10px', textAlign: 'center', color: '#94a3b8', fontWeight: 600, fontSize: 11 }}>{b.time}</td>
+                    {top3.map((s, j) => (
+                      <td key={j} style={{ padding: isMobile ? '4px 4px' : '5px 10px', textAlign: 'center' }}>
+                        <span style={{ color: PATTERN_COLORS[s.pattern] || '#e2e8f0', fontWeight: j === 0 ? 700 : 400, fontSize: isMobile ? 11 : 12 }}>
+                          {s.pattern}
+                        </span>
+                        <span style={{ fontSize: 9, color: '#475569', marginLeft: 3 }}>{s.prob}%</span>
+                      </td>
+                    ))}
+                    <td style={{ padding: isMobile ? '4px 4px' : '5px 10px', textAlign: 'center' }}>
+                      {missing.length > 0 ? (
+                        <span style={{ display: 'inline-flex', gap: 3, flexWrap: 'wrap', justifyContent: 'center' }}>
+                          {missing.slice(0, 3).map(p => (
+                            <span key={p} style={{ color: PATTERN_COLORS[p] || '#e2e8f0', fontSize: 10, fontWeight: 600, background: 'rgba(255,255,255,0.06)', borderRadius: 3, padding: '1px 4px' }}>{p}</span>
+                          ))}
+                          {missing.length > 3 && <span style={{ fontSize: 9, color: '#475569' }}>+{missing.length - 3}</span>}
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: 9, color: '#4ade80' }}>✓</span>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Legend */}
+      <div style={{ display: 'flex', gap: isMobile ? 6 : 10, marginTop: 10, fontSize: 10, color: '#64748b', flexWrap: 'wrap' }}>
+        {Object.entries(PATTERN_LABELS).map(([k, v]) => (
+          <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+            <span style={{ display: 'inline-block', width: 8, height: 8, background: PATTERN_COLORS[k], borderRadius: '50%' }} />
+            <span style={{ color: PATTERN_COLORS[k] }}>{v}</span>
+          </span>
+        ))}
+        <span style={{ color: '#475569' }}>· % = tỷ lệ kỳ có HOA trong khung giờ đó</span>
+      </div>
+    </div>
+  )
+})
+
 /* ─────────────────────────── App ──────────────────────────────────────── */
 function App() {
   const [preds, setPreds] = useState([])
@@ -984,13 +1253,12 @@ function App() {
     try {
       const predH = predETagRef.current ? { 'If-None-Match': predETagRef.current } : {}
       const histH = histETagRef.current ? { 'If-None-Match': histETagRef.current } : {}
-      const [pRaw, hRaw, sumRaw] = await Promise.all([
+      const [pRaw, hRaw] = await Promise.all([
         fetch('/predict', { cache: 'no-cache', headers: predH }),
         fetch('/history?limit=800', { headers: histH }),
-        fetch('/predict-sum', { cache: 'no-cache' }),
       ])
 
-      // Both unchanged — nothing to do, skip all state updates
+      // predict 304 + history 304 — truly nothing changed
       if (pRaw.status === 304 && hRaw.status === 304) return
 
       if (pRaw.status !== 304 && !pRaw.ok) throw new Error(`API ${pRaw.status}`)
@@ -1024,6 +1292,8 @@ function App() {
         setSumStats(pRes.sumStats || [])
         setTotal(pRes.total || 0)
         setUpdated(new Date().toLocaleTimeString('vi-VN'))
+        // Sum prediction — bundled in /predict, updates atomically
+        if (pRes.sumPrediction) setSumPreds(pRes.sumPrediction)
       }
       if (hRes) {
         const etag = hRaw.headers.get('ETag')
@@ -1034,10 +1304,6 @@ function App() {
           historyRef.current = nextSig
           setHistory(newHistory)
         }
-      }
-      // Sum prediction response
-      if (sumRaw.ok) {
-        try { setSumPreds(await sumRaw.json()) } catch (_) { }
       }
     } catch (e) {
       setError(e.message)
@@ -1398,6 +1664,11 @@ function App() {
           <div style={{ padding: '18px 20px' }}>
             <DrawPivotTable refreshKey={pivotRefreshCount} onSelect={setHlHistoryCombo} />
           </div>
+        </div>
+
+        {/* ── Hoa Block Forecast ── */}
+        <div style={{ ...C.card, marginBottom: 28 }}>
+          <HoaForecastBlock />
         </div>
 
         {/* ── Sum distribution (visible on all screen sizes) ── */}

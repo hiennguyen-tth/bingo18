@@ -190,6 +190,7 @@ function withCache(key, ttlMs, fn) {
       const etag = `"${hit.ts}"`
       res.set('X-Cache', 'HIT')
       res.set('ETag', etag)
+      res.set('Cache-Control', 'private, no-cache')
       res.set('Last-Modified', new Date(hit.ts).toUTCString())
       if (req.headers['if-none-match'] === etag) return res.status(304).end()
       return res.json(hit.data)
@@ -199,6 +200,7 @@ function withCache(key, ttlMs, fn) {
       apiCache.set(key, { data, ts: now })
       res.set('X-Cache', 'MISS')
       res.set('ETag', `"${now}"`)
+      res.set('Cache-Control', 'private, no-cache')
       res.set('Last-Modified', new Date(now).toUTCString())
       res.json(data)
     } catch (err) {
@@ -262,12 +264,16 @@ function buildPredictPayload(data) {
     .map(([sum, cnt]) => ({ sum: +sum, pct: +(cnt / data.length * 100).toFixed(2) }))
     .sort((a, b) => b.pct - a.pct)
 
+  // Include sum prediction in the same payload — atomic update, no separate cache needed
+  const sumPrediction = predict.predictSum(data)
+
   return {
     next,
     tripleSignal,
     modelContrib: effectiveWeights,
     verdict: verdict || 'no_pattern',
     sumStats,
+    sumPrediction,
     total: data.length,
     latestKy: latestKyRecord?.ky ?? null,
     latestDrawTime: latestKyRecord?.drawTime ?? null,
@@ -616,6 +622,253 @@ app.get('/predict', withCache('predict', 5 * 60_000,
 app.get('/predict-sum', withCache('predict-sum', 5 * 60_000,
   async () => predict.predictSum(await loadHistory())
 ))
+
+/**
+ * GET /api/hoa-forecast — Hoa (triple) block-based forecast for tomorrow.
+ * Analyses 30 days of history grouped into hourly blocks (0–23).
+ * Combines block probability, global probability, momentum, and cooldown.
+ * Computed once per day (after last draw ~22:00 VN) and cached until next day.
+ */
+let _hoaForecastCache = null
+let _hoaForecastDate = ''  // 'YYYY-MM-DD' VN date when cache was computed
+
+app.get('/api/hoa-forecast', async (_req, res) => {
+  try {
+    // VN date string for today
+    const vnNow = new Date(Date.now() + 7 * 3600_000)
+    const vnDateStr = vnNow.toISOString().slice(0, 10)
+    const vnHour = vnNow.getUTCHours()
+
+    // Serve cache if same date (or next-day before 06:00 — no new data yet)
+    if (_hoaForecastCache && _hoaForecastDate === vnDateStr) {
+      res.set('X-Cache', 'HIT')
+      return res.json(_hoaForecastCache)
+    }
+
+    const data = await loadHistory()
+    // Last 30 days
+    const cutoff = new Date(Date.now() - 30 * 24 * 3600_000)
+    const recent30 = data.filter(r => r.drawTime && new Date(r.drawTime) >= cutoff)
+
+    if (recent30.length < 100) {
+      return res.json({ blocks: [], error: 'insufficient data', total: recent30.length })
+    }
+
+    const PATTERNS = [111, 222, 333, 444, 555, 666]
+
+    // Extract features
+    function getBlockIndex(drawTime) {
+      const d = new Date(drawTime)
+      return (d.getUTCHours() + 7) % 24  // VN hour
+    }
+
+    function extractHoa(item) {
+      const digits = [item.n1, item.n2, item.n3]
+      const hoa = []
+      if (digits[0] === digits[1] && digits[1] === digits[2]) {
+        hoa.push(digits[0] * 111)
+      }
+      return hoa
+    }
+
+    // Build block stats
+    const blockStats = {}
+    const globalStats = { total: 0, patternCount: {} }
+
+    for (const item of recent30) {
+      const block = getBlockIndex(item.drawTime)
+      const hoa = extractHoa(item)
+
+      if (!blockStats[block]) {
+        blockStats[block] = { total: 0, patternCount: {}, lastSeen: {} }
+      }
+      const stat = blockStats[block]
+      stat.total++
+      globalStats.total++
+
+      hoa.forEach(p => {
+        stat.patternCount[p] = (stat.patternCount[p] || 0) + 1
+        stat.lastSeen[p] = new Date(item.drawTime).getTime()
+        globalStats.patternCount[p] = (globalStats.patternCount[p] || 0) + 1
+      })
+    }
+
+    // Momentum: recent 7 days vs previous 7 days
+    const now = Date.now()
+    const recentCutoff = now - 7 * 24 * 3600_000
+    const pastCutoff = now - 14 * 24 * 3600_000
+    const recentData = recent30.filter(r => new Date(r.drawTime).getTime() >= recentCutoff)
+    const pastData = recent30.filter(r => {
+      const t = new Date(r.drawTime).getTime()
+      return t >= pastCutoff && t < recentCutoff
+    })
+
+    function getFreq(subset, block, pattern) {
+      let total = 0, count = 0
+      for (const item of subset) {
+        if (getBlockIndex(item.drawTime) !== block) continue
+        total++
+        const hoa = extractHoa(item)
+        if (hoa.includes(pattern)) count++
+      }
+      return total > 0 ? count / total : 0
+    }
+
+    function probPatternInBlock(block, pattern) {
+      const stat = blockStats[block]
+      if (!stat) return 0
+      return ((stat.patternCount[pattern] || 0) + 1) / (stat.total + 6)
+    }
+
+    function probGlobal(pattern) {
+      return ((globalStats.patternCount[pattern] || 0) + 1) / (globalStats.total + 6)
+    }
+
+    function momentum(block, pattern) {
+      return getFreq(recentData, block, pattern) - getFreq(pastData, block, pattern)
+    }
+
+    function cooldown(block, pattern) {
+      const last = blockStats[block]?.lastSeen?.[pattern]
+      if (!last) return 1
+      const diff = now - last
+      return Math.min(diff / (1000 * 60 * 60 * 24), 1)
+    }
+
+    function scoreCalc(block, pattern) {
+      return (
+        0.5 * probPatternInBlock(block, pattern)
+        + 0.2 * probGlobal(pattern)
+        + 0.2 * Math.max(0, momentum(block, pattern))
+        + 0.1 * cooldown(block, pattern)
+      )
+    }
+
+    function normalize(scores) {
+      const sum = scores.reduce((s, x) => s + x.score, 0)
+      if (sum === 0) return scores.map(x => ({ ...x, prob: 0 }))
+      return scores.map(x => ({ ...x, prob: +(x.score / sum * 100).toFixed(1) }))
+    }
+
+    // Generate 159 periods for tomorrow (06:00–21:54, every 6 min)
+    const tomorrow = new Date(vnNow)
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1)
+    tomorrow.setUTCHours(6 - 7, 0, 0, 0)  // 06:00 VN = 23:00 UTC prev day
+    const startTime = tomorrow.getTime()
+
+    const blocks = []
+    for (let i = 0; i < 159; i++) {
+      const time = startTime + i * 6 * 60 * 1000
+      const d = new Date(time)
+      const block = (d.getUTCHours() + 7) % 24
+      const hhmm = `${String(block).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`
+
+      const scores = PATTERNS.map(p => ({
+        pattern: p,
+        score: scoreCalc(block, p),
+      }))
+
+      const normalized = normalize(scores)
+      normalized.sort((a, b) => b.prob - a.prob)
+
+      blocks.push({
+        time: hhmm,
+        block,
+        period: i + 1,
+        scores: normalized,
+        missingPatterns: PATTERNS.filter(p => !(blockStats[block]?.patternCount[p] > 0)),
+      })
+    }
+
+    // Aggregate by hour for summary view — use ACTUAL historical stats
+    const hourly = {}
+    for (let h = 6; h <= 21; h++) {
+      const stat = blockStats[h]
+      if (!stat) continue
+      const totalDraws = stat.total
+      const totalHoa = Object.values(stat.patternCount).reduce((s, v) => s + v, 0)
+      const hoaPct = totalDraws > 0 ? +(totalHoa / totalDraws * 100).toFixed(2) : 0
+      // Per-pattern breakdown sorted by count desc
+      const patternBreakdown = PATTERNS.map(p => ({
+        pattern: p,
+        count: stat.patternCount[p] || 0,
+      })).sort((a, b) => b.count - a.count)
+      const topPattern = patternBreakdown[0]
+
+      hourly[h] = {
+        block: h,
+        totalDraws,
+        totalHoa,
+        hoaPct,
+        topPattern: topPattern.pattern,
+        topPatternCount: topPattern.count,
+        patternBreakdown,
+        missingPatterns: PATTERNS.filter(p => !(stat.patternCount[p] > 0)),
+      }
+    }
+
+    // Streak info for each pattern (consecutive days with HOA)
+    const patternStreaks = {}
+    for (const p of PATTERNS) {
+      // Group by date, check consecutive days with this pattern
+      const dateHas = new Set()
+      for (const item of recent30) {
+        const hoa = extractHoa(item)
+        if (hoa.includes(p)) {
+          const d = new Date(item.drawTime)
+          const dateStr = new Date(d.getTime() + 7 * 3600_000).toISOString().slice(0, 10)
+          dateHas.add(dateStr)
+        }
+      }
+      // Count streak from today backwards
+      let streak = 0
+      const today = new Date(Date.now() + 7 * 3600_000)
+      for (let i = 0; i < 30; i++) {
+        const checkDate = new Date(today)
+        checkDate.setUTCDate(checkDate.getUTCDate() - i)
+        const ds = checkDate.toISOString().slice(0, 10)
+        if (dateHas.has(ds)) streak++
+        else break
+      }
+      const totalCount = globalStats.patternCount[p] || 0
+      patternStreaks[p] = {
+        pattern: p,
+        streak,
+        totalCount,
+        avgPerDay: +(totalCount / 30).toFixed(1),
+        status: streak >= 4 ? 'hot' : streak >= 2 ? 'warm' : streak === 0 ? 'cold' : 'normal',
+      }
+    }
+
+    // Block hotness: total hoa appearances / total periods per block
+    const blockHotness = {}
+    for (let h = 6; h <= 21; h++) {
+      const stat = blockStats[h]
+      if (!stat) { blockHotness[h] = 0; continue }
+      const totalHoa = Object.values(stat.patternCount).reduce((s, v) => s + v, 0)
+      blockHotness[h] = stat.total > 0 ? +(totalHoa / stat.total * 100).toFixed(2) : 0
+    }
+
+    const payload = {
+      blocks,
+      hourly: Object.values(hourly).sort((a, b) => a.block - b.block),
+      blockHotness,
+      patternStreaks: Object.values(patternStreaks).sort((a, b) => b.streak - a.streak),
+      totalPeriods: recent30.length,
+      days: 30,
+      computedAt: new Date().toISOString(),
+    }
+
+    _hoaForecastCache = payload
+    _hoaForecastDate = vnDateStr
+
+    res.set('X-Cache', 'MISS')
+    res.json(payload)
+  } catch (err) {
+    console.error('[/api/hoa-forecast]', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
 
 /** GET /predict-hierarchical — P1 hierarchical prediction.
  *  Step 1: predict sum → top-{sumFilter} buckets.

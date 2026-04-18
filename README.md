@@ -99,6 +99,31 @@ Mỗi 60 giây:
 
 ---
 
+## v19 Changes (2026-04-18)
+
+### 🌸 HOA Forecast — Dự báo Hoa theo block giờ
+- **Endpoint `/api/hoa-forecast`**: Phân tích 30 ngày lịch sử, nhóm theo block giờ (06–21h).
+- **Block scoring**: Mỗi block giờ × kỳ được chấm điểm dự báo từ: base-rate, recency, Markov transition, hourly bias, streak bonus/penalty. Softmax → xác suất 6 pattern HOA (111–666).
+- **Hourly summary**: Hiển thị **tổng kỳ, số lần HOA thực tế, tỷ lệ %** cho mỗi khung giờ — thay thế "10/10 kỳ" cũ (bug hiển thị predicted count thay vì actual). Top 3 giờ nóng nhất được highlight 🔥.
+- **Chuỗi HOA (streak view)**: Phân tích chuỗi ngày liên tiếp có HOA cho mỗi pattern. Hiển thị trạng thái: 🔥 ĐANG NỔ MẠNH (≥4 ngày), ⚡ ĐANG NỔ (≥2 ngày), ❄️ ĐANG NGHỈ (0 ngày).
+- **Hotness bar**: Bar chart trực quan tỷ lệ HOA theo giờ, highlight giờ hiện tại (tím) và giờ nóng (vàng).
+- **3 tab view**: Theo giờ | Chuỗi HOA | Chi tiết (top-3 pattern/kỳ).
+
+### UI — Cải thiện màu sắc & trải nghiệm
+- **Sum color contrast**: `cellBg()` tăng opacity từ 0.12 → 0.22 cho cả low-sum (blue) và high-sum (orange). Dùng `rgb(96,165,250)` (blue) và `rgb(251,146,60)` (orange) — dễ phân biệt hơn trên dark theme.
+- **Cache-busting**: Bump `?v=20260418c` cho immutable JS files.
+
+---
+
+## v18 Changes (2026-04-18)
+
+### 🌸 HOA Forecast — Backend foundation
+- **`/api/hoa-forecast` endpoint**: 30-day analysis, block-level scoring, daily cache.
+- **Auto-reload**: DrawPivotTable (lịch sử) tự reload mỗi 60s (silent, không flash).
+- **Sum prediction fix**: `load()` xử lý `sumRaw` trước khi check 304 → sum không còn bị stuck.
+
+---
+
 ## v14 Changes (2026-04-17)
 
 ### Crawl — thêm vietlott.vn (nguồn chính thức ưu tiên)
