@@ -1,12 +1,77 @@
 # Bingo18 Analyzer
 
-Hệ thống **phân tích thống kê** Bingo18 dùng **5-model Ensemble** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học**. Crawler dùng **dual-source race** (vietlott.vn ưu tiên + xoso.net.vn song song, source nào về trước ghi vào history trước), phục vụ qua REST API + Dashboard React, deploy trên Fly.io.
+Hệ thống **phân tích thống kê** Bingo18 dùng **5-model Ensemble** — normalize từng model về `[0, 1]`, kết hợp qua **sigmoid với trọng số đã học**. Crawler dùng **triple-source parallel** (vietlott.vn + xoso.net.vn + bingo18.top song song), phục vụ qua REST API + Dashboard React + Bảng lịch sử theo khung giờ, deploy trên Fly.io.
 
 > **Production:** https://xs-bingo18.fly.dev
 
 ---
 
-## v15 Changes (current — 2026-04-17)
+## v18 Changes (current — 2026-04-18)
+
+### UI — Tab Navigation + Cache Busting
+- **Tab nav bar** trên section "Lịch sử theo giờ": Tab active "📊 Lịch sử theo giờ" + link "↗ Bảng đầy đủ" → `/history-table` + link "🏆 Loto 5/35" → `https://lotto535.fly.dev` (ở phải).
+- **Header buttons**: `📅 Lịch sử` → `/history-table` (indigo) + `🏆 Loto 5/35` → `https://lotto535.fly.dev` (green gradient, `target="_blank"`).
+- **Cache busting**: Script tags trong `index.html` có `?v=20260418` để force browser refresh sau deploy.
+- **DrawPivotTable**: Fetch từ `/api/history-grid` (canonical 160 slots 06:00–21:54), không dùng raw history records. Ball colors match `history.html` (purple=HOA, blue=Pair, orange=Normal). Cell colors theo sum/pattern.
+
+### Crawler — Source C (bingo18.top) already running in parallel
+- Source C `https://bingo18.top/data/data.json` đã chạy song song với Source A/B từ v16.
+- Cung cấp `drawAt` full timestamp (HH:MM), faster update ~1 min, không cần auth.
+- Khi deploy: 3 sources (A+B+C) fire parallel; C thường về sớm nhất vì không bị 403.
+
+---
+
+## v17 Changes (2026-04-17)
+
+### Canonical 6-minute Slot System
+- **`canonicalSlotInfo(drawTime)`**: Hàm chuẩn hóa mọi timestamp về khung giờ canonical 6 phút — từ 06:00 đến 21:54 VN (UTC+7). 160 slots/ngày. Formula: `slotIndex = Math.round((totalMin - 360) / 6)`, `canonMin = 360 + slotIndex * 6`. Trả `{ slot: "HH:MM", date: "YYYY-MM-DD" }` hoặc `null` nếu ngoài giờ.
+- **Crawler merge() rewritten**: Thay vì match bằng exact minute + ball comparison (dễ miss khi Source C offset 1-5 phút), giờ match bằng canonical slot + ngày. Source C records (không có kỳ) được merge chính xác với Source A/B records.
+- **History-grid API**: Dùng `canonicalSlotInfo()` — trả đúng 160 slots canonical (06:00, 06:06, ..., 21:54), không còn 474 slots rải rác.
+- **DrawPivotTable (frontend)**: Snap về canonical slot thay vì dùng raw HH:MM.
+
+### Data Deduplication
+- **`scripts/dedup.js` rewritten**: Group records theo canonical slot+ngày. Loại bỏ no-ky records trùng slot với ky-records. Kết quả: **50,108 → 45,881 records** (loại 4,227 duplicates từ Source C).
+- **Dry-run mode**: `node scripts/dedup.js` (preview) / `node scripts/dedup.js --write` (apply). Auto-backup `.pre-dedup.bak`.
+
+### History Page Improvements
+- **Default 5 ngày** (thay vì 14) — tập trung dữ liệu gần nhất.
+- **Empty cells**: Near-invisible styling (`border-color: rgba(255,255,255,0.03)`, dot `·` cùng màu background) — nhìn chuyên nghiệp hơn, không bị khoảng trống.
+
+### UI — History Navigation Button
+- **Gradient button** trong header-actions: `📅 Lịch sử` với `background: linear-gradient(135deg, #6366f1, #818cf8)`, white text, box-shadow. Dễ thấy, dễ navigate.
+
+### Backtest Coverage Increase
+- **Stats `_computeStatsBackground()`**: Target 500 test windows (thay vì 150), start từ 20% data (thay vì 30%). Kết quả: ~350+ tests thay vì ~106.
+
+---
+
+## v16 Changes (2026-04-17)
+
+### Crawl — Triple Source (thêm bingo18.top)
+- **Source C: bingo18.top** (`/data/data.json`) — public JSON ~627KB, 7000+ records, cập nhật ~1 phút/lần. Cung cấp `drawAt` (ISO HH:MM), `winningResult` (3-digit string). Không có số kỳ (ky).
+- **`parseBingo18Top(raw)`:** Parse `raw.gbingoDraws[]`, validate từng ball 1–6 (dùng `Number.isInteger`), tính sum/pattern, gán SHA1 id `dt-${drawTime}-${balls}`.
+- **`fetchBingo18Top()`:** GET `https://bingo18.top/data/data.json` với 15s timeout.
+- **`merge()` nâng cấp:** Xử lý `_srcC=true` records — match bằng `bySlot` map (YYYY-MM-DDTHH:MM + balls), patch `drawTime` trên records hiện tại nếu có T00:00:00 (date-only từ Vietlott).
+- **`--seed-c` CLI flag:** One-shot import toàn bộ history từ bingo18.top (`node crawler/crawl.js --seed-c`). Dùng sau deploy để patch timestamps cũ.
+- **`run()` → triple Promise.allSettled:** pA (Vietlott), pB (xoso), pC (bingo18top) fire song song. Sort kết hợp: ky-desc > ky first > drawTime-desc.
+
+### Frontend — Bảng lịch sử theo khung giờ
+- **`/history-table`** — trang lịch sử mới (file `web/history.html`), hiển thị bảng slot×ngày giống bingo18.top.
+  - Hàng = khung giờ (HH:MM), cột = ngày (YYYY-MM-DD), cell = 3 bi với màu.
+  - Click cell để highlight tất cả cell có cùng combo (order-independent).
+  - Footer rows: HOA (triple), x40, x12, x20.
+  - Auto-refresh 60s trong 06:00–22:00. Scroll đến slot hiện tại khi load.
+- **Nav link** trong header React app: `📅 Lịch sử` → `/history-table`.
+
+### API — `/api/history-grid`
+- **`GET /api/history-grid?days=N`** (N: 3–60, default 15): Trả `{ slots, dates, cells, days, total, generated }`.
+  - Bỏ qua records có `drawTime` chứa `T00:00:00` (date-only từ Vietlott, chưa có HH:MM).
+  - Timezone fix: `d.getTime() + 7 * 3600_000` (không dùng `getTimezoneOffset()` — sai khi server ở VN).
+  - Cache 60s in-memory với ETag support.
+
+---
+
+## v15 Changes (2026-04-17)
 
 ### Crawl — Vietlott AjaxPro + xoso fallback
 
@@ -77,14 +142,16 @@ Mỗi 60 giây:
 Mỗi 60 giây (06:00–22:00 VN):
   ┌─ Source A [PRIORITY]: vietlott.vn/...winning-number-bingo18
   │   Thời gian: ~800ms | Dữ liệu: 6 kỳ mới nhất | Nguồn chính thức
-  │   ⚠ 403 từ Fly.io Singapore → im lặng, xoso cover
-  └─ Source B [BACKUP]: xoso.net.vn/xs-bingo-18.html
-      Thời gian: ~700ms | Dữ liệu: 15 kỳ + HH:MM drawTime
+  │   ⚠ 403 từ Fly.io Singapore → im lặng, xoso + bingo18top cover
+  ├─ Source B [BACKUP]:   xoso.net.vn/xs-bingo-18.html
+  │   Thời gian: ~700ms | Dữ liệu: 15 kỳ + HH:MM drawTime
+  └─ Source C [TIMESTAMP]: bingo18.top/data/data.json
+      Thời gian: ~300ms | Dữ liệu: 7000+ records, ISO HH:MM timestamps
 
-  → Cả hai fire đồng thời (Promise.allSettled)
-  → Source nào về trước → queuedMerge() ngay → ghi vào history.json
-  → Source còn lại → merge tiếp, bổ sung recs còn thiếu / enrich drawTime
-  → Kết quả: luôn có union đầy đủ nhất
+  → Cả ba fire đồng thời (Promise.allSettled)
+  → merge() xử lý _srcC records: match theo canonical 6-min slot+ngày (v17)
+  → Seed-C: node crawler/crawl.js --seed-c (import bulk từ bingo18.top)
+  → Dedup: node scripts/dedup.js --write (loại duplicate cross-source)
 
   Historical (crawlAll / crawlSince — gap recovery tự động mỗi 10 phút):
     crawlPage(n) → Try: Vietlott AjaxPro (POST /ajaxpro/..., 6/page, từ VN)

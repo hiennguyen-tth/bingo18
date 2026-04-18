@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bảng Lịch Sử Bingo18 — Kết Quả Theo Khung Giờ</title>
+    <meta name="description"
+        content="Bảng kết quả Bingo18 theo khung giờ và ngày. Tra cứu lịch sử kết quả xổ số 36D, hoa (triple), x40, x12, x20 mỗi ngày." />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="https://xs-bingo18.fly.dev/history-table" />
+    <style>
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+        }
+
+        /* ── Header ── */
+        .header {
+            background: linear-gradient(135deg, #1e1b4b 0%, #312e81 100%);
+            padding: 14px 20px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            border-bottom: 1px solid rgba(99, 102, 241, 0.3);
+            flex-wrap: wrap;
+        }
+
+        .logo {
+            font-size: 20px;
+            font-weight: 800;
+            color: #a5b4fc;
+            text-decoration: none;
+        }
+
+        .nav {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .nav a {
+            font-size: 13px;
+            color: #94a3b8;
+            text-decoration: none;
+            padding: 4px 10px;
+            border-radius: 6px;
+            transition: background 0.15s, color 0.15s;
+        }
+
+        .nav a:hover,
+        .nav a.active {
+            background: rgba(99, 102, 241, 0.25);
+            color: #a5b4fc;
+        }
+
+        .controls {
+            margin-left: auto;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .select-days {
+            background: #1e293b;
+            border: 1px solid rgba(99, 102, 241, 0.4);
+            color: #e2e8f0;
+            border-radius: 8px;
+            padding: 5px 10px;
+            font-size: 13px;
+            cursor: pointer;
+        }
+
+        .btn-refresh {
+            background: #6366f1;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            padding: 6px 14px;
+            font-size: 13px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+
+        .btn-refresh:hover {
+            opacity: 0.85;
+        }
+
+        /* ── Status bar ── */
+        .status-bar {
+            padding: 6px 20px;
+            font-size: 12px;
+            color: #64748b;
+            background: #0f172a;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            display: flex;
+            gap: 16px;
+            align-items: center;
+        }
+
+        .status-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #22c55e;
+            display: inline-block;
+            margin-right: 4px;
+        }
+
+        .status-dot.stale {
+            background: #f59e0b;
+        }
+
+        /* ── Table container ── */
+        .table-wrap {
+            overflow: auto;
+            max-height: calc(100vh - 110px);
+            position: relative;
+        }
+
+        table {
+            border-collapse: collapse;
+            font-size: 12px;
+            width: max-content;
+            min-width: 100%;
+        }
+
+        th,
+        td {
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            padding: 0;
+            text-align: center;
+            white-space: nowrap;
+        }
+
+        /* Sticky time column */
+        th:first-child,
+        td:first-child {
+            position: sticky;
+            left: 0;
+            z-index: 2;
+            background: #1e293b;
+            font-weight: 700;
+            color: #94a3b8;
+            min-width: 52px;
+            padding: 5px 8px;
+        }
+
+        /* Sticky header row */
+        thead th {
+            position: sticky;
+            top: 0;
+            z-index: 3;
+            background: #1e293b;
+            color: #6366f1;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 6px 8px;
+            text-transform: uppercase;
+        }
+
+        thead th:first-child {
+            z-index: 4;
+        }
+
+        /* Current time row */
+        tr.current-slot td {
+            background: rgba(99, 102, 241, 0.12) !important;
+        }
+
+        tr.current-slot td:first-child {
+            background: #1e293b !important;
+            color: #a5b4fc;
+        }
+
+        /* Cell content */
+        td.draw-cell {
+            min-width: 80px;
+            padding: 3px 4px;
+            cursor: pointer;
+            transition: filter 0.1s;
+        }
+
+        td.draw-cell:hover {
+            filter: brightness(1.15);
+        }
+
+        td.draw-cell.empty {
+            background: #0f172a;
+            min-width: 80px;
+            border-color: rgba(255, 255, 255, 0.03);
+        }
+
+        .balls {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 2px;
+        }
+
+        .ball {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 11px;
+            color: #fff;
+            background: #f97316;
+            flex-shrink: 0;
+        }
+
+        .ball.triple {
+            background: #8b5cf6;
+        }
+
+        .ball.pair {
+            background: #3b82f6;
+        }
+
+        .sum {
+            font-size: 10px;
+            font-weight: 700;
+            color: #94a3b8;
+            margin-left: 2px;
+            min-width: 16px;
+        }
+
+        /* Sum-based row tinting — 3 tiers: <10 light · 10/11 neutral · >11 dark */
+        /* Light tier (sum < 10) */
+        td[data-sum="3"] {
+            background: rgba(255, 179, 186, 0.22);
+        }
+
+        td[data-sum="4"] {
+            background: rgba(255, 179, 186, 0.18);
+        }
+
+        td[data-sum="5"] {
+            background: rgba(152, 251, 152, 0.16);
+        }
+
+        td[data-sum="6"] {
+            background: rgba(176, 196, 222, 0.16);
+        }
+
+        td[data-sum="7"] {
+            background: rgba(176, 224, 230, 0.13);
+        }
+
+        td[data-sum="8"] {
+            background: rgba(200, 225, 255, 0.10);
+        }
+
+        td[data-sum="9"] {
+            background: rgba(210, 235, 255, 0.07);
+        }
+
+        /* Neutral tier (sum 10/11) — no background */
+        /* Dark tier (sum > 11) */
+        td[data-sum="12"] {
+            background: rgba(255, 252, 210, 0.22);
+        }
+
+        td[data-sum="13"] {
+            background: rgba(255, 220, 170, 0.28);
+        }
+
+        td[data-sum="14"] {
+            background: rgba(255, 190, 120, 0.34);
+        }
+
+        td[data-sum="15"] {
+            background: rgba(255, 140, 100, 0.38);
+        }
+
+        td[data-sum="16"] {
+            background: rgba(221, 160, 221, 0.44);
+        }
+
+        td[data-sum="17"] {
+            background: rgba(255, 105, 180, 0.46);
+        }
+
+        td[data-sum="18"] {
+            background: rgba(255, 215, 0, 0.46);
+        }
+
+        /* HOA (triple) — golden background + inset border */
+        td.draw-cell[data-pattern="triple"] {
+            background: rgba(255, 215, 0, 0.30) !important;
+            box-shadow: inset 0 0 0 2px rgba(255, 200, 0, 0.85);
+        }
+
+        /* Đôi (pair) — blue inset border */
+        td.draw-cell[data-pattern="pair"] {
+            box-shadow: inset 0 0 0 2px rgba(59, 130, 246, 0.72);
+        }
+
+        /* Cross-day: same sum repeated in ≥2 days at same time slot */
+        td.draw-cell.cross-day-sum {
+            border-bottom: 2px solid rgba(251, 191, 36, 0.80) !important;
+        }
+
+        /* Cross-day: same pattern (HOA or Đôi) in ≥2 days at same time slot */
+        td.draw-cell.cross-day-pattern {
+            border-top: 2px solid rgba(52, 211, 153, 0.85) !important;
+        }
+
+        /* Footer rows */
+        tr.footer-row td {
+            font-weight: 700;
+            font-size: 11px;
+            color: #f8fafc;
+            background: #1e293b;
+        }
+
+        tr.footer-row td:first-child {
+            color: #6366f1;
+        }
+
+        tr.footer-hoa td {
+            background: rgba(255, 215, 0, 0.15);
+        }
+
+        tr.footer-x40 td {
+            background: rgba(255, 105, 180, 0.12);
+        }
+
+        tr.footer-x12 td {
+            background: rgba(152, 251, 152, 0.1);
+        }
+
+        tr.footer-x20 td {
+            background: rgba(221, 160, 221, 0.1);
+        }
+
+        /* Highlight matching cells on click */
+        td.draw-cell.hl-match {
+            outline: 2px solid #6366f1;
+            z-index: 1;
+            position: relative;
+        }
+
+        td.draw-cell.hl-dim {
+            opacity: 0.35;
+        }
+
+        /* Loading / error */
+        .overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.85);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            font-size: 16px;
+            color: #a5b4fc;
+        }
+
+        .spinner {
+            width: 28px;
+            height: 28px;
+            border: 3px solid rgba(99, 102, 241, 0.3);
+            border-top-color: #6366f1;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 12px;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="header">
+        <a href="/" class="logo">Bingo18</a>
+        <nav class="nav">
+            <a href="/">AI Dự Đoán</a>
+            <a href="/history-table" class="active">Bảng Lịch Sử</a>
+            <a href="/about">Giới Thiệu</a>
+        </nav>
+        <div class="controls">
+            <select class="select-days" id="daysSelect" onchange="loadGrid()">
+                <option value="5" selected>5 ngày</option>
+                <option value="7">7 ngày</option>
+                <option value="14">1/2 tháng</option>
+                <option value="30">1 tháng</option>
+            </select>
+            <button class="btn-refresh" onclick="loadGrid()">↻ Tải lại</button>
+        </div>
+    </div>
+
+    <div class="status-bar">
+        <span><span class="status-dot" id="statusDot"></span><span id="statusText">Đang tải…</span></span>
+        <span id="totalText"></span>
+        <span id="generatedText"></span>
+    </div>
+
+    <div class="table-wrap" id="tableWrap">
+        <div class="overlay" id="overlay">
+            <div class="spinner"></div>Đang tải dữ liệu…
+        </div>
+    </div>
+
+    <script>
+        const DOW = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7']
+
+        function vnDate(isoDate) {
+            // isoDate = "2026-04-17"
+            const d = new Date(isoDate + 'T12:00:00+07:00')
+            const dow = DOW[d.getDay()]
+            const dd = isoDate.slice(8)
+            const mm = isoDate.slice(5, 7)
+            return `${dow} ${parseInt(dd)}/${parseInt(mm)}`
+        }
+
+        function getColorForSum(sum, pattern) {
+            // Colors handled by CSS data-sum / data-pattern selectors — return empty.
+            return ''
+        }
+
+        function ballClass(n1, n2, n3, i) {
+            const n = [n1, n2, n3][i]
+            if (n1 === n2 && n2 === n3) return 'ball triple'
+            if ((i === 0 && (n1 === n2 || n1 === n3)) || (i === 1 && (n2 === n1 || n2 === n3)) || (i === 2 && (n3 === n1 || n3 === n2))) return 'ball pair'
+            return 'ball'
+        }
+
+        let _gridData = null
+        let _highlightCombo = null
+
+        function renderGrid(data) {
+            _gridData = data
+            const { slots, dates, cells } = data
+
+            // Current VN time for highlighting
+            const nowVN = new Date(Date.now() + (7 * 60 - new Date().getTimezoneOffset()) * 60_000)
+            const nowH = nowVN.getUTCHours()
+            const nowM = nowVN.getUTCMinutes()
+            const todayStr = `${nowVN.getUTCFullYear()}-${String(nowVN.getUTCMonth() + 1).padStart(2, '0')}-${String(nowVN.getUTCDate()).padStart(2, '0')}`
+
+            // Build header
+            let html = '<table><thead><tr><th>Giờ</th>'
+            for (const date of dates) html += `<th>${vnDate(date)}</th>`
+            html += '</tr></thead><tbody>'
+
+            // Daily totals for footer
+            const totals = {}
+            for (const date of dates) totals[date] = { hoa: 0, x40: 0, x12: 0, x20: 0 }
+
+            for (const slot of slots) {
+                const [sh, sm] = slot.split(':').map(Number)
+                // Find nearest slot to current time (within 6 min window)
+                const slotTotalMin = sh * 60 + sm
+                const nowTotalMin = nowH * 60 + nowM
+                const isCurrent = Math.abs(slotTotalMin - nowTotalMin) <= 6
+
+                html += `<tr${isCurrent ? ' class="current-slot"' : ''}>`
+                html += `<td>${slot}</td>`
+
+                for (const date of dates) {
+                    const cell = cells[slot]?.[date]
+                    if (!cell) {
+                        html += `<td class="draw-cell empty" data-slot="${slot}" data-date="${date}"><span style="color:#1e293b">·</span></td>`
+                        continue
+                    }
+                    const { n1, n2, n3, sum, pattern } = cell
+                    const bg = getColorForSum(sum, pattern)
+                    const comboKey = `${n1}${n2}${n3}`
+
+                    // Accumulate footer stats
+                    if (date in totals) {
+                        if (pattern === 'triple') totals[date].hoa++
+                        if (sum === 4 || sum === 17) totals[date].x40++
+                        if (sum === 6 || sum === 15) totals[date].x12++
+                        if (sum === 5 || sum === 16) totals[date].x20++
+                    }
+
+                    const bc0 = ballClass(n1, n2, n3, 0), bc1 = ballClass(n1, n2, n3, 1), bc2 = ballClass(n1, n2, n3, 2)
+                    html += `<td class="draw-cell" data-slot="${slot}" data-date="${date}" data-combo="${comboKey}" data-sum="${sum}" data-pattern="${pattern || ''}" onclick="highlightCombo(this)">`
+                    html += `<div class="balls"><span class="${bc0}">${n1}</span><span class="${bc1}">${n2}</span><span class="${bc2}">${n3}</span><span class="sum">${sum}</span></div>`
+                    html += '</td>'
+                }
+                html += '</tr>'
+            }
+
+            // Footer rows
+            const footerRows = [
+                { key: 'hoa', label: 'HOA', cls: 'footer-hoa' },
+                { key: 'x40', label: 'x40', cls: 'footer-x40' },
+                { key: 'x12', label: 'x12', cls: 'footer-x12' },
+                { key: 'x20', label: 'x20', cls: 'footer-x20' },
+            ]
+            for (const { key, label, cls } of footerRows) {
+                html += `<tr class="footer-row ${cls}"><td>${label}</td>`
+                for (const date of dates) html += `<td>${totals[date]?.[key] ?? ''}</td>`
+                html += '</tr>'
+            }
+
+            html += '</tbody></table>'
+
+            const wrap = document.getElementById('tableWrap')
+            wrap.innerHTML = html
+
+            // Post-process: cross-day highlights (same sum or same HOA/pair in same slot)
+            applyHighlights(data)
+
+            // Scroll to current slot
+            const curRow = wrap.querySelector('tr.current-slot')
+            if (curRow) curRow.scrollIntoView({ block: 'center', behavior: 'smooth' })
+            // Scroll to rightmost column (today)
+            wrap.scrollLeft = wrap.scrollWidth
+
+            // Update status
+            document.getElementById('statusDot').className = 'status-dot'
+            document.getElementById('statusText').textContent = 'Cập nhật thành công'
+            document.getElementById('totalText').textContent = `Tổng: ${data.total.toLocaleString()} kỳ`
+            const gen = new Date(data.generated)
+            document.getElementById('generatedText').textContent = `Lúc: ${gen.toLocaleTimeString('vi-VN')}`
+        }
+
+        /**
+         * Post-process table: add cross-day highlight classes.
+         * Rules:
+         *   cross-day-sum     — same sum value in ≥2 days at the same time slot
+         *   cross-day-pattern — same HOA or Đôi pattern in ≥2 days at the same time slot
+         */
+        function applyHighlights(data) {
+            const { slots, dates, cells } = data
+            const wrap = document.getElementById('tableWrap')
+            if (!wrap) return
+
+            for (const slot of slots) {
+                // Gather all populated cells for this slot row
+                const slotCells = []
+                for (const date of dates) {
+                    const cell = cells[slot]?.[date]
+                    if (!cell) continue
+                    const td = wrap.querySelector(`td.draw-cell[data-slot="${slot}"][data-date="${date}"]`)
+                    if (td) slotCells.push({ td, sum: cell.sum, pattern: cell.pattern || '' })
+                }
+                if (slotCells.length < 2) continue
+
+                // Count occurrences of each sum
+                const sumCount = {}
+                for (const c of slotCells) sumCount[c.sum] = (sumCount[c.sum] || 0) + 1
+
+                // Count occurrences of HOA/Đôi patterns
+                const patCount = {}
+                for (const c of slotCells) {
+                    if (c.pattern === 'triple' || c.pattern === 'pair')
+                        patCount[c.pattern] = (patCount[c.pattern] || 0) + 1
+                }
+
+                // Apply classes
+                for (const c of slotCells) {
+                    if (sumCount[c.sum] >= 2) c.td.classList.add('cross-day-sum')
+                    if ((c.pattern === 'triple' || c.pattern === 'pair') && patCount[c.pattern] >= 2)
+                        c.td.classList.add('cross-day-pattern')
+                }
+            }
+        }
+
+        function highlightCombo(cell) {
+            const combo = cell.dataset.combo
+            if (!combo) return
+            const all = document.querySelectorAll('td.draw-cell[data-combo]')
+
+            // Toggle off if clicking same combo
+            if (_highlightCombo === combo) {
+                _highlightCombo = null
+                all.forEach(c => { c.classList.remove('hl-match', 'hl-dim') })
+                return
+            }
+            _highlightCombo = combo
+
+            // Sort combos for order-independent matching (e.g. 123 == 132 == 321)
+            const sorted = combo.split('').sort().join('')
+            all.forEach(c => {
+                const cs = c.dataset.combo.split('').sort().join('')
+                if (cs === sorted) {
+                    c.classList.add('hl-match')
+                    c.classList.remove('hl-dim')
+                } else {
+                    c.classList.add('hl-dim')
+                    c.classList.remove('hl-match')
+                }
+            })
+        }
+
+        async function loadGrid() {
+            const days = document.getElementById('daysSelect').value
+            const wrap = document.getElementById('tableWrap')
+
+            // Show spinner overlay
+            const overlay = document.createElement('div')
+            overlay.className = 'overlay'
+            overlay.innerHTML = '<div class="spinner"></div>Đang tải…'
+            wrap.appendChild(overlay)
+
+            document.getElementById('statusDot').className = 'status-dot stale'
+            document.getElementById('statusText').textContent = 'Đang tải…'
+
+            try {
+                const res = await fetch(`/api/history-grid?days=${days}`)
+                if (!res.ok) throw new Error(`HTTP ${res.status}`)
+                const data = await res.json()
+                renderGrid(data)
+            } catch (err) {
+                overlay.remove()
+                document.getElementById('statusDot').className = 'status-dot stale'
+                document.getElementById('statusText').textContent = 'Lỗi: ' + err.message
+            }
+        }
+
+        // Auto-refresh every 60s during operating hours
+        function scheduleAutoRefresh() {
+            const h = new Date().getHours()
+            if (h >= 6 && h < 22) {
+                setTimeout(() => { loadGrid(); scheduleAutoRefresh() }, 60_000)
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            loadGrid()
+            scheduleAutoRefresh()
+        })
+    </script>
+</body>
+
+</html>

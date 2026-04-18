@@ -57,7 +57,7 @@ const predict = require('../predictor/ensemble')
 const frequency = require('../predictor/frequency')
 const features = require('../predictor/features')
 const { runStatTests } = require('../predictor/stats_tests')
-const { run: crawlRun, crawlPage, crawlSince, merge: crawlMerge } = require('../crawler/crawl')
+const { run: crawlRun, crawlPage, crawlSince, merge: crawlMerge, canonicalSlotInfo } = require('../crawler/crawl')
 
 const app = express()
 const PORT = parseInt(process.env.PORT) || 8080
@@ -424,14 +424,12 @@ async function _computeStatsBackground() {
       forward: { top1: 0, top3: 0, top10: 0, tested: 0 },
     }
 
-    // Dynamic SAMPLE_EVERY: target ~150 test windows regardless of dataset size.
+    // Dynamic SAMPLE_EVERY: target ~500 test windows regardless of dataset size.
     // TRAIN_CAP: cap training slice at 5k records so predict.ranked() stays fast.
-    // Was 10k — on 41k-record dataset each predict call was holding ~8MB slices in
-    // memory simultaneously during all SAMPLE_EVERY iterations, risking OOM on Fly 1GB.
-    const SAMPLE_EVERY = Math.max(1, Math.floor(N / 150))
+    const SAMPLE_EVERY = Math.max(1, Math.floor(N / 500))
     const TRAIN_CAP = 5_000   // max records per training slice (5k → ~3MB per slice)
-    // Start from 30% mark — early windows have too little training data.
-    const START_I = Math.max(WINDOW, Math.floor(N * 0.3))
+    // Start from 20% mark — early windows have too little training data.
+    const START_I = Math.max(WINDOW, Math.floor(N * 0.2))
 
     for (let i = START_I; i < N; i += SAMPLE_EVERY) {
       await new Promise(resolve => setImmediate(resolve))  // yield before predict
@@ -566,6 +564,7 @@ app.get(['/', '/index.html'], (_req, res) => {
 const _staticPages = {
   '/about': 'about.html',
   '/how-it-works': 'how-it-works.html',
+  '/history-table': 'history.html',
   '/blog/what-is-bingo18': 'blog/what-is-bingo18.html',
   '/blog/best-strategy-2026': 'blog/best-strategy-2026.html',
   '/privacy-policy': 'privacy-policy.html',
@@ -653,6 +652,74 @@ app.get('/history', async (req, res) => {
     const etag = `"${now}"`
     res.set('X-Cache', 'MISS')
     res.set('ETag', etag)
+    res.json(payload)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * GET /api/history-grid — data for the time-slot × day history table.
+ * Returns the last ?days=N days (default 15) of draws grouped by time-slot and date.
+ * Only records with full HH:MM timestamps are included.
+ *
+ * Response: { slots: ["06:05",...], dates: ["2026-04-17",...], cells: { "06:05": { "2026-04-17": {n1,n2,n3,sum,pattern} } }, generated: <iso> }
+ */
+app.get('/api/history-grid', async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days) || 15, 3), 60)
+    const cacheKey = `history-grid-${days}`
+    const now = Date.now()
+    const hit = apiCache.get(cacheKey)
+    if (hit && now - hit.ts < 60_000) {
+      res.set('X-Cache', 'HIT')
+      res.set('ETag', `"${hit.ts}"`)
+      if (req.headers['if-none-match'] === `"${hit.ts}"`) return res.status(304).end()
+      return res.json(hit.data)
+    }
+
+    const data = await loadHistory()
+    // Cutoff: only include records from the last N days
+    const cutoff = new Date()
+    cutoff.setDate(cutoff.getDate() - days)
+    cutoff.setHours(0, 0, 0, 0)
+
+    const cells = {}
+    const slotSet = new Set()
+    const dateSet = new Set()
+
+    for (const r of data) {
+      if (!r.drawTime) continue
+      // Skip date-only timestamps (Vietlott source sets T00:00:00)
+      if (r.drawTime.includes('T00:00:00')) continue
+
+      const d = new Date(r.drawTime)
+      if (isNaN(d.getTime()) || d < cutoff) continue
+
+      // Snap to canonical 6-minute slot (06:00, 06:06, ..., 21:54 VN time)
+      const ci = canonicalSlotInfo(r.drawTime)
+      if (!ci) continue
+
+      const dateStr = ci.date
+      const slotStr = ci.slot
+
+      slotSet.add(slotStr)
+      dateSet.add(dateStr)
+
+      if (!cells[slotStr]) cells[slotStr] = {}
+      // Keep only one record per canonical slot per day (first wins — data is newest-first)
+      if (!cells[slotStr][dateStr]) {
+        cells[slotStr][dateStr] = { n1: r.n1, n2: r.n2, n3: r.n3, sum: r.sum, pattern: r.pattern, ky: r.ky }
+      }
+    }
+
+    const slots = [...slotSet].sort()
+    const dates = [...dateSet].sort()
+
+    const payload = { slots, dates, cells, days, total: data.length, generated: new Date().toISOString() }
+    apiCache.set(cacheKey, { data: payload, ts: now })
+    res.set('X-Cache', 'MISS')
+    res.set('ETag', `"${now}"`)
     res.json(payload)
   } catch (err) {
     res.status(500).json({ error: err.message })

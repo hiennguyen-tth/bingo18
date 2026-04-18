@@ -637,7 +637,11 @@ const AccuracyPanel = memo(function AccuracyPanel({
     style: {
       color: '#e2e8f0'
     }
-  }, tested), " k\u1EF3 \xA0\xB7\xA0Random baseline: top1=", baseline.top1, "% / top3=", baseline.top3, "% / top10=", baseline.top10, "%"), rows.map(r => /*#__PURE__*/React.createElement("div", {
+  }, tested), " windows", stats?.total ? /*#__PURE__*/React.createElement("span", null, " \xB7 ", /*#__PURE__*/React.createElement("strong", {
+    style: {
+      color: '#94a3b8'
+    }
+  }, stats.total.toLocaleString()), " k\u1EF3 d\u1EEF li\u1EC7u") : null, "\xA0\xB7\xA0Random baseline: top1=", baseline.top1, "% / top3=", baseline.top3, "% / top10=", baseline.top10, "%"), rows.map(r => /*#__PURE__*/React.createElement("div", {
     key: r.key,
     style: {
       marginBottom: 14
@@ -1210,173 +1214,183 @@ const OverdueTable = memo(function OverdueTable({
 });
 
 /* ─────────────────────── DrawPivotTable (lịch sử theo giờ) ─────────────── */
-const DrawPivotTable = memo(function DrawPivotTable({
-  history,
-  total
-}) {
+const DrawPivotTable = memo(function DrawPivotTable() {
+  const [days, setDays] = useState(5);
   const [filter, setFilter] = useState('all');
+  const [hlCombo, setHlCombo] = useState(null);
+  const [gridData, setGridData] = useState(null); // { slots, dates, cells, total, generated }
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   const [isMobile, setIsMobile] = useState(typeof window !== 'undefined' ? window.innerWidth < 720 : false);
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 720);
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   }, []);
-  if (!history || history.length === 0) return /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: '#475569',
-      fontSize: 13,
-      padding: '16px 0'
-    }
-  }, "Kh\xF4ng c\xF3 d\u1EEF li\u1EC7u");
-
-  // Use ACTUAL draw times from the crawl data as slot labels — no canonical snapping.
-  // Rationale: xoso.net.vn timestamps are the publication time, which can be 1-6 minutes
-  // after the canonical 06:05+6min schedule. Snapping to a fixed grid causes:
-  //   (a) draws published near a slot boundary to collide → one gets silently dropped
-  //   (b) the first draw found (newest-first) occupies the slot, later draws skipped
-  // Dynamic slots use exact HH:MM from drawTime — every draw is visible, no collisions.
-  const VN_OFF = 7 * 3600_000;
-  const bySlot = {}; // "HH:MM" → { "YYYY-MM-DD" → record }
-  const dateSet = new Set();
-  const slotSet = new Set();
-  for (const r of history) {
-    if (!r.drawTime) continue;
-    const vnMs = new Date(r.drawTime).getTime() + VN_OFF;
-    const vnD = new Date(vnMs);
-    const h = vnD.getUTCHours(),
-      m = vnD.getUTCMinutes();
-    if (h < 6 || h >= 22) continue; // skip draws outside operating hours
-    const slot = h.toString().padStart(2, '0') + ':' + m.toString().padStart(2, '0');
-    const dateStr = vnD.getUTCFullYear() + '-' + (vnD.getUTCMonth() + 1).toString().padStart(2, '0') + '-' + vnD.getUTCDate().toString().padStart(2, '0');
-    if (!bySlot[slot]) bySlot[slot] = {};
-    if (!bySlot[slot][dateStr]) bySlot[slot][dateStr] = r;
-    dateSet.add(dateStr);
-    slotSet.add(slot);
-  }
-
-  // ALL_SLOTS: all unique HH:MM values across history, sorted chronologically.
-  // These are the actual published draw times — no hardcoded canonical grid.
-  const ALL_SLOTS = [...slotSet].sort();
-
-  // Up to 5 most-recent dates as columns, newest → oldest (left → right)
-  const dates = [...dateSet].sort((a, b) => b.localeCompare(a)).slice(0, isMobile ? 3 : 5);
-
-  // Use all 159 canonical slots, filtered by period.
-  let slots = ALL_SLOTS;
-  if (filter === 'morning') slots = slots.filter(s => +s.slice(0, 2) < 12);
-  if (filter === 'afternoon') slots = slots.filter(s => {
-    const h = +s.slice(0, 2);
-    return h >= 12 && h < 18;
-  });
-  if (filter === 'evening') slots = slots.filter(s => +s.slice(0, 2) >= 18);
+  useEffect(() => {
+    setLoading(true);
+    setError(null);
+    fetch(`/api/history-grid?days=${days}`).then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))).then(d => {
+      setGridData(d);
+      setLoading(false);
+    }).catch(e => {
+      setError(e.message);
+      setLoading(false);
+    });
+  }, [days]);
   const DAY_VN = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'];
   function fmtDateHdr(ds) {
     const [y, mo, dd] = ds.split('-').map(Number);
-    const day = new Date(Date.UTC(y, mo - 1, dd)).getUTCDay();
-    return DAY_VN[day] + ' ' + dd + '/' + mo;
-  }
-  function isTriple(r) {
-    return r.n1 === r.n2 && r.n2 === r.n3;
-  }
-  function isPair(r) {
-    return !isTriple(r) && (r.n1 === r.n2 || r.n2 === r.n3 || r.n1 === r.n3);
-  }
-  function getSum(r) {
-    return r.sum != null ? r.sum : r.n1 + r.n2 + r.n3;
+    return DAY_VN[new Date(Date.UTC(y, mo - 1, dd)).getUTCDay()] + ' ' + dd + '/' + mo;
   }
 
-  // Highlight flags for a given (slot, column-index) cell
-  function getHL(slot, di) {
-    const cur = bySlot[slot]?.[dates[di]];
-    if (!cur) return {};
-    const h = {};
-    if (isTriple(cur)) h.triple = true;else if (isPair(cur)) h.pair = true;
-    const curSum = getSum(cur);
-    // Compare against immediate neighbours (previous and next column)
-    for (const adj of [bySlot[slot]?.[dates[di - 1]], bySlot[slot]?.[dates[di + 1]]]) {
-      if (!adj) continue;
-      if (getSum(adj) === curSum) h.sameSum = true;
-      if (isTriple(cur) && isTriple(adj)) h.sameTriple = true;
-      if (isPair(cur) && isPair(adj)) h.samePair = true;
+  // Cell background based on sum/pattern — matching history.html
+  function cellBg(cell) {
+    // 3-tier intensity: sum < 10 → light · sum 10/11 → neutral · sum > 11 → dark
+    const {
+      sum,
+      pattern
+    } = cell;
+    if (pattern === 'triple') return 'rgba(255,215,0,0.30)'; // gold override
+    const m = {
+      3: 'rgba(255,179,186,0.22)',
+      4: 'rgba(255,179,186,0.18)',
+      5: 'rgba(152,251,152,0.16)',
+      6: 'rgba(176,196,222,0.16)',
+      7: 'rgba(176,224,230,0.13)',
+      8: 'rgba(200,225,255,0.10)',
+      9: 'rgba(210,235,255,0.07)',
+      // 10/11 → no background (neutral)
+      12: 'rgba(255,252,210,0.22)',
+      13: 'rgba(255,220,170,0.28)',
+      14: 'rgba(255,190,120,0.34)',
+      15: 'rgba(255,140,100,0.38)',
+      16: 'rgba(221,160,221,0.44)',
+      17: 'rgba(255,105,180,0.46)',
+      18: 'rgba(255,215,0,0.46)'
+    };
+    return m[sum] || '';
+  }
+
+  // Box-shadow for HOA/pair borders in the pivot table
+  function cellBorder(cell) {
+    if (!cell) return 'none';
+    if (cell.pattern === 'triple') return 'inset 0 0 0 2px rgba(255,200,0,0.85)';
+    if (cell.pattern === 'pair') return 'inset 0 0 0 2px rgba(59,130,246,0.72)';
+    return 'none';
+  }
+
+  // Per-ball color — matching history.html ball classes
+  function ballColor(n1, n2, n3, i) {
+    if (n1 === n2 && n2 === n3) return '#8b5cf6'; // triple → purple
+    const ns = [n1, n2, n3];
+    const n = ns[i];
+    const isPairBall = i === 0 && (n1 === n2 || n1 === n3) || i === 1 && (n2 === n1 || n2 === n3) || i === 2 && (n3 === n1 || n3 === n2);
+    return isPairBall ? '#3b82f6' : '#f97316'; // pair → blue, normal → orange
+  }
+
+  // Sorted combo key for order-independent match
+  function comboKey(n1, n2, n3) {
+    return [n1, n2, n3].map(String).sort().join('');
+  }
+
+  // Current VN time for row highlight
+  const nowVN = new Date(Date.now() + 7 * 3600_000);
+  const nowTotalMin = nowVN.getUTCHours() * 60 + nowVN.getUTCMinutes();
+  function isCurrentSlot(slot) {
+    const [sh, sm] = slot.split(':').map(Number);
+    return Math.abs(sh * 60 + sm - nowTotalMin) <= 6;
+  }
+  if (loading) return /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '24px 0',
+      color: '#475569',
+      fontSize: 13,
+      textAlign: 'center'
     }
-    return h;
-  }
-  function cellCS(h) {
-    // background + box-shadow for the <td>
-    if (h.sameTriple) return {
-      background: 'rgba(251,191,36,0.28)',
-      boxShadow: 'inset 0 0 0 2px rgba(251,191,36,0.65)'
-    };
-    if (h.triple) return {
-      background: 'rgba(251,191,36,0.12)',
-      boxShadow: 'inset 0 0 0 1px rgba(251,191,36,0.38)'
-    };
-    if (h.samePair) return {
-      background: 'rgba(167,139,250,0.20)',
-      boxShadow: 'inset 0 0 0 2px rgba(167,139,250,0.58)'
-    };
-    if (h.pair) return {
-      background: 'rgba(125,211,252,0.10)',
-      boxShadow: 'inset 0 0 0 1px rgba(125,211,252,0.28)'
-    };
-    if (h.sameSum) return {
-      background: 'rgba(251,113,133,0.12)',
-      boxShadow: 'inset 0 0 0 2px rgba(251,113,133,0.52)'
-    };
-    return {
-      background: 'transparent',
-      boxShadow: 'none'
-    };
-  }
-  function ballColor(h) {
-    return h.sameTriple || h.triple ? '#fbbf24' : h.samePair || h.pair ? '#7dd3fc' : '#c4b5fd';
-  }
-  function ballBg(h) {
-    return h.sameTriple || h.triple ? 'rgba(251,191,36,0.22)' : h.samePair || h.pair ? 'rgba(125,211,252,0.18)' : 'rgba(99,102,241,0.18)';
-  }
-  function ballBorder(h) {
-    return h.sameTriple || h.triple ? '1px solid rgba(251,191,36,0.45)' : h.samePair || h.pair ? '1px solid rgba(125,211,252,0.35)' : '1px solid rgba(99,102,241,0.30)';
-  }
+  }, "\u0110ang t\u1EA3i\u2026");
+  if (error) return /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '16px 0',
+      color: '#f87171',
+      fontSize: 13
+    }
+  }, "L\u1ED7i: ", error);
+  if (!gridData) return null;
+  const {
+    slots: allSlots,
+    dates: allDates,
+    cells,
+    total
+  } = gridData;
 
-  // Footer summary per date column
-  const colSum = dates.map(date => {
-    let t = 0,
-      p = 0,
-      n = 0;
+  // Show newest dates left → oldest right, cap at mobile
+  const dates = [...allDates].sort((a, b) => b.localeCompare(a)).slice(0, isMobile ? 3 : 5);
+
+  // Filter slots by time period
+  let slots = allSlots;
+  if (filter === 'morning') slots = slots.filter(s => +s.slice(0, 2) < 12);else if (filter === 'afternoon') slots = slots.filter(s => {
+    const h = +s.slice(0, 2);
+    return h >= 12 && h < 18;
+  });else if (filter === 'evening') slots = slots.filter(s => +s.slice(0, 2) >= 18);
+
+  // Footer stats per date column
+  const colStats = dates.map(date => {
+    let hoa = 0,
+      x40 = 0,
+      x12 = 0,
+      x20 = 0;
     for (const slot of slots) {
-      const r = bySlot[slot]?.[date];
-      if (!r) continue;
-      if (isTriple(r)) t++;else if (isPair(r)) p++;else n++;
+      const c = cells[slot]?.[date];
+      if (!c) continue;
+      if (c.pattern === 'triple') hoa++;
+      if (c.sum === 4 || c.sum === 17) x40++;
+      if (c.sum === 6 || c.sum === 15) x12++;
+      if (c.sum === 5 || c.sum === 16) x20++;
     }
     return {
-      t,
-      p,
-      n
+      hoa,
+      x40,
+      x12,
+      x20
     };
   });
   const TH = {
-    padding: isMobile ? '6px 4px' : '8px 6px',
+    padding: isMobile ? '6px 4px' : '7px 8px',
     textAlign: 'center',
-    color: '#64748b',
+    color: '#6366f1',
     fontSize: isMobile ? 9 : 10,
     fontWeight: 700,
-    letterSpacing: '0.05em',
-    borderBottom: '1px solid rgba(255,255,255,0.08)',
-    background: '#1e293b'
+    background: '#1e293b',
+    position: 'sticky',
+    top: 0,
+    zIndex: 3
   };
-  const ROW_BD = {
-    borderBottom: '1px solid rgba(255,255,255,0.04)'
-  };
-  const BALL_SIZE = isMobile ? 18 : 21;
+  const BALL_SIZE = isMobile ? 19 : 22;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       gap: 8,
-      marginBottom: 14,
+      marginBottom: 10,
       flexWrap: 'wrap',
       alignItems: 'center'
     }
-  }, [['all', 'Tất cả'], ['morning', 'Sáng 6–12h'], ['afternoon', 'Chiều 12–18h'], ['evening', 'Tối 18–22h']].map(([v, l]) => /*#__PURE__*/React.createElement("button", {
+  }, /*#__PURE__*/React.createElement("select", {
+    value: days,
+    onChange: e => setDays(+e.target.value),
+    style: {
+      background: '#1e293b',
+      border: '1px solid rgba(99,102,241,0.4)',
+      color: '#e2e8f0',
+      borderRadius: 6,
+      padding: '4px 8px',
+      fontSize: isMobile ? 10 : 11,
+      cursor: 'pointer'
+    }
+  }, [3, 5, 7, 14].map(d => /*#__PURE__*/React.createElement("option", {
+    key: d,
+    value: d
+  }, d, " ng\xE0y"))), [['all', 'Tất cả'], ['morning', 'Sáng 6–12h'], ['afternoon', 'Chiều 12–18h'], ['evening', 'Tối 18–22h']].map(([v, l]) => /*#__PURE__*/React.createElement("button", {
     key: v,
     onClick: () => setFilter(v),
     style: {
@@ -1392,35 +1406,68 @@ const DrawPivotTable = memo(function DrawPivotTable({
     style: {
       fontSize: isMobile ? 10 : 11,
       color: '#334155',
-      marginLeft: 4
+      marginLeft: 2
     }
-  }, history.length, " / ", total.toLocaleString(), " k\u1EF3 \xB7 159 k\u1EF3/ng\xE0y \xB7 ", dates.length, " ng\xE0y"), /*#__PURE__*/React.createElement("div", {
+  }, total.toLocaleString(), " k\u1EF3 \xB7 ", slots.length, " slot/ng\xE0y"), hlCombo && /*#__PURE__*/React.createElement("button", {
+    onClick: () => setHlCombo(null),
     style: {
-      marginLeft: isMobile ? 0 : 'auto',
-      width: isMobile ? '100%' : 'auto',
+      background: 'rgba(99,102,241,0.15)',
+      color: '#a5b4fc',
+      border: '1px solid rgba(99,102,241,0.4)',
+      borderRadius: 6,
+      padding: '3px 10px',
+      cursor: 'pointer',
+      fontSize: 11
+    }
+  }, "\u2715 B\u1ECF ch\u1ECDn"), /*#__PURE__*/React.createElement("a", {
+    href: "/history-table",
+    target: "_blank",
+    rel: "noopener",
+    style: {
+      marginLeft: 'auto',
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 5,
+      background: 'linear-gradient(135deg,#6366f1,#8b5cf6)',
+      color: '#fff',
+      border: 'none',
+      borderRadius: 7,
+      padding: '5px 14px',
+      fontSize: 11,
+      fontWeight: 700,
+      textDecoration: 'none',
+      whiteSpace: 'nowrap'
+    }
+  }, "\u2197 Xem full")), /*#__PURE__*/React.createElement("div", {
+    style: {
       display: 'flex',
       gap: 10,
+      marginBottom: 10,
       fontSize: 10,
       color: '#64748b',
       flexWrap: 'wrap',
       alignItems: 'center'
     }
-  }, [['rgba(251,191,36,0.40)', 'HOA'], ['rgba(125,211,252,0.35)', 'Đôi'], ['rgba(251,113,133,0.35)', 'Same Tổng'], ['rgba(167,139,250,0.35)', 'Same Đôi']].map(([c, l]) => /*#__PURE__*/React.createElement("span", {
+  }, [['#8b5cf6', 'HOA'], ['#3b82f6', 'Đôi'], ['#f97316', 'Thường'], ['rgba(255,215,0,0.6)', 'Tổng 18/3'], ['rgba(255,105,180,0.6)', 'x40(4/17)'], ['rgba(152,251,152,0.6)', 'x12(6/15)']].map(([c, l]) => /*#__PURE__*/React.createElement("span", {
     key: l,
     style: {
       display: 'flex',
       alignItems: 'center',
-      gap: 4
+      gap: 3
     }
   }, /*#__PURE__*/React.createElement("span", {
     style: {
       display: 'inline-block',
-      width: 10,
-      height: 10,
+      width: 9,
+      height: 9,
       background: c,
-      borderRadius: 2
+      borderRadius: '50%'
     }
-  }), l)))), /*#__PURE__*/React.createElement("div", {
+  }), l)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#334155'
+    }
+  }, "\xB7 Click \xF4 \u0111\u1EC3 highlight")), /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 10,
       overflowX: 'auto'
@@ -1428,9 +1475,9 @@ const DrawPivotTable = memo(function DrawPivotTable({
   }, /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'grid',
-      gridTemplateColumns: `repeat(${Math.max(1, dates.length)}, minmax(${isMobile ? 120 : 160}px,1fr))`,
+      gridTemplateColumns: `repeat(${Math.max(1, dates.length)}, minmax(${isMobile ? 120 : 150}px,1fr))`,
       gap: 8,
-      minWidth: dates.length ? `${dates.length * (isMobile ? 120 : 160)}px` : 'auto'
+      minWidth: dates.length ? `${dates.length * (isMobile ? 120 : 150)}px` : 'auto'
     }
   }, dates.map((d, i) => /*#__PURE__*/React.createElement("div", {
     key: d,
@@ -1450,35 +1497,44 @@ const DrawPivotTable = memo(function DrawPivotTable({
   }, fmtDateHdr(d)), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
-      justifyContent: 'space-between',
-      fontSize: isMobile ? 11 : 12
+      gap: 8,
+      fontSize: isMobile ? 11 : 12,
+      flexWrap: 'wrap'
     }
   }, /*#__PURE__*/React.createElement("span", {
     style: {
       color: '#fbbf24',
       fontWeight: 700
     }
-  }, "HOA ", colSum[i]?.t ?? 0), /*#__PURE__*/React.createElement("span", {
+  }, "HOA ", colStats[i].hoa), /*#__PURE__*/React.createElement("span", {
     style: {
-      color: '#7dd3fc',
+      color: '#f97316',
       fontWeight: 700
     }
-  }, "\u0110\xF4i ", colSum[i]?.p ?? 0), /*#__PURE__*/React.createElement("span", {
+  }, "x40 ", colStats[i].x40), /*#__PURE__*/React.createElement("span", {
     style: {
-      color: '#94a3b8',
+      color: '#4ade80',
       fontWeight: 700
     }
-  }, "Th\u01B0\u1EDDng ", colSum[i]?.n ?? 0)))))), /*#__PURE__*/React.createElement("div", {
+  }, "x12 ", colStats[i].x12), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#c084fc',
+      fontWeight: 700
+    }
+  }, "x20 ", colStats[i].x20)))))), /*#__PURE__*/React.createElement("div", {
     style: {
       overflowX: 'auto',
       overflowY: 'auto',
-      maxHeight: isMobile ? 420 : 540
+      maxHeight: isMobile ? 420 : 560,
+      border: '1px solid rgba(255,255,255,0.06)',
+      borderRadius: 8
     }
   }, /*#__PURE__*/React.createElement("table", {
     style: {
-      width: '100%',
       borderCollapse: 'collapse',
-      fontSize: 12
+      fontSize: 12,
+      width: 'max-content',
+      minWidth: '100%'
     }
   }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
     style: {
@@ -1486,53 +1542,69 @@ const DrawPivotTable = memo(function DrawPivotTable({
       textAlign: 'left',
       position: 'sticky',
       left: 0,
-      zIndex: 3,
+      zIndex: 4,
       minWidth: isMobile ? 44 : 52,
-      padding: isMobile ? '6px 8px' : '8px 10px'
+      padding: isMobile ? '6px 8px' : '7px 10px'
     }
   }, "Gi\u1EDD"), dates.map(d => /*#__PURE__*/React.createElement("th", {
     key: d,
     style: {
       ...TH,
-      minWidth: isMobile ? 92 : 110
+      minWidth: isMobile ? 88 : 108
     }
   }, fmtDateHdr(d))))), /*#__PURE__*/React.createElement("tbody", null, slots.map(slot => {
+    const isCurrent = isCurrentSlot(slot);
     return /*#__PURE__*/React.createElement("tr", {
-      key: slot
+      key: slot,
+      style: isCurrent ? {
+        background: 'rgba(99,102,241,0.10)'
+      } : {}
     }, /*#__PURE__*/React.createElement("td", {
       style: {
-        ...ROW_BD,
-        padding: isMobile ? '4px 6px' : '4px 10px',
-        color: '#475569',
+        padding: isMobile ? '4px 6px' : '3px 10px',
+        color: isCurrent ? '#a5b4fc' : '#475569',
         fontSize: isMobile ? 10 : 11,
         fontWeight: 700,
         position: 'sticky',
         left: 0,
         background: '#1e293b',
-        zIndex: 1
+        zIndex: 1,
+        borderRight: '1px solid rgba(255,255,255,0.06)',
+        borderBottom: '1px solid rgba(255,255,255,0.04)'
       }
-    }, slot), dates.map((date, di) => {
-      const r = bySlot[slot]?.[date];
-      const h = r ? getHL(slot, di) : {};
-      const bc = ballColor(h),
-        bbg = ballBg(h),
-        bb = ballBorder(h);
+    }, slot), dates.map(date => {
+      const cell = cells[slot]?.[date];
+      const bg = cell ? cellBg(cell) : '';
+      const border = cell ? cellBorder(cell) : 'none';
+      const ck = cell ? comboKey(cell.n1, cell.n2, cell.n3) : null;
+      const isMatch = ck && ck === hlCombo;
+      const isHl = hlCombo !== null;
       return /*#__PURE__*/React.createElement("td", {
         key: date,
+        onClick: cell ? () => setHlCombo(prev => prev === ck ? null : ck) : undefined,
         style: {
-          ...ROW_BD,
-          padding: isMobile ? '3px 4px' : '4px 6px',
+          padding: isMobile ? '2px 3px' : '3px 5px',
           textAlign: 'center',
-          ...cellCS(h)
+          background: bg || (isCurrent ? 'rgba(99,102,241,0.06)' : '#0f172a'),
+          borderBottom: '1px solid rgba(255,255,255,0.04)',
+          borderRight: '1px solid rgba(255,255,255,0.04)',
+          cursor: cell ? 'pointer' : 'default',
+          opacity: isHl && cell && !isMatch ? 0.25 : 1,
+          outline: isMatch ? '2px solid #6366f1' : 'none',
+          boxShadow: isMatch ? 'none' : border,
+          position: 'relative',
+          zIndex: isMatch ? 1 : 'auto',
+          minWidth: isMobile ? 80 : 96,
+          transition: 'opacity 0.1s'
         }
-      }, r ? /*#__PURE__*/React.createElement("div", {
+      }, cell ? /*#__PURE__*/React.createElement("div", {
         style: {
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
           gap: 2
         }
-      }, [r.n1, r.n2, r.n3].map((n, j) => /*#__PURE__*/React.createElement("span", {
+      }, [cell.n1, cell.n2, cell.n3].map((n, j) => /*#__PURE__*/React.createElement("span", {
         key: j,
         style: {
           display: 'inline-flex',
@@ -1540,27 +1612,80 @@ const DrawPivotTable = memo(function DrawPivotTable({
           justifyContent: 'center',
           width: BALL_SIZE,
           height: BALL_SIZE,
-          background: bbg,
-          border: bb,
-          borderRadius: 5,
-          fontWeight: 800,
-          color: bc,
-          fontSize: isMobile ? 10 : 11
+          borderRadius: '50%',
+          fontWeight: 700,
+          color: '#fff',
+          background: ballColor(cell.n1, cell.n2, cell.n3, j),
+          fontSize: isMobile ? 10 : 11,
+          flexShrink: 0
         }
       }, n)), /*#__PURE__*/React.createElement("span", {
         style: {
           fontSize: isMobile ? 9 : 10,
-          color: '#475569',
-          marginLeft: 2
+          color: '#64748b',
+          marginLeft: 2,
+          minWidth: 14
         }
-      }, getSum(r))) : /*#__PURE__*/React.createElement("span", {
+      }, cell.sum)) : /*#__PURE__*/React.createElement("span", {
         style: {
-          color: '#1e3a5f',
-          fontSize: 11
+          color: '#1e293b',
+          fontSize: 10
         }
-      }, "\u2014"));
+      }, "\xB7"));
     }));
-  })))));
+  }), [{
+    key: 'hoa',
+    label: 'HOA',
+    bg: 'rgba(255,215,0,0.15)',
+    tc: '#fbbf24'
+  }, {
+    key: 'x40',
+    label: 'x40',
+    bg: 'rgba(255,105,180,0.10)',
+    tc: '#f472b6'
+  }, {
+    key: 'x12',
+    label: 'x12',
+    bg: 'rgba(152,251,152,0.08)',
+    tc: '#4ade80'
+  }, {
+    key: 'x20',
+    label: 'x20',
+    bg: 'rgba(221,160,221,0.08)',
+    tc: '#c084fc'
+  }].map(({
+    key,
+    label,
+    bg,
+    tc
+  }) => /*#__PURE__*/React.createElement("tr", {
+    key: key,
+    style: {
+      background: bg
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: isMobile ? '4px 6px' : '4px 10px',
+      fontWeight: 700,
+      fontSize: 11,
+      color: '#6366f1',
+      position: 'sticky',
+      left: 0,
+      background: '#1e293b',
+      borderRight: '1px solid rgba(255,255,255,0.06)',
+      borderTop: '1px solid rgba(255,255,255,0.08)'
+    }
+  }, label), dates.map((date, i) => /*#__PURE__*/React.createElement("td", {
+    key: date,
+    style: {
+      padding: isMobile ? '4px 3px' : '4px 5px',
+      fontWeight: 700,
+      fontSize: 11,
+      color: tc,
+      textAlign: 'center',
+      borderTop: '1px solid rgba(255,255,255,0.08)'
+    }
+  }, colStats[i][key]))))))));
 });
 
 /* ─────────────────────────── NewDrawToast ──────────────────────────────── */
@@ -1902,10 +2027,11 @@ function App() {
         if (!mounted) return;
         const info = JSON.parse(e.data);
         setLiveKy(info.latestKy);
-        // Show toast only — user clicks "↻ Cập nhật ngay" to force-refresh.
-        // Auto-rerender on every draw causes jarring mid-session updates;
-        // the 60s polling is already a silent safety net.
         setToast(info);
+        // Auto-refresh predictions ~1.5s after new draw (prewarm takes ~500ms)
+        setTimeout(() => {
+          if (mounted) loadRef.current(true);
+        }, 1_500);
       });
       es.onerror = () => {
         if (!mounted) return;
@@ -1977,7 +2103,41 @@ function App() {
     className: "hide-mobile"
   }, "Ph\xE2n t\xEDch th\u1ED1ng k\xEA combo \xB7 Realtime SSE \xB7 Walk-forward Backtest")), /*#__PURE__*/React.createElement("div", {
     className: "header-actions"
-  }, /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("a", {
+    href: "/history-table",
+    style: {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 6,
+      fontSize: 13,
+      fontWeight: 700,
+      color: '#fff',
+      textDecoration: 'none',
+      padding: '7px 16px',
+      borderRadius: 8,
+      background: 'linear-gradient(135deg,#6366f1,#818cf8)',
+      border: '1px solid rgba(129,140,248,0.5)',
+      boxShadow: '0 2px 8px rgba(99,102,241,0.3)'
+    }
+  }, "\uD83D\uDCC5 L\u1ECBch s\u1EED"), /*#__PURE__*/React.createElement("a", {
+    href: "https://lotto535.fly.dev",
+    target: "_blank",
+    rel: "noopener",
+    style: {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 6,
+      fontSize: 13,
+      fontWeight: 700,
+      color: '#fff',
+      textDecoration: 'none',
+      padding: '7px 16px',
+      borderRadius: 8,
+      background: 'linear-gradient(135deg,#059669,#10b981)',
+      border: '1px solid rgba(16,185,129,0.5)',
+      boxShadow: '0 2px 8px rgba(16,185,129,0.25)'
+    }
+  }, "\uFFFD Loto 5/35"), /*#__PURE__*/React.createElement("span", {
     style: C.pill
   }, total, " records"), /*#__PURE__*/React.createElement("span", {
     style: {
@@ -2277,24 +2437,66 @@ function App() {
   }))), /*#__PURE__*/React.createElement("div", {
     style: {
       ...C.card,
-      marginBottom: 28
+      marginBottom: 28,
+      padding: 0,
+      overflow: 'hidden'
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
-      ...C.label,
-      marginBottom: 14
+      display: 'flex',
+      alignItems: 'center',
+      borderBottom: '1px solid rgba(99,102,241,0.25)',
+      background: 'rgba(255,255,255,0.02)',
+      padding: '0 20px',
+      gap: 4
     }
-  }, "L\u1ECBch s\u1EED theo gi\u1EDD", /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("span", {
     style: {
-      fontWeight: 400,
-      textTransform: 'none',
-      color: '#475569',
-      marginLeft: 8
+      fontSize: 13,
+      fontWeight: 700,
+      color: '#a5b4fc',
+      padding: '10px 12px 10px 0',
+      borderBottom: '2px solid #6366f1',
+      marginBottom: -1
     }
-  }, "(hi\u1EC3n th\u1ECB ", history.length.toLocaleString(), " / ", total.toLocaleString(), " k\u1EF3)")), /*#__PURE__*/React.createElement(DrawPivotTable, {
-    history: history,
-    total: total
-  })), sumStats.length > 0 && /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDCCA L\u1ECBch s\u1EED theo gi\u1EDD"), /*#__PURE__*/React.createElement("a", {
+    href: "/history-table",
+    target: "_blank",
+    rel: "noopener",
+    style: {
+      fontSize: 13,
+      color: '#64748b',
+      padding: '10px 12px',
+      textDecoration: 'none',
+      borderRadius: 6,
+      transition: 'color 0.15s'
+    },
+    onMouseEnter: e => e.currentTarget.style.color = '#a5b4fc',
+    onMouseLeave: e => e.currentTarget.style.color = '#64748b'
+  }, "\u2197 B\u1EA3ng \u0111\u1EA7y \u0111\u1EE7"), /*#__PURE__*/React.createElement("a", {
+    href: "https://lotto535.fly.dev",
+    target: "_blank",
+    rel: "noopener",
+    style: {
+      fontSize: 13,
+      color: '#34d399',
+      padding: '10px 12px',
+      textDecoration: 'none',
+      borderRadius: 6,
+      marginLeft: 'auto',
+      fontWeight: 700,
+      display: 'flex',
+      alignItems: 'center',
+      gap: 5,
+      background: 'rgba(52,211,153,0.08)',
+      borderRadius: 6,
+      border: '1px solid rgba(52,211,153,0.25)'
+    }
+  }, "\uD83C\uDFC6 Loto 5/35")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '18px 20px'
+    }
+  }, /*#__PURE__*/React.createElement(DrawPivotTable, null))), sumStats.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       ...C.card,
       marginBottom: 28
@@ -2370,6 +2572,9 @@ function App() {
       marginBottom: 12
     }
   }, [{
+    href: '/history-table',
+    label: 'Lịch sử kết quả'
+  }, {
     href: '/about',
     label: 'Về chúng tôi'
   }, {
