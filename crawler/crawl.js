@@ -302,7 +302,7 @@ async function fetchBingo18Top() {
   try {
     const r = await axios.get(BINGO18TOP_URL, {
       timeout: 15_000,
-      headers: { ...HEADERS, Accept: 'application/json', Referer: 'https://bingo18.top/' },
+      headers: { ...HEADERS, Accept: 'application/json', Referer: 'https://bingo18.top/', 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' },
       responseType: 'json',
     })
     return parseBingo18Top(r.data)
@@ -381,10 +381,14 @@ async function merge(incoming) {
   const byKy = new Map(old.map(o => [o.ky, o]))
   // Index by canonical 6-min slot+day for Source C matching
   // Key: "YYYY-MM-DD|HH:MM" (canonical slot)
+  // Prefer the NEWEST (first in sorted array) record per slot — don't overwrite.
   const byCanonDay = new Map()
   for (const o of old) {
     const ci = canonicalSlotInfo(o.drawTime)
-    if (ci) byCanonDay.set(`${ci.date}|${ci.slot}`, o)
+    if (ci) {
+      const key = `${ci.date}|${ci.slot}`
+      if (!byCanonDay.has(key)) byCanonDay.set(key, o)
+    }
   }
 
   const newRecords = []
@@ -398,24 +402,33 @@ async function merge(incoming) {
       const canonMatch = canonKey ? byCanonDay.get(canonKey) : null
 
       if (canonMatch) {
-        // Existing record at same canonical slot → patch drawTime if date-only
-        const needsPatch = !canonMatch.drawTime || canonMatch.drawTime.endsWith('T00:00:00+07:00')
-        if (needsPatch) {
-          canonMatch.drawTime = r.drawTime
-          patched++
+        // Verify balls match — if balls differ, this is a NEW draw that happens to land in
+        // the same canonical 6-min slot as an existing draw (e.g. ky drawn 3 min early rounds
+        // UP to the next slot, then the next draw's actual time also hits that same slot).
+        const ballsMatch = canonMatch.n1 === r.n1 && canonMatch.n2 === r.n2 && canonMatch.n3 === r.n3
+        if (ballsMatch) {
+          // Same draw at same canonical slot → patch drawTime if currently date-only
+          const needsPatch = !canonMatch.drawTime || canonMatch.drawTime.endsWith('T00:00:00+07:00')
+          if (needsPatch) {
+            canonMatch.drawTime = r.drawTime
+            patched++
+          }
+          continue
         }
-        continue
+        // Different balls at same canonical slot → this is a genuinely new draw; fall through
+        // to add as a new record (do NOT skip it just because the slot is "occupied").
       }
 
       // Not matched by canonical slot. Try matching by id (re-imported Source C record).
       if (byId.has(r.id)) continue
 
-      // Fallback: match by n1+n2+n3 within a 10-minute window.
-      // Source C timestamps are typically 6-8 min earlier than official vietlott drawTime,
-      // so they fall in a different canonical slot but are the same actual draw.
+      // Fallback: match by n1+n2+n3 against existing KY records.
+      // Only use 10-minute real-time window — never match against date-only (T00:00:00) ky records
+      // because those can collide with a genuinely different draw that has the same balls.
       const rTime = new Date(r.drawTime).getTime()
       if (!isNaN(rTime)) {
         const ballMatch = old.find(x => x.ky && x.n1 === r.n1 && x.n2 === r.n2 && x.n3 === r.n3
+          && x.drawTime && !x.drawTime.endsWith('T00:00:00+07:00')
           && Math.abs(new Date(x.drawTime).getTime() - rTime) < 10 * 60 * 1000)
         if (ballMatch) continue
       }
@@ -436,9 +449,22 @@ async function merge(incoming) {
       // This handles the race where Source C inserts a record before Source A confirms it with ky.
       if (r.ky) {
         const rTime = new Date(r.drawTime).getTime()
-        if (!isNaN(rTime)) {
-          const noKyMatch = old.find(x => !x.ky && x.n1 === r.n1 && x.n2 === r.n2 && x.n3 === r.n3
-            && Math.abs(new Date(x.drawTime).getTime() - rTime) < 10 * 60 * 1000)
+        const rIsDateOnly = r.drawTime && r.drawTime.endsWith('T00:00:00+07:00')
+        const rDate = r.drawTime ? r.drawTime.slice(0, 10) : null
+        if (rDate) {
+          let noKyMatch = null
+          if (rIsDateOnly) {
+            // Source A gives date-only T00:00:00 — we don't know the exact time.
+            // Use findLast (oldest no-ky with matching balls on same day) to avoid
+            // accidentally promoting the NEWEST draw when multiple same-ball draws exist.
+            // Array is sorted newest-first, so findLast = chronologically oldest match.
+            noKyMatch = old.findLast(x => !x.ky && x.n1 === r.n1 && x.n2 === r.n2 && x.n3 === r.n3
+              && x.drawTime && x.drawTime.startsWith(rDate))
+          } else {
+            // Source B has real HH:MM time — safe 10-min window
+            noKyMatch = old.find(x => !x.ky && x.n1 === r.n1 && x.n2 === r.n2 && x.n3 === r.n3
+              && x.drawTime && Math.abs(new Date(x.drawTime).getTime() - rTime) < 10 * 60 * 1000)
+          }
           if (noKyMatch) {
             // Promote: gắn ky chính thức vào record Source C, dùng drawTime chính xác hơn
             noKyMatch.ky = r.ky
@@ -476,14 +502,24 @@ async function merge(incoming) {
     return { total: old.length, added: 0, newRecords, patched: 0, changed: false }
   }
 
-  // Sort: records with ky by ky desc; records without ky by drawTime desc
+  // Sort: unified sort by effective draw position.
+  // Real-timed records (not T00:00:00) use their actual timestamp.
+  // Date-only ky records (T00:00:00) use midnight of their date + ky as tiny offset,
+  //   so they sort AFTER any real-timed record from the SAME day but BEFORE records from earlier dates.
+  //   This correctly positions Source A's date-only records relative to Source C's real-timed records.
   old.sort((a, b) => {
-    const ka = a.ky ? Number(a.ky) : 0
-    const kb = b.ky ? Number(b.ky) : 0
-    if (ka && kb) return kb - ka
-    if (ka) return -1  // ky records at top
-    if (kb) return 1
-    return (b.drawTime || '').localeCompare(a.drawTime || '')
+    function sortKey(r) {
+      if (r.drawTime && !r.drawTime.endsWith('T00:00:00+07:00')) {
+        return new Date(r.drawTime).getTime()          // real timestamp (largest within a day)
+      }
+      if (r.drawTime && r.ky) {
+        // Date-only ky: midnight of that date + ky ms offset (unique within day, stays below real timestamps)
+        return new Date(r.drawTime).getTime() + Number(r.ky)
+      }
+      if (r.drawTime) return new Date(r.drawTime).getTime()  // date-only, no ky
+      return r.ky ? Number(r.ky) : 0                         // no drawTime at all
+    }
+    return sortKey(b) - sortKey(a)  // descending
   })
   await fs.ensureFile(FILE)
   await atomicWriteJSON(FILE, old)
@@ -559,10 +595,15 @@ async function run() {
     console.log(`[crawl] done ${elapsed}ms — total: ${after.length} (+${totalAdded} new${latestKy ? ', latest ky:' + latestKy : ''})`)
   }
 
+  // Use the latest KY-confirmed record from full history (not just allNew) so SSE always
+  // broadcasts the correct confirmed ky even when Source C adds a no-ky record first.
+  const latestKy = after.find(r => r.ky)?.ky || null
+
   return {
     total: after.length,
     added: totalAdded,
     newRecords: allNew,
+    latestKy,
     changed: totalAdded > 0 || (resultA?.patched || 0) + (resultB?.patched || 0) + (resultC?.patched || 0) > 0,
   }
 }

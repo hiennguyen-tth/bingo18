@@ -211,13 +211,16 @@ function withCache(key, ttlMs, fn) {
 /** Build /predict response payload from history array (newest-first). */
 function buildPredictPayload(data) {
   const latestRecord = data[0] || null
+  // Use latest KY-confirmed record for latestKy/latestDrawTime — no-ky Source C records at
+  // position 0 should not report latestKy as null to the client.
+  const latestKyRecord = data.find(r => r.ky) || latestRecord
   if (data.length < 2) {
     return {
       next: [],
       sumStats: [],
       total: data.length,
-      latestKy: latestRecord?.ky ?? null,
-      latestDrawTime: latestRecord?.drawTime ?? null,
+      latestKy: latestKyRecord?.ky ?? null,
+      latestDrawTime: latestKyRecord?.drawTime ?? null,
       message: 'Not enough data — run: node crawler/crawl.js'
     }
   }
@@ -263,8 +266,8 @@ function buildPredictPayload(data) {
     verdict: verdict || 'no_pattern',
     sumStats,
     total: data.length,
-    latestKy: latestRecord?.ky ?? null,
-    latestDrawTime: latestRecord?.drawTime ?? null,
+    latestKy: latestKyRecord?.ky ?? null,
+    latestDrawTime: latestKyRecord?.drawTime ?? null,
     maxScore: next.length ? +Math.max(...next.map(r => r.score)).toFixed(5) : 0
   }
 }
@@ -689,7 +692,6 @@ app.get('/api/history-grid', async (req, res) => {
     const cells = {}
     const slotSet = new Set()
     const dateSet = new Set()
-    const patRank = { triple: 3, pair: 2, normal: 1 }
 
     for (const r of data) {
       if (!r.drawTime) continue
@@ -710,11 +712,15 @@ app.get('/api/history-grid', async (req, res) => {
       dateSet.add(dateStr)
 
       if (!cells[slotStr]) cells[slotStr] = {}
-      // Keep one record per slot/day. When collision occurs, prefer notable patterns (triple > pair > normal).
+      // Keep one record per slot/day. When collision occurs (two draws map to same canonical slot
+      // due to rounding), prefer the NEWER draw — higher ky wins. Data is sorted newest-first so
+      // the first record we see is already the newest; only replace it if an explicitly higher ky arrives.
       const existing = cells[slotStr][dateStr]
       if (!existing) {
         cells[slotStr][dateStr] = { n1: r.n1, n2: r.n2, n3: r.n3, sum: r.sum, pattern: r.pattern, ky: r.ky }
-      } else if ((patRank[r.pattern] || 0) > (patRank[existing.pattern] || 0)) {
+      } else if (existing.ky && r.ky && Number(r.ky) > Number(existing.ky)) {
+        // Both ky-confirmed and incoming ky is higher → newer confirmed draw wins
+        // (Never overwrite a no-ky Source C record — it represents the most recent unconfirmed draw)
         cells[slotStr][dateStr] = { n1: r.n1, n2: r.n2, n3: r.n3, sum: r.sum, pattern: r.pattern, ky: r.ky }
       }
     }
@@ -936,8 +942,7 @@ async function crawlTick({ manual = false } = {}) {
   _crawlRunning = true
   lastCrawlAttempt = Date.now()
   try {
-    const { total, added, newRecords, changed } = await crawlRun()
-    const latestKy = newRecords?.[0]?.ky || null
+    const { total, added, newRecords, changed, latestKy } = await crawlRun()
 
     // Track consecutive failures (both sources returned empty).
     if (added === 0 && total === lastKnownTotal && isOperatingHours()) {
@@ -997,7 +1002,7 @@ async function runDeepRecovery() {
       console.log(`[crawler] deep recovery: +${totalAdded} draws filled`)
       invalidateCache()
       const data2 = await loadHistory()
-      broadcast('new-draw', { added: totalAdded, latestKy: data2[0]?.ky || '?', total: data2.length, ts: new Date().toISOString(), source: 'deep-recovery' })
+      broadcast('new-draw', { added: totalAdded, latestKy: data2.find(r => r.ky)?.ky || '?', total: data2.length, ts: new Date().toISOString(), source: 'deep-recovery' })
     }
   } catch (err) {
     console.error('[crawler] deep recovery error:', err.message)
