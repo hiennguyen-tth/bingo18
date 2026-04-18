@@ -50,6 +50,11 @@ const BINGO18TOP_URL = 'https://bingo18.top/data/data.json'
 // the next begins, so no data is lost when both resolve within ms of each other.
 let _writeQueue = Promise.resolve()
 
+// ── In-process history cache — avoids re-reading 8 MB on every merge call ──
+// Invalidated automatically when merge() writes a new file (mtime updates).
+let _crawlHistoryCache = null
+let _crawlHistoryCacheMtime = 0
+
 function queuedMerge(records) {
   if (!records || records.length === 0) {
     return Promise.resolve({ total: 0, added: 0, newRecords: [], patched: 0, changed: false })
@@ -153,14 +158,27 @@ async function loadHistorySafe() {
   const exists = await fs.pathExists(FILE)
   if (!exists) return []
 
+  // Mtime-based cache: avoids re-reading 8 MB JSON on every merge() call within the same tick.
+  // merge() updates _crawlHistoryCache after each write so the next source sees fresh data.
+  try {
+    const stat = await fs.stat(FILE)
+    if (_crawlHistoryCache && stat.mtimeMs === _crawlHistoryCacheMtime) return _crawlHistoryCache
+  } catch (_) { /* stat failed — fall through to read */ }
+
   const parsed = await fs.readJSON(FILE).catch(() => null)
-  if (Array.isArray(parsed)) return parsed
+  if (Array.isArray(parsed)) {
+    _crawlHistoryCache = parsed
+    try { _crawlHistoryCacheMtime = (await fs.stat(FILE)).mtimeMs } catch (_) { }
+    return parsed
+  }
 
   // If the primary file is corrupted, attempt recovery from backup.
   const backup = await fs.readJSON(BACKUP_FILE).catch(() => null)
   if (Array.isArray(backup) && backup.length > 0) {
     console.error(`[crawl] WARNING: history.json corrupted, recovering from backup (${backup.length} records)`)
     await atomicWriteJSON(FILE, backup)
+    _crawlHistoryCache = backup
+    try { _crawlHistoryCacheMtime = (await fs.stat(FILE)).mtimeMs } catch (_) { }
     return backup
   }
 
@@ -526,6 +544,10 @@ async function merge(incoming) {
   })
   await fs.ensureFile(FILE)
   await atomicWriteJSON(FILE, old)
+  // Update in-process cache so the next merge() call (e.g. Source A after Source C)
+  // skips the 8 MB re-read and sees the data we just wrote.
+  try { _crawlHistoryCacheMtime = (await fs.stat(FILE)).mtimeMs } catch (_) { }
+  _crawlHistoryCache = old
   // Keep a last-known-good snapshot for corruption recovery.
   await atomicWriteJSON(BACKUP_FILE, old)
   return { total: old.length, added: newRecords.length, newRecords, patched, changed: true }
@@ -549,11 +571,21 @@ async function run() {
   let cFailed = false
 
   // ── Primary: Source C (bingo18.top) — fast JSON, full timestamps ──────
+  // Source C returns a 45-day rolling window (~7200 records). For regular crawl ticks
+  // we only need recent records — merging all 7200 every 60s was the main crawl bottleneck.
+  // 24-hour window covers any reasonable restart gap; deep recovery fills longer outages.
+  const SOURCE_C_WINDOW_MS = 24 * 60 * 60 * 1000  // 24h ≈ 240 draws
   try {
     const recs = await fetchBingo18Top()
     if (recs.length > 0) {
-      resultC = await queuedMerge(recs)
-      console.log(`[crawl] C(bingo18top): ${recs.length} recs +${resultC.added} new patched=${resultC.patched}`)
+      const cutoffMs = Date.now() - SOURCE_C_WINDOW_MS
+      const recentRecs = recs.filter(r => {
+        const t = r.drawTime ? new Date(r.drawTime).getTime() : NaN
+        return !isNaN(t) && t >= cutoffMs
+      })
+      const mergeRecs = recentRecs.length > 0 ? recentRecs : recs.slice(0, 30)
+      resultC = await queuedMerge(mergeRecs)
+      console.log(`[crawl] C(bingo18top): ${recs.length} total, ${mergeRecs.length} recent → +${resultC.added} new patched=${resultC.patched}`)
     } else {
       cFailed = true
     }

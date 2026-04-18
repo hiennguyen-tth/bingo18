@@ -704,7 +704,9 @@ app.get('/api/history-grid', async (req, res) => {
       if (r.drawTime.includes('T00:00:00')) continue
 
       const d = new Date(r.drawTime)
-      if (isNaN(d.getTime()) || d < cutoff) continue
+      if (isNaN(d.getTime())) continue
+      // Data is sorted newest-first; first real-timed record before cutoff means all remaining are too.
+      if (d < cutoff) break
 
       // Snap to canonical 6-minute slot (06:00, 06:06, ..., 21:54 VN time)
       const ci = canonicalSlotInfo(r.drawTime)
