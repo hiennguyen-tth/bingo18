@@ -300,10 +300,13 @@ async function fetchHtml() {
  */
 async function fetchBingo18Top() {
   try {
+    const https = require('https')
+    const agent = new https.Agent({ rejectUnauthorized: false })
     const r = await axios.get(BINGO18TOP_URL, {
       timeout: 15_000,
       headers: { ...HEADERS, Accept: 'application/json', Referer: 'https://bingo18.top/', 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' },
       responseType: 'json',
+      httpsAgent: agent,
     })
     return parseBingo18Top(r.data)
   } catch (err) {
@@ -529,21 +532,37 @@ async function merge(incoming) {
 }
 
 /**
- * Triple-source parallel crawl — main entry point called by the server loop every 60s.
+ * Primary-source crawl — main entry point called by the server loop every 60s.
  *
- * All three sources fire simultaneously. As each resolves, its records are immediately
- * merged via queuedMerge (serialized). Whichever source arrives first writes first;
- * the others fill gaps and patch missing timestamps.
+ * Strategy: bingo18.top (Source C) is the PRIMARY source — fast, full timestamps, no captcha.
+ *   Sources A (vietlott.vn) and B (xoso.net.vn) are FALLBACK — only called when C fails.
+ *   This avoids hitting rate-limited sites unnecessarily. A/B provide ky numbers to
+ *   promote no-ky Source C records.
  *
  * @returns {{ total, added, newRecords, changed }}
  */
 async function run() {
   const t0 = Date.now()
+  let resultC = null
   let resultA = null
   let resultB = null
-  let resultC = null
+  let cFailed = false
 
-  // Source A (priority): vietlott.vn — official source, authoritative ky numbers.
+  // ── Primary: Source C (bingo18.top) — fast JSON, full timestamps ──────
+  try {
+    const recs = await fetchBingo18Top()
+    if (recs.length > 0) {
+      resultC = await queuedMerge(recs)
+      console.log(`[crawl] C(bingo18top): ${recs.length} recs +${resultC.added} new patched=${resultC.patched}`)
+    } else {
+      cFailed = true
+    }
+  } catch (err) {
+    console.warn('[crawl] C(bingo18top) failed:', err.message)
+    cFailed = true
+  }
+
+  // ── Always: Source A (vietlott) — provides authoritative ky numbers to promote C records ──
   const pA = fetchVietlott().then(async (recs) => {
     if (recs.length === 0) return
     resultA = await queuedMerge(recs)
@@ -551,23 +570,18 @@ async function run() {
     console.log(`[crawl] A(vietlott): ${recs.length} recs (ky≤${maxKy}) +${resultA.added} new`)
   }).catch(err => console.warn('[crawl] source A error:', err.message))
 
-  // Source B: xoso.net.vn HTML — includes drawTime (HH:MM) to enrich existing records.
-  const pB = fetchHtml().then(async (recs) => {
-    if (recs.length === 0) return
-    resultB = await queuedMerge(recs)
-    const maxKy = Math.max(...recs.map(r => Number(r.ky)))
-    console.log(`[crawl] B(xoso): ${recs.length} recs (ky≤${maxKy}) +${resultB.added} new`)
-  }).catch(err => console.warn('[crawl] source B error:', err.message))
+  // ── Fallback: Source B (xoso) — only when C failed ────────────────────
+  let pB = Promise.resolve()
+  if (cFailed) {
+    pB = fetchHtml().then(async (recs) => {
+      if (recs.length === 0) return
+      resultB = await queuedMerge(recs)
+      const maxKy = Math.max(...recs.map(r => Number(r.ky)))
+      console.log(`[crawl] B(xoso): ${recs.length} recs (ky≤${maxKy}) +${resultB.added} new`)
+    }).catch(err => console.warn('[crawl] source B error:', err.message))
+  }
 
-  // Source C: bingo18.top — full timestamp feed, patches drawTimes, fills gaps.
-  const pC = fetchBingo18Top().then(async (recs) => {
-    if (recs.length === 0) return
-    resultC = await queuedMerge(recs)
-    console.log(`[crawl] C(bingo18top): ${recs.length} recs +${resultC.added} new patched=${resultC.patched}`)
-  }).catch(err => console.warn('[crawl] source C error:', err.message))
-
-  // Wait for all three to complete.
-  await Promise.allSettled([pA, pB, pC])
+  await Promise.allSettled([pA, pB])
 
   const elapsed = Date.now() - t0
 
@@ -577,11 +591,11 @@ async function run() {
     return { total: current.length, added: 0, newRecords: [], changed: false }
   }
 
-  const totalAdded = (resultA?.added || 0) + (resultB?.added || 0) + (resultC?.added || 0)
+  const totalAdded = (resultC?.added || 0) + (resultA?.added || 0) + (resultB?.added || 0)
   const allNew = [
+    ...(resultC?.newRecords || []),
     ...(resultA?.newRecords || []),
     ...(resultB?.newRecords || []),
-    ...(resultC?.newRecords || []),
   ].sort((a, b) => {
     const ka = a.ky ? Number(a.ky) : 0
     const kb = b.ky ? Number(b.ky) : 0
@@ -595,8 +609,6 @@ async function run() {
     console.log(`[crawl] done ${elapsed}ms — total: ${after.length} (+${totalAdded} new${latestKy ? ', latest ky:' + latestKy : ''})`)
   }
 
-  // Use the latest KY-confirmed record from full history (not just allNew) so SSE always
-  // broadcasts the correct confirmed ky even when Source C adds a no-ky record first.
   const latestKy = after.find(r => r.ky)?.ky || null
 
   return {
@@ -604,7 +616,7 @@ async function run() {
     added: totalAdded,
     newRecords: allNew,
     latestKy,
-    changed: totalAdded > 0 || (resultA?.patched || 0) + (resultB?.patched || 0) + (resultC?.patched || 0) > 0,
+    changed: totalAdded > 0 || (resultC?.patched || 0) + (resultA?.patched || 0) + (resultB?.patched || 0) > 0,
   }
 }
 

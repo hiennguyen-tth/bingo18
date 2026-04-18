@@ -6,13 +6,13 @@ npm-debug.log*
 
 # Don't ship local dataset — crawl fresh on first deploy
 dataset/history.json
+dataset/*.bak
+dataset/*_cache.json
 
 # Dev/tooling files
 *.md
 python/
 backtest/
-analyze_triple.js
-write_ensemble.js
 test.js
 ecosystem.config.js
 logs/

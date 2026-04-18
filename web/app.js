@@ -495,19 +495,19 @@ const PatTag = memo(function PatTag({
 }) {
   const s = {
     triple: {
-      background: 'rgba(139,92,246,0.3)',
+      background: 'rgba(139,92,246,0.14)',
       color: '#c4b5fd'
     },
     pair: {
-      background: 'rgba(59,130,246,0.25)',
+      background: 'rgba(59,130,246,0.13)',
       color: '#7dd3fc'
     },
     normal: {
-      background: 'rgba(255,255,255,0.06)',
+      background: 'rgba(255,255,255,0.05)',
       color: '#94a3b8'
     }
   }[pat] || {
-    background: 'rgba(255,255,255,0.06)',
+    background: 'rgba(255,255,255,0.05)',
     color: '#94a3b8'
   };
   return /*#__PURE__*/React.createElement("span", {
@@ -1215,7 +1215,8 @@ const OverdueTable = memo(function OverdueTable({
 
 /* ─────────────────────── DrawPivotTable (lịch sử theo giờ) ─────────────── */
 const DrawPivotTable = memo(function DrawPivotTable({
-  refreshKey = 0
+  refreshKey = 0,
+  onSelect
 }) {
   const [days, setDays] = useState(5);
   const [filter, setFilter] = useState('all');
@@ -1246,32 +1247,16 @@ const DrawPivotTable = memo(function DrawPivotTable({
     return DAY_VN[new Date(Date.UTC(y, mo - 1, dd)).getUTCDay()] + ' ' + dd + '/' + mo;
   }
 
-  // Cell background based on sum/pattern — matching history.html
+  // Cell background based on sum/pattern
   function cellBg(cell) {
-    // 3-tier intensity: sum < 10 → light · sum 10/11 → neutral · sum > 11 → dark
     const {
       sum,
       pattern
     } = cell;
-    if (pattern === 'triple') return 'rgba(255,215,0,0.30)'; // gold override
-    const m = {
-      3: 'rgba(255,179,186,0.22)',
-      4: 'rgba(255,179,186,0.18)',
-      5: 'rgba(152,251,152,0.16)',
-      6: 'rgba(176,196,222,0.16)',
-      7: 'rgba(176,224,230,0.13)',
-      8: 'rgba(200,225,255,0.10)',
-      9: 'rgba(210,235,255,0.07)',
-      // 10/11 → no background (neutral)
-      12: 'rgba(255,252,210,0.22)',
-      13: 'rgba(255,220,170,0.28)',
-      14: 'rgba(255,190,120,0.34)',
-      15: 'rgba(255,140,100,0.38)',
-      16: 'rgba(221,160,221,0.44)',
-      17: 'rgba(255,105,180,0.46)',
-      18: 'rgba(255,215,0,0.46)'
-    };
-    return m[sum] || '';
+    if (pattern === 'triple') return 'rgba(255,215,0,0.30)'; // gold override for HOA
+    if (sum <= 9) return 'rgba(147,197,253,0.12)'; // low sum → subtle blue
+    if (sum >= 12) return 'rgba(253,186,116,0.12)'; // high sum → subtle warm
+    return ''; // 10/11 → neutral (no bg)
   }
 
   // Box-shadow for HOA/pair borders in the pivot table
@@ -1282,13 +1267,11 @@ const DrawPivotTable = memo(function DrawPivotTable({
     return 'none';
   }
 
-  // Per-ball color — softer tones matching history.html ball classes
+  // Per-ball color — softer tones for readability
   function ballColor(n1, n2, n3, i) {
-    if (n1 === n2 && n2 === n3) return 'rgba(133, 87, 240, 0.7)'; // triple → soft purple
-    const ns = [n1, n2, n3];
-    const n = ns[i];
+    if (n1 === n2 && n2 === n3) return 'rgba(167,139,250,0.55)'; // triple → muted purple
     const isPairBall = i === 0 && (n1 === n2 || n1 === n3) || i === 1 && (n2 === n1 || n2 === n3) || i === 2 && (n3 === n1 || n3 === n2);
-    return isPairBall ? 'rgba(175, 251, 248, 0.95)' : 'rgba(243, 250, 207, 0.93)'; // pair → soft blue, normal → soft orange
+    return isPairBall ? 'rgba(147,197,253,0.55)' : 'rgba(148,163,184,0.35)'; // pair → muted blue, normal → muted gray
   }
 
   // Sorted combo key for order-independent match
@@ -1450,7 +1433,7 @@ const DrawPivotTable = memo(function DrawPivotTable({
       flexWrap: 'wrap',
       alignItems: 'center'
     }
-  }, [['rgba(139,92,246,0.70)', 'HOA'], ['rgba(59,130,246,0.65)', 'Đôi'], ['rgba(249,115,22,0.65)', 'Thường'], ['rgba(255,215,0,0.6)', 'Tổng 18/3'], ['rgba(255,105,180,0.6)', 'x40(4/17)'], ['rgba(152,251,152,0.6)', 'x12(6/15)']].map(([c, l]) => /*#__PURE__*/React.createElement("span", {
+  }, [['rgba(167,139,250,0.55)', 'HOA'], ['rgba(147,197,253,0.55)', 'Đôi'], ['rgba(148,163,184,0.35)', 'Thường'], ['rgba(147,197,253,0.35)', 'Sum ≤9'], ['rgba(253,186,116,0.35)', 'Sum ≥12']].map(([c, l]) => /*#__PURE__*/React.createElement("span", {
     key: l,
     style: {
       display: 'flex',
@@ -1583,7 +1566,11 @@ const DrawPivotTable = memo(function DrawPivotTable({
       const isHl = hlCombo !== null;
       return /*#__PURE__*/React.createElement("td", {
         key: date,
-        onClick: cell ? () => setHlCombo(prev => prev === ck ? null : ck) : undefined,
+        onClick: cell ? () => {
+          const next = hlCombo === ck ? null : ck;
+          setHlCombo(next);
+          onSelect?.(next);
+        } : undefined,
         style: {
           padding: isMobile ? '2px 3px' : '3px 5px',
           textAlign: 'center',
@@ -1871,8 +1858,9 @@ function App() {
   const [modelContrib, setModelContrib] = useState(null);
   const [verdict, setVerdict] = useState(null);
   const [sumPreds, setSumPreds] = useState(null);
+  const [hlHistoryCombo, setHlHistoryCombo] = useState(null);
 
-  // Bingo18 operating hours: 06:00–21:54 Vietnam time (UTC+7)
+  // Bingo18 operating hours: 06:00–22:00 Vietnam time (UTC+7)
   const isNowOperating = () => {
     const vnMin = (new Date().getUTCHours() + 7) % 24 * 60 + new Date().getUTCMinutes();
     return vnMin >= 360 && vnMin <= 1320;
@@ -2080,7 +2068,7 @@ function App() {
 
   // ── Periodic data refresh ──
   // - Skip all fetches when the browser tab is hidden (saves mobile battery + server CPU)
-  // - predict+history: every 60s during operating hours (06:00–21:54 VN), else every 5min
+  // - predict+history: every 60s during operating hours (06:00–22:00 VN), else every 5min
   // - stats+overdue:   every 5 minutes (heavy O(N²) backtest, changes slowly)
   // SSE handles instant updates when a new draw appears; polling is just a safety net.
   useEffect(() => {
@@ -2182,7 +2170,7 @@ function App() {
       borderColor: 'rgba(251,191,36,0.4)',
       background: 'rgba(251,191,36,0.08)'
     },
-    title: "Bingo18 m\u1EDF 06:00\u201321:54 VN. Kh\xF4ng c\xF3 k\u1EF3 m\u1EDBi ngo\xE0i gi\u1EDD n\xE0y."
+    title: "Bingo18 m\u1EDF 06:00\u201322:00 VN. Kh\xF4ng c\xF3 k\u1EF3 m\u1EDBi ngo\xE0i gi\u1EDD n\xE0y."
   }, "\uD83D\uDD15 Ngo\xE0i gi\u1EDD Bingo"), /*#__PURE__*/React.createElement("span", {
     style: {
       ...C.pill,
@@ -2404,33 +2392,74 @@ function App() {
       fontSize: 10,
       color: m.color
     }
-  }, m.label, " ", modelContrib[m.key], "%")))), /*#__PURE__*/React.createElement("div", {
+  }, m.label, " ", modelContrib[m.key], "%")))), hlHistoryCombo && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      marginBottom: 10,
+      padding: '6px 12px',
+      background: 'rgba(99,102,241,0.12)',
+      border: '1px solid rgba(99,102,241,0.35)',
+      borderRadius: 8,
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#a5b4fc',
+      fontWeight: 700
+    }
+  }, "\uD83D\uDD0D L\u1ECDc combo t\u1EEB l\u1ECBch s\u1EED: ", hlHistoryCombo.split('').join('-')), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setHlHistoryCombo(null),
+    style: {
+      marginLeft: 'auto',
+      background: 'none',
+      border: 'none',
+      color: '#6366f1',
+      cursor: 'pointer',
+      fontSize: 14,
+      fontWeight: 700,
+      padding: '0 4px'
+    }
+  }, "\u2715")), /*#__PURE__*/React.createElement("div", {
     className: "grid3"
   }, preds.length === 0 && !loading && /*#__PURE__*/React.createElement("div", {
     style: {
       color: '#64748b',
       fontSize: 13
     }
-  }, "Ch\u01B0a c\xF3 d\u1EF1 \u0111o\xE1n."), preds.map((p, i) => /*#__PURE__*/React.createElement(PredCard, {
-    key: `${predictBasisKy || 'base'}:${p.combo}`,
-    combo: p.combo,
-    pct: p.pct,
-    rank: i,
-    maxPct: maxPct,
-    score: p.score,
-    maxScore: maxScore,
-    overdueRatio: p.overdueRatio,
-    comboGap: p.comboGap ?? 0,
-    pat: p.pat,
-    stability: p.stability,
-    zScore: p.zScore,
-    statNorm: p.statNorm ?? p.coreNorm,
-    mk2Norm: p.mk2Norm,
-    sessNorm: p.sessNorm,
-    rankStrength: p.rankStrength,
-    calBuckets: stats?.calBuckets,
-    isUniform: !!modelContrib?._uniform
-  })))), overdue && /*#__PURE__*/React.createElement("div", {
+  }, "Ch\u01B0a c\xF3 d\u1EF1 \u0111o\xE1n."), preds.map((p, i) => {
+    const pKey = p.combo.split('-').sort().join('');
+    const isDimmed = hlHistoryCombo && pKey !== hlHistoryCombo;
+    const isMatch = hlHistoryCombo && pKey === hlHistoryCombo;
+    return /*#__PURE__*/React.createElement("div", {
+      key: `${predictBasisKy || 'base'}:${p.combo}`,
+      style: {
+        opacity: isDimmed ? 0.28 : 1,
+        transition: 'opacity 0.15s',
+        outline: isMatch ? '2px solid #6366f1' : 'none',
+        borderRadius: 12
+      }
+    }, /*#__PURE__*/React.createElement(PredCard, {
+      combo: p.combo,
+      pct: p.pct,
+      rank: i,
+      maxPct: maxPct,
+      score: p.score,
+      maxScore: maxScore,
+      overdueRatio: p.overdueRatio,
+      comboGap: p.comboGap ?? 0,
+      pat: p.pat,
+      stability: p.stability,
+      zScore: p.zScore,
+      statNorm: p.statNorm ?? p.coreNorm,
+      mk2Norm: p.mk2Norm,
+      sessNorm: p.sessNorm,
+      rankStrength: p.rankStrength,
+      calBuckets: stats?.calBuckets,
+      isUniform: !!modelContrib?._uniform
+    }));
+  }))), overdue && /*#__PURE__*/React.createElement("div", {
     style: {
       ...C.card,
       marginBottom: 28
@@ -2508,7 +2537,8 @@ function App() {
       padding: '18px 20px'
     }
   }, /*#__PURE__*/React.createElement(DrawPivotTable, {
-    refreshKey: pivotRefreshCount
+    refreshKey: pivotRefreshCount,
+    onSelect: setHlHistoryCombo
   }))), sumStats.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       ...C.card,

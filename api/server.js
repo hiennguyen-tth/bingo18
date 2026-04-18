@@ -57,7 +57,7 @@ const predict = require('../predictor/ensemble')
 const frequency = require('../predictor/frequency')
 const features = require('../predictor/features')
 const { runStatTests } = require('../predictor/stats_tests')
-const { run: crawlRun, crawlPage, crawlSince, merge: crawlMerge, canonicalSlotInfo } = require('../crawler/crawl')
+const { run: crawlRun, crawlSince, canonicalSlotInfo } = require('../crawler/crawl')
 
 const app = express()
 const PORT = parseInt(process.env.PORT) || 8080
@@ -942,7 +942,7 @@ async function crawlTick({ manual = false } = {}) {
   _crawlRunning = true
   lastCrawlAttempt = Date.now()
   try {
-    const { total, added, newRecords, changed, latestKy } = await crawlRun()
+    const { total, added, changed, latestKy } = await crawlRun()
 
     // Track consecutive failures (both sources returned empty).
     if (added === 0 && total === lastKnownTotal && isOperatingHours()) {

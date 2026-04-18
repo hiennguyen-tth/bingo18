@@ -8,6 +8,8 @@ yarn-error.log*
 # ── Dataset (large / generated) ───────────────
 # Remove the next line if you want to track seed data
 # dataset/history.json
+dataset/*.bak
+dataset/*_cache.json
 
 # ── Python ────────────────────────────────────
 __pycache__/
