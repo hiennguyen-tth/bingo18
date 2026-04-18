@@ -410,6 +410,16 @@ async function merge(incoming) {
       // Not matched by canonical slot. Try matching by id (re-imported Source C record).
       if (byId.has(r.id)) continue
 
+      // Fallback: match by n1+n2+n3 within a 10-minute window.
+      // Source C timestamps are typically 6-8 min earlier than official vietlott drawTime,
+      // so they fall in a different canonical slot but are the same actual draw.
+      const rTime = new Date(r.drawTime).getTime()
+      if (!isNaN(rTime)) {
+        const ballMatch = old.find(x => x.ky && x.n1 === r.n1 && x.n2 === r.n2 && x.n3 === r.n3
+          && Math.abs(new Date(x.drawTime).getTime() - rTime) < 10 * 60 * 1000)
+        if (ballMatch) continue
+      }
+
       // Truly new record from Source C — insert without ky
       const rec = { id: r.id, drawTime: r.drawTime, n1: r.n1, n2: r.n2, n3: r.n3, sum: r.sum, pattern: r.pattern }
       old.push(rec)
@@ -422,6 +432,25 @@ async function merge(incoming) {
     // ── Source A/B: normal ky-based merge ────────────────────────────────
     const existing = byId.get(r.id) || (r.ky ? byKy.get(r.ky) : null)
     if (!existing) {
+      // Try to promote an existing Source C no-ky record with same balls within 10 min.
+      // This handles the race where Source C inserts a record before Source A confirms it with ky.
+      if (r.ky) {
+        const rTime = new Date(r.drawTime).getTime()
+        if (!isNaN(rTime)) {
+          const noKyMatch = old.find(x => !x.ky && x.n1 === r.n1 && x.n2 === r.n2 && x.n3 === r.n3
+            && Math.abs(new Date(x.drawTime).getTime() - rTime) < 10 * 60 * 1000)
+          if (noKyMatch) {
+            // Promote: gắn ky chính thức vào record Source C, dùng drawTime chính xác hơn
+            noKyMatch.ky = r.ky
+            byKy.set(r.ky, noKyMatch)
+            if (r.drawTime && !r.drawTime.endsWith('T00:00:00+07:00')) {
+              noKyMatch.drawTime = r.drawTime
+            }
+            patched++
+            continue
+          }
+        }
+      }
       old.push(r)
       byId.set(r.id, r)
       if (r.ky) byKy.set(r.ky, r)

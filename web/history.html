@@ -168,6 +168,9 @@
             font-weight: 700;
             padding: 6px 8px;
             text-transform: uppercase;
+            /* Replace border-bottom with box-shadow to avoid double-border with border-collapse */
+            border-bottom: none;
+            box-shadow: 0 1px 0 rgba(99, 102, 241, 0.35);
         }
 
         thead th:first-child {
@@ -219,16 +222,16 @@
             font-weight: 700;
             font-size: 11px;
             color: #fff;
-            background: #f97316;
+            background: rgba(249, 115, 22, 0.65);
             flex-shrink: 0;
         }
 
         .ball.triple {
-            background: #8b5cf6;
+            background: rgba(139, 92, 246, 0.70);
         }
 
         .ball.pair {
-            background: #3b82f6;
+            background: rgba(59, 130, 246, 0.65);
         }
 
         .sum {
@@ -312,12 +315,17 @@
 
         /* Cross-day: same sum repeated in ≥2 days at same time slot */
         td.draw-cell.cross-day-sum {
-            border-bottom: 2px solid rgba(251, 191, 36, 0.80) !important;
+            box-shadow: 0 2px 0 rgba(251, 191, 36, 0.85);
         }
 
         /* Cross-day: same pattern (HOA or Đôi) in ≥2 days at same time slot */
         td.draw-cell.cross-day-pattern {
-            border-top: 2px solid rgba(52, 211, 153, 0.85) !important;
+            box-shadow: 0 -2px 0 rgba(52, 211, 153, 0.90);
+        }
+
+        /* Both cross-day indicators on same cell */
+        td.draw-cell.cross-day-sum.cross-day-pattern {
+            box-shadow: 0 2px 0 rgba(251, 191, 36, 0.85), 0 -2px 0 rgba(52, 211, 153, 0.90);
         }
 
         /* Footer rows */
@@ -357,6 +365,17 @@
 
         td.draw-cell.hl-dim {
             opacity: 0.35;
+        }
+
+        /* Row selection highlight */
+        tr.selected-row td {
+            background: rgba(99, 102, 241, 0.14) !important;
+            box-shadow: none;
+        }
+
+        tr.selected-row td:first-child {
+            background: rgba(99, 102, 241, 0.25) !important;
+            color: #a5b4fc;
         }
 
         /* Loading / error */
@@ -448,6 +467,20 @@
 
         let _gridData = null
         let _highlightCombo = null
+        let _selectedSlot = null
+
+        function selectRow(slot) {
+            // Toggle off if same slot
+            if (_selectedSlot === slot) {
+                _selectedSlot = null
+                document.querySelectorAll('tr.selected-row').forEach(r => r.classList.remove('selected-row'))
+                return
+            }
+            _selectedSlot = slot
+            document.querySelectorAll('tr.selected-row').forEach(r => r.classList.remove('selected-row'))
+            const rows = document.querySelectorAll(`tr[data-slot="${slot}"]`)
+            rows.forEach(r => r.classList.add('selected-row'))
+        }
 
         function renderGrid(data) {
             _gridData = data
@@ -460,7 +493,7 @@
             const todayStr = `${nowVN.getUTCFullYear()}-${String(nowVN.getUTCMonth() + 1).padStart(2, '0')}-${String(nowVN.getUTCDate()).padStart(2, '0')}`
 
             // Build header
-            let html = '<table><thead><tr><th>Giờ</th>'
+            let html = '<table><thead><tr><th title="Click cột giờ để chọn hàng so sánh">Giờ</th>'
             for (const date of dates) html += `<th>${vnDate(date)}</th>`
             html += '</tr></thead><tbody>'
 
@@ -475,8 +508,9 @@
                 const nowTotalMin = nowH * 60 + nowM
                 const isCurrent = Math.abs(slotTotalMin - nowTotalMin) <= 6
 
-                html += `<tr${isCurrent ? ' class="current-slot"' : ''}>`
-                html += `<td>${slot}</td>`
+                const rowCls = isCurrent ? 'current-slot' : ''
+                html += `<tr${rowCls ? ` class="${rowCls}"` : ''} data-slot="${slot}">`
+                html += `<td onclick="selectRow('${slot}')" style="cursor:pointer">${slot}</td>`
 
                 for (const date of dates) {
                     const cell = cells[slot]?.[date]
@@ -633,17 +667,45 @@
             }
         }
 
-        // Auto-refresh every 60s during operating hours
+        // Auto-refresh every 60s during operating hours (VN time) + SSE live reload
+        function isOperatingHoursVN() {
+            const vnMin = ((new Date().getUTCHours() + 7) % 24) * 60 + new Date().getUTCMinutes()
+            return vnMin >= 360 && vnMin <= 1320  // 06:00–22:00 VN
+        }
+
         function scheduleAutoRefresh() {
-            const h = new Date().getHours()
-            if (h >= 6 && h < 22) {
+            if (isOperatingHoursVN()) {
                 setTimeout(() => { loadGrid(); scheduleAutoRefresh() }, 60_000)
+            } else {
+                // Check again in 5 min
+                setTimeout(scheduleAutoRefresh, 5 * 60_000)
             }
+        }
+
+        let _sseReloadTimer = null
+        function connectSSE() {
+            let es
+            let reconnectTimer
+            function open() {
+                es = new EventSource('/events')
+                es.addEventListener('new-draw', () => {
+                    // Debounce: only reload once even if multiple events arrive quickly
+                    clearTimeout(_sseReloadTimer)
+                    _sseReloadTimer = setTimeout(() => loadGrid(), 1_500)
+                })
+                es.onerror = () => {
+                    es.close()
+                    clearTimeout(reconnectTimer)
+                    reconnectTimer = setTimeout(open, 5_000)
+                }
+            }
+            open()
         }
 
         document.addEventListener('DOMContentLoaded', () => {
             loadGrid()
             scheduleAutoRefresh()
+            connectSSE()
         })
     </script>
 </body>

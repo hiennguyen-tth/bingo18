@@ -585,7 +585,7 @@ const OverdueTable = memo(function OverdueTable({ items, loading, title }) {
 })
 
 /* ─────────────────────── DrawPivotTable (lịch sử theo giờ) ─────────────── */
-const DrawPivotTable = memo(function DrawPivotTable() {
+const DrawPivotTable = memo(function DrawPivotTable({ refreshKey = 0 }) {
   const [days, setDays] = useState(5)
   const [filter, setFilter] = useState('all')
   const [hlCombo, setHlCombo] = useState(null)
@@ -603,11 +603,11 @@ const DrawPivotTable = memo(function DrawPivotTable() {
   useEffect(() => {
     setLoading(true)
     setError(null)
-    fetch(`/api/history-grid?days=${days}`)
+    fetch(`/api/history-grid?days=${days}&_t=${Date.now()}`)
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
       .then(d => { setGridData(d); setLoading(false) })
       .catch(e => { setError(e.message); setLoading(false) })
-  }, [days])
+  }, [days, refreshKey])
 
   const DAY_VN = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7']
   function fmtDateHdr(ds) {
@@ -642,15 +642,15 @@ const DrawPivotTable = memo(function DrawPivotTable() {
     return 'none'
   }
 
-  // Per-ball color — matching history.html ball classes
+  // Per-ball color — softer tones matching history.html ball classes
   function ballColor(n1, n2, n3, i) {
-    if (n1 === n2 && n2 === n3) return '#8b5cf6'       // triple → purple
+    if (n1 === n2 && n2 === n3) return 'rgba(133, 87, 240, 0.7)'   // triple → soft purple
     const ns = [n1, n2, n3]
     const n = ns[i]
     const isPairBall = (i === 0 && (n1 === n2 || n1 === n3)) ||
       (i === 1 && (n2 === n1 || n2 === n3)) ||
       (i === 2 && (n3 === n1 || n3 === n2))
-    return isPairBall ? '#3b82f6' : '#f97316'           // pair → blue, normal → orange
+    return isPairBall ? 'rgba(175, 251, 248, 0.95)' : 'rgba(243, 250, 207, 0.93)'  // pair → soft blue, normal → soft orange
   }
 
   // Sorted combo key for order-independent match
@@ -729,7 +729,7 @@ const DrawPivotTable = memo(function DrawPivotTable() {
 
       {/* Legend */}
       <div style={{ display: 'flex', gap: 10, marginBottom: 10, fontSize: 10, color: '#64748b', flexWrap: 'wrap', alignItems: 'center' }}>
-        {[['#8b5cf6', 'HOA'], ['#3b82f6', 'Đôi'], ['#f97316', 'Thường'], ['rgba(255,215,0,0.6)', 'Tổng 18/3'], ['rgba(255,105,180,0.6)', 'x40(4/17)'], ['rgba(152,251,152,0.6)', 'x12(6/15)']].map(([c, l]) => (
+        {[['rgba(139,92,246,0.70)', 'HOA'], ['rgba(59,130,246,0.65)', 'Đôi'], ['rgba(249,115,22,0.65)', 'Thường'], ['rgba(255,215,0,0.6)', 'Tổng 18/3'], ['rgba(255,105,180,0.6)', 'x40(4/17)'], ['rgba(152,251,152,0.6)', 'x12(6/15)']].map(([c, l]) => (
           <span key={l} style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
             <span style={{ display: 'inline-block', width: 9, height: 9, background: c, borderRadius: '50%' }} />{l}
           </span>
@@ -913,6 +913,7 @@ function App() {
   const [sumStats, setSumStats] = useState([])
   const [maxScore, setMaxScore] = useState(1)
   const [history, setHistory] = useState([])
+  const [pivotRefreshCount, setPivotRefreshCount] = useState(0)
   // Refs store cheap signatures instead of whole payloads.
   const predsRef = React.useRef('')
   const historyRef = React.useRef('')
@@ -975,8 +976,12 @@ function App() {
         if (etag) statsETagRef.current = etag
         const s = await r.json()
         setStats(s)
-        // Server is computing for the first time — auto-retry after 60s
-        if (s?.computing) setTimeout(() => loadStatsRef.current(), 60_000)
+        // Server is computing for the first time — auto-retry after 30s
+        if (s?.computing) setTimeout(() => { statsETagRef.current = null; loadStatsRef.current() }, 30_000)
+        // Server is recomputing in background (has stale cache) — retry after 8s to get fresh data
+        if (r.headers.get('X-Stats-Computing') === '1') {
+          setTimeout(() => { statsETagRef.current = null; loadStatsRef.current() }, 8_000)
+        }
       }
       // 304 → data unchanged, skip re-render
     } catch (_) { }
@@ -1086,8 +1091,25 @@ function App() {
         const info = JSON.parse(e.data)
         setLiveKy(info.latestKy)
         setToast(info)
-        // Auto-refresh predictions ~1.5s after new draw (prewarm takes ~500ms)
-        setTimeout(() => { if (mounted) loadRef.current(true) }, 1_500)
+        // Auto-refresh all data ~1.5s after new draw (server prewarm takes ~500ms).
+        // Clear ETags to bypass 304 and force fresh data.
+        setTimeout(() => {
+          if (!mounted) return
+          predETagRef.current = null
+          histETagRef.current = null
+          overdueETagRef.current = null
+          statsETagRef.current = null
+          loadRef.current(true)
+          loadStatsRef.current()
+          loadOverdueRef.current()
+          setPivotRefreshCount(c => c + 1)
+        }, 1_500)
+        // Stats recompute takes ~3-8s — retry once more to get fresh stats
+        setTimeout(() => {
+          if (!mounted) return
+          statsETagRef.current = null
+          loadStatsRef.current()
+        }, 10_000)
       })
 
       es.onerror = () => {
@@ -1151,6 +1173,7 @@ function App() {
         loadRef.current(true)
         loadStatsRef.current()
         loadOverdueRef.current()
+        setPivotRefreshCount(c => c + 1)
       }} />
 
       {/* ── Header ── */}
@@ -1161,7 +1184,7 @@ function App() {
         </div>
         <div className="header-actions">
           <a href="/history-table" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, fontWeight: 700, color: '#fff', textDecoration: 'none', padding: '7px 16px', borderRadius: 8, background: 'linear-gradient(135deg,#6366f1,#818cf8)', border: '1px solid rgba(129,140,248,0.5)', boxShadow: '0 2px 8px rgba(99,102,241,0.3)' }}>📅 Lịch sử</a>
-          <a href="https://lotto535.fly.dev" target="_blank" rel="noopener" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, fontWeight: 700, color: '#fff', textDecoration: 'none', padding: '7px 16px', borderRadius: 8, background: 'linear-gradient(135deg,#059669,#10b981)', border: '1px solid rgba(16,185,129,0.5)', boxShadow: '0 2px 8px rgba(16,185,129,0.25)' }}>� Loto 5/35</a>
+          <a href="https://lotto535.fly.dev" target="_blank" rel="noopener" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, fontWeight: 700, color: '#fff', textDecoration: 'none', padding: '7px 16px', borderRadius: 8, background: 'linear-gradient(135deg,#059669,#10b981)', border: '1px solid rgba(16,185,129,0.5)', boxShadow: '0 2px 8px rgba(16,185,129,0.25)' }}> 🎰 Loto 5/35</a>
           <span style={C.pill}>{total} records</span>
           <span style={{
             ...C.pill,
@@ -1203,6 +1226,7 @@ function App() {
                   loadStatsRef.current(),
                   loadOverdueRef.current(),
                 ])
+                setPivotRefreshCount(c => c + 1)
               } catch (e) {
                 setError(e.message || 'Không thể cập nhật dữ liệu')
               } finally {
@@ -1356,13 +1380,10 @@ function App() {
               onMouseLeave={e => e.currentTarget.style.color = '#64748b'}>
               ↗ Bảng đầy đủ
             </a>
-            <a href="https://lotto535.fly.dev" target="_blank" rel="noopener" style={{ fontSize: 13, color: '#34d399', padding: '10px 12px', textDecoration: 'none', borderRadius: 6, marginLeft: 'auto', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 5, background: 'rgba(52,211,153,0.08)', borderRadius: 6, border: '1px solid rgba(52,211,153,0.25)' }}>
-              🏆 Loto 5/35
-            </a>
           </div>
           {/* Content */}
           <div style={{ padding: '18px 20px' }}>
-            <DrawPivotTable />
+            <DrawPivotTable refreshKey={pivotRefreshCount} />
           </div>
         </div>
 

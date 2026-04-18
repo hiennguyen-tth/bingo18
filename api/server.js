@@ -168,8 +168,8 @@ function invalidateCache() {
   const cachedN = Math.max(_lastStatsTotal, _statsCache?.total ?? 0)
   const nGrew = currentN > 0 && cachedN > 0 && currentN > cachedN * 1.1
   const statsDelay = nGrew ? 2_000            // data changed significantly — bypass rate limit
-    : msSinceLastStats < 10 * 60_000
-      ? (10 * 60_000 - msSinceLastStats)      // wait out the remainder
+    : msSinceLastStats < 5 * 60_000
+      ? (5 * 60_000 - msSinceLastStats)       // wait out the remainder (rate-limit: 5 min)
       : 5_000                                 // first time: 5s debounce
   if (nGrew) console.log(`[stats] N grew ${cachedN} → ${currentN} — bypassing rate limit, recomputing in 2s`)
   _invalidateTimer = setTimeout(() => _computeStatsBackground(), statsDelay)
@@ -308,16 +308,18 @@ function buildOverduePayload(data) {
     ...TRIPLES.filter(k => !tripleKeys.has(k)).map(k => ({ key: k, label: k.replace(/-/g, ''), appeared: 0, kySinceLast: N, avgInterval: N, overdueScore: 1 })),
   ].sort((a, b) => b.overdueScore - a.overdueScore)
 
-  // Any-triple aggregate
+  // Any-triple aggregate — use only ky records to avoid Source C duplicate inflation
+  const chronKyOv = chron.filter(r => r.ky)
+  const Nky = chronKyOv.length
   let lastTripleIdx = -1
   const anyTripleGaps = []
-  chron.forEach((r, i) => {
+  chronKyOv.forEach((r, i) => {
     if (r.pattern === 'triple' || (r.n1 === r.n2 && r.n2 === r.n3)) {
       if (lastTripleIdx >= 0) anyTripleGaps.push(i - lastTripleIdx)
       lastTripleIdx = i
     }
   })
-  const sinceAnyTriple = lastTripleIdx >= 0 ? N - 1 - lastTripleIdx : N
+  const sinceAnyTriple = lastTripleIdx >= 0 ? Nky - 1 - lastTripleIdx : Nky
   const avgAnyTripleGap = anyTripleGaps.length
     ? +(anyTripleGaps.reduce((a, b) => a + b, 0) / anyTripleGaps.length).toFixed(1)
     : 36
@@ -687,6 +689,7 @@ app.get('/api/history-grid', async (req, res) => {
     const cells = {}
     const slotSet = new Set()
     const dateSet = new Set()
+    const patRank = { triple: 3, pair: 2, normal: 1 }
 
     for (const r of data) {
       if (!r.drawTime) continue
@@ -707,8 +710,11 @@ app.get('/api/history-grid', async (req, res) => {
       dateSet.add(dateStr)
 
       if (!cells[slotStr]) cells[slotStr] = {}
-      // Keep only one record per canonical slot per day (first wins — data is newest-first)
-      if (!cells[slotStr][dateStr]) {
+      // Keep one record per slot/day. When collision occurs, prefer notable patterns (triple > pair > normal).
+      const existing = cells[slotStr][dateStr]
+      if (!existing) {
+        cells[slotStr][dateStr] = { n1: r.n1, n2: r.n2, n3: r.n3, sum: r.sum, pattern: r.pattern, ky: r.ky }
+      } else if ((patRank[r.pattern] || 0) > (patRank[existing.pattern] || 0)) {
         cells[slotStr][dateStr] = { n1: r.n1, n2: r.n2, n3: r.n3, sum: r.sum, pattern: r.pattern, ky: r.ky }
       }
     }
@@ -740,9 +746,8 @@ app.get('/stats', (req, res) => {
     res.set('X-Cache', _statsComputing ? 'STALE' : 'HIT')
     res.set('X-Stats-Computing', _statsComputing ? '1' : '0')
     if (req.headers['if-none-match'] === etag && !_statsComputing) return res.status(304).end()
-    // Auto-refresh when cache is stale — but also respect the 10-min rate limit
-    // to prevent cascading recomputes when multiple clients hit /stats simultaneously.
-    if (!_statsComputing && Date.now() - ts > 15 * 60_000 && Date.now() - _lastStatsCompute > 10 * 60_000) _computeStatsBackground()
+    // Auto-refresh when cache is stale — rate-limit: 5 min.
+    if (!_statsComputing && Date.now() - ts > 10 * 60_000 && Date.now() - _lastStatsCompute > 5 * 60_000) _computeStatsBackground()
     return res.json(_statsCache)
   }
   if (!_statsComputing) _computeStatsBackground()
@@ -981,7 +986,7 @@ async function runDeepRecovery() {
   const data = await loadHistory()
   if (data.length < 30) return
 
-  const recent = data.slice(0, 30).map(r => Number(r.ky)).sort((a, b) => b - a)
+  const recent = data.slice(0, 60).map(r => Number(r.ky)).filter(k => !isNaN(k)).sort((a, b) => b - a).slice(0, 30)
   const hasGap = recent.some((k, i) => i > 0 && recent[i - 1] - k > 1)
   if (!hasGap) return
 

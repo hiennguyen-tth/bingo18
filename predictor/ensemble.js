@@ -857,7 +857,16 @@ function rebalanceTripleRanks(top10, overdueRatio, verdict) {
 function predictRanked(data, opts = {}) {
   if (!data) data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'))
   if (!data || data.length < 2) return { top10: [], tripleSignal: null }
-  const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
+  // Sort by drawTime (primary) — safe for records from source C which have no ky.
+  // Ky-only sort fails because Number(undefined)=NaN produces unpredictable ordering,
+  // causing undefined-ky triples to appear at random positions and corrupt sinceLastTriple.
+  const chron = [...data].sort((a, b) => {
+    const ta = (a.drawTime || '').substring(0, 19)
+    const tb = (b.drawTime || '').substring(0, 19)
+    if (ta < tb) return -1
+    if (ta > tb) return 1
+    return Number(a.ky || 0) - Number(b.ky || 0)  // tiebreak by ky
+  })
   const now = new Date()
   const statRes = runStatTests(chron)
   const { results: all, effectiveWeights } = ensembleAll(chron, now)
@@ -883,10 +892,13 @@ function predictRanked(data, opts = {}) {
 
   // ── Triple signal: single O(N) pass for all triple stats ────────────
   const EXPECTED_GAP = 36 // 6/216 — one triple every 36 draws on average
+  // Only count official records (with ky) to avoid inflating sinceLastTriple with
+  // Source C near-duplicate records that have slightly-off timestamps (~6-8 min early).
+  const chronKy = chron.filter(r => r.ky)
   let tripleCount = 0
   let lastTripleIdx = -1
   const tripleGaps = []
-  chron.forEach((r, i) => {
+  chronKy.forEach((r, i) => {
     const pat = r.pattern || classify(r.n1, r.n2, r.n3)
     if (pat === 'triple') {
       tripleCount++
@@ -894,7 +906,7 @@ function predictRanked(data, opts = {}) {
       lastTripleIdx = i
     }
   })
-  const sinceTriple = lastTripleIdx >= 0 ? chron.length - 1 - lastTripleIdx : chron.length
+  const sinceTriple = lastTripleIdx >= 0 ? chronKy.length - 1 - lastTripleIdx : chronKy.length
   const overdueRatio = sinceTriple / EXPECTED_GAP
   const avgTripleGap = tripleGaps.length
     ? +(tripleGaps.reduce((a, b) => a + b, 0) / tripleGaps.length).toFixed(1)
