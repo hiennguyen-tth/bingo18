@@ -18,8 +18,8 @@ function fmtTime(iso) {
   return `${hh}:${mi} ${dd}/${mo}/${yy}`
 }
 
-function predsSignature(preds, latestKy) {
-  return `${latestKy || '0'}::${preds.map(p => `${p.combo}:${p.score}:${p.rankStrength}`).join('|')}`
+function predsSignature(preds, latestKy, newestDrawTime) {
+  return `${latestKy || '0'}|${newestDrawTime || ''}::${preds.map(p => `${p.combo}:${p.score}:${p.rankStrength}`).join('|')}`
 }
 
 function historySignature(records) {
@@ -920,6 +920,7 @@ function App() {
   const [toast, setToast] = useState(null)
   const [liveKy, setLiveKy] = useState(null)
   const [predictBasisKy, setPredictBasisKy] = useState(null)
+  const [newestDrawTime, setNewestDrawTime] = useState(null)
   const [basisJustChanged, setBasisJustChanged] = useState(false)
   const [sseConnected, setSseConnected] = useState(false)
   const [stats, setStats] = useState(null)
@@ -1002,7 +1003,8 @@ function App() {
         if (etag) predETagRef.current = etag
         const newPreds = pRes.next || []
         const nextBasisKy = pRes.latestKy || null
-        const nextSig = predsSignature(newPreds, nextBasisKy || pRes.total)
+        const nextNewestTime = pRes.newestDrawTime || null
+        const nextSig = predsSignature(newPreds, nextBasisKy || pRes.total, nextNewestTime)
         if (nextSig !== predsRef.current) {
           predsRef.current = nextSig
           setPreds(newPreds)
@@ -1015,6 +1017,7 @@ function App() {
         predictBasisRef.current = nextBasisKy
         setMaxScore(pRes.maxScore || 1)
         setPredictBasisKy(nextBasisKy)
+        setNewestDrawTime(pRes.newestDrawTime || null)
         setTripleSignal(pRes.tripleSignal || null)
         setModelContrib(pRes.modelContrib || null)
         setVerdict(pRes.verdict || null)
@@ -1255,9 +1258,17 @@ function App() {
               {updated !== '—' && (
                 <span style={{ fontSize: 10, color: '#475569' }}>⟳ {updated}</span>
               )}
-              {predictBasisKy && (
-                <span style={{ fontSize: 10, color: '#94a3b8' }}>Dựa trên kỳ #{predictBasisKy}</span>
-              )}
+              {predictBasisKy && (() => {
+                // If newestDrawTime is significantly newer than latestKyRecord, show latest draw time
+                // (happens when Source A/B fails to promote Source C records with ky)
+                const latestTime = newestDrawTime ? new Date(newestDrawTime) : null
+                const hhmm = latestTime ? latestTime.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Ho_Chi_Minh' }) : null
+                return (
+                  <span style={{ fontSize: 10, color: '#94a3b8' }}>
+                    Dựa trên kỳ #{predictBasisKy}{hhmm ? ` · lần vẽ lúc ${hhmm}` : ''}
+                  </span>
+                )
+              })()}
               {basisJustChanged && predictBasisKy && (
                 <span style={{ fontSize: 10, color: '#34d399', border: '1px solid rgba(52,211,153,0.35)', background: 'rgba(52,211,153,0.08)', borderRadius: 999, padding: '3px 8px', fontWeight: 700 }}>
                   Đã nhận kỳ mới #{predictBasisKy}

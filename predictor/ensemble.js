@@ -892,13 +892,14 @@ function predictRanked(data, opts = {}) {
 
   // ── Triple signal: single O(N) pass for all triple stats ────────────
   const EXPECTED_GAP = 36 // 6/216 — one triple every 36 draws on average
-  // Only count official records (with ky) to avoid inflating sinceLastTriple with
-  // Source C near-duplicate records that have slightly-off timestamps (~6-8 min early).
-  const chronKy = chron.filter(r => r.ky)
+  // Use ALL records (including Source C no-ky) — history.json is deduplicated by
+  // canonical 6-min slot so every record represents a unique real draw.
+  // Filtering to ky-only caused sinceLastTriple to freeze when Vietlott source A
+  // fails to promote new Source C records with ky numbers.
   let tripleCount = 0
   let lastTripleIdx = -1
   const tripleGaps = []
-  chronKy.forEach((r, i) => {
+  chron.forEach((r, i) => {
     const pat = r.pattern || classify(r.n1, r.n2, r.n3)
     if (pat === 'triple') {
       tripleCount++
@@ -906,7 +907,7 @@ function predictRanked(data, opts = {}) {
       lastTripleIdx = i
     }
   })
-  const sinceTriple = lastTripleIdx >= 0 ? chronKy.length - 1 - lastTripleIdx : chronKy.length
+  const sinceTriple = lastTripleIdx >= 0 ? chron.length - 1 - lastTripleIdx : chron.length
   const overdueRatio = sinceTriple / EXPECTED_GAP
   const avgTripleGap = tripleGaps.length
     ? +(tripleGaps.reduce((a, b) => a + b, 0) / tripleGaps.length).toFixed(1)

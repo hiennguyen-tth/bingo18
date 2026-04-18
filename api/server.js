@@ -125,6 +125,9 @@ let _lastInvalidateAt = 0      // epoch ms — watcher cooldown
     }
     if (pred) { apiCache.set('predict', pred); console.log('[predict] disk cache loaded, ts:', new Date(pred.ts || 0).toISOString()) }
     if (over) { apiCache.set('overdue', over); console.log('[overdue] disk cache loaded, ts:', new Date(over.ts || 0).toISOString()) }
+    // Always refresh predict+overdue on startup to ensure sinceLastTriple / kySinceLast
+    // reflect the current history (disk cache may be stale from previous deployment).
+    setTimeout(() => _prewarmCaches(), 2_000)
   })()
 
 // ── History file watcher — invalidate on external change ──────────────────
@@ -168,8 +171,8 @@ function invalidateCache() {
   const cachedN = Math.max(_lastStatsTotal, _statsCache?.total ?? 0)
   const nGrew = currentN > 0 && cachedN > 0 && currentN > cachedN * 1.1
   const statsDelay = nGrew ? 2_000            // data changed significantly — bypass rate limit
-    : msSinceLastStats < 5 * 60_000
-      ? (5 * 60_000 - msSinceLastStats)       // wait out the remainder (rate-limit: 5 min)
+    : msSinceLastStats < 2 * 60_000
+      ? (2 * 60_000 - msSinceLastStats)       // wait out the remainder (rate-limit: 2 min)
       : 5_000                                 // first time: 5s debounce
   if (nGrew) console.log(`[stats] N grew ${cachedN} → ${currentN} — bypassing rate limit, recomputing in 2s`)
   _invalidateTimer = setTimeout(() => _computeStatsBackground(), statsDelay)
@@ -268,6 +271,7 @@ function buildPredictPayload(data) {
     total: data.length,
     latestKy: latestKyRecord?.ky ?? null,
     latestDrawTime: latestKyRecord?.drawTime ?? null,
+    newestDrawTime: data[0]?.drawTime ?? null,   // absolute newest record (may be Source C, no ky)
     maxScore: next.length ? +Math.max(...next.map(r => r.score)).toFixed(5) : 0
   }
 }
@@ -277,6 +281,9 @@ function buildOverduePayload(data) {
   if (data.length === 0) return { triples: [], pairs: [], sums: [] }
 
   const chron = [...data].reverse()  // chronological for interval calc
+  // Use ALL records (including Source C no-ky): history is deduplicated per 6-min slot
+  // so every entry is a unique real draw. Filtering to ky-only caused kySinceLast to
+  // freeze when Vietlott fails to promote Source C records with ky numbers.
   const N = chron.length
 
   function computeStats(keyFn, labelFn) {
@@ -311,18 +318,16 @@ function buildOverduePayload(data) {
     ...TRIPLES.filter(k => !tripleKeys.has(k)).map(k => ({ key: k, label: k.replace(/-/g, ''), appeared: 0, kySinceLast: N, avgInterval: N, overdueScore: 1 })),
   ].sort((a, b) => b.overdueScore - a.overdueScore)
 
-  // Any-triple aggregate — use only ky records to avoid Source C duplicate inflation
-  const chronKyOv = chron.filter(r => r.ky)
-  const Nky = chronKyOv.length
+  // Any-triple aggregate — use all records (same as computeStats above)
   let lastTripleIdx = -1
   const anyTripleGaps = []
-  chronKyOv.forEach((r, i) => {
+  chron.forEach((r, i) => {
     if (r.pattern === 'triple' || (r.n1 === r.n2 && r.n2 === r.n3)) {
       if (lastTripleIdx >= 0) anyTripleGaps.push(i - lastTripleIdx)
       lastTripleIdx = i
     }
   })
-  const sinceAnyTriple = lastTripleIdx >= 0 ? Nky - 1 - lastTripleIdx : Nky
+  const sinceAnyTriple = lastTripleIdx >= 0 ? N - 1 - lastTripleIdx : N
   const avgAnyTripleGap = anyTripleGaps.length
     ? +(anyTripleGaps.reduce((a, b) => a + b, 0) / anyTripleGaps.length).toFixed(1)
     : 36
@@ -429,9 +434,9 @@ async function _computeStatsBackground() {
       forward: { top1: 0, top3: 0, top10: 0, tested: 0 },
     }
 
-    // Dynamic SAMPLE_EVERY: target ~500 test windows regardless of dataset size.
+    // Dynamic SAMPLE_EVERY: target ~2000 test windows regardless of dataset size.
     // TRAIN_CAP: cap training slice at 5k records so predict.ranked() stays fast.
-    const SAMPLE_EVERY = Math.max(1, Math.floor(N / 500))
+    const SAMPLE_EVERY = Math.max(1, Math.floor(N / 2000))
     const TRAIN_CAP = 5_000   // max records per training slice (5k → ~3MB per slice)
     // Start from 20% mark — early windows have too little training data.
     const START_I = Math.max(WINDOW, Math.floor(N * 0.2))
@@ -752,8 +757,8 @@ app.get('/stats', (req, res) => {
     res.set('X-Cache', _statsComputing ? 'STALE' : 'HIT')
     res.set('X-Stats-Computing', _statsComputing ? '1' : '0')
     if (req.headers['if-none-match'] === etag && !_statsComputing) return res.status(304).end()
-    // Auto-refresh when cache is stale — rate-limit: 5 min.
-    if (!_statsComputing && Date.now() - ts > 10 * 60_000 && Date.now() - _lastStatsCompute > 5 * 60_000) _computeStatsBackground()
+    // Auto-refresh when cache is stale — rate-limit: 2 min.
+    if (!_statsComputing && Date.now() - ts > 3 * 60_000 && Date.now() - _lastStatsCompute > 2 * 60_000) _computeStatsBackground()
     return res.json(_statsCache)
   }
   if (!_statsComputing) _computeStatsBackground()
