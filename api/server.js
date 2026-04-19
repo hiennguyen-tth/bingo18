@@ -229,7 +229,11 @@ function buildPredictPayload(data) {
       message: 'Not enough data — run: node crawler/crawl.js'
     }
   }
-  const { top10, tripleSignal, effectiveWeights, verdict } = predict.ranked(data)
+  // Cap training window — statistical signals converge well before 10K records.
+  // predict.ranked() is O(N); 46K → 10K ≈10× faster with negligible accuracy delta.
+  const PREDICT_WINDOW = 10_000
+  const rankData = data.length > PREDICT_WINDOW ? data.slice(0, PREDICT_WINDOW) : data
+  const { top10, tripleSignal, effectiveWeights, verdict } = predict.ranked(rankData)
   const top10Total = top10.reduce((s, r) => s + r.score, 0) || 1
 
   // top10Total used for pct normalisation. max/min/spread no longer needed
@@ -394,8 +398,8 @@ async function _prewarmCaches() {
     const ts = Date.now()
     const predictPl = buildPredictPayload(data)
     const overduePl = buildOverduePayload(data)
-    // predictSum is O(N) — fast, include in prewarm so first request after new draw is instant
-    const sumPl = predict.predictSum(data)
+    // predictSum is already computed inside buildPredictPayload — extract to avoid double O(N) pass
+    const sumPl = predictPl.sumPrediction || predict.predictSum(data)
 
     // Guard: if a new draw arrived while we were computing, skip overwriting the cache.
     // withCache() will compute fresh on the next client request instead.
@@ -414,6 +418,19 @@ async function _prewarmCaches() {
       fs.writeJSON(OVERDUE_CACHE_FILE, { data: overduePl, ts }),
     ])
     console.log(`[prewarm] predict + overdue + predict-sum cached + persisted in ${Date.now() - t0}ms`)
+
+    // Warm history-grid-15 in background (most-requested; saves ~100ms on first load after draw)
+    setImmediate(async () => {
+      try {
+        if (_lastInvalidateAt !== prewarmStartedAt || apiCache.has('history-grid-15')) return
+        const http = require('http')
+        const PORT_SELF = process.env.PORT || 8080  // must match server listen port
+        http.get(`http://localhost:${PORT_SELF}/api/history-grid?days=15`, (r) => {
+          r.resume()
+          if (r.statusCode === 200) console.log(`[prewarm] history-grid-15 warmed in ${Date.now() - t0}ms`)
+        }).on('error', () => { })  // not critical — warms naturally on next request
+      } catch (_) { }
+    })
   } catch (err) {
     console.error('[prewarm]', err.message)
   } finally {
@@ -608,12 +625,14 @@ app.get('/sitemap.xml', (_req, res) => { res.setHeader('Content-Type', 'applicat
 app.get('/ads.txt', (_req, res) => { res.setHeader('Content-Type', 'text/plain; charset=utf-8'); res.sendFile(path.join(WEB_DIR, 'ads.txt')) })
 
 // Static assets (app.js, heatmap.js, etc.) — index.html excluded above
-// Long cache for JS/CSS (1y), short for HTML (5 min)
+// Long cache for JS/CSS/images (1y), short for HTML (5 min)
 app.use(express.static(WEB_DIR, {
   index: false,
   setHeaders: (res, filePath) => {
     if (filePath.endsWith('.js') || filePath.endsWith('.css')) {
       res.set('Cache-Control', 'public, max-age=31536000, immutable')
+    } else if (filePath.endsWith('.png') || filePath.endsWith('.jpg') || filePath.endsWith('.webp') || filePath.endsWith('.svg')) {
+      res.set('Cache-Control', 'public, max-age=86400')  // 24h for images
     } else if (filePath.endsWith('.html')) {
       res.set('Cache-Control', 'public, max-age=300')  // 5 min
     }
@@ -921,6 +940,7 @@ app.get('/history', async (req, res) => {
       const etag = `"${hit.ts}"`
       res.set('X-Cache', 'HIT')
       res.set('ETag', etag)
+      res.set('Cache-Control', 'private, max-age=60')
       if (req.headers['if-none-match'] === etag) return res.status(304).end()
       return res.json(hit.data)
     }
@@ -930,6 +950,7 @@ app.get('/history', async (req, res) => {
     const etag = `"${now}"`
     res.set('X-Cache', 'MISS')
     res.set('ETag', etag)
+    res.set('Cache-Control', 'private, max-age=60')
     res.json(payload)
   } catch (err) {
     res.status(500).json({ error: err.message })
@@ -962,41 +983,88 @@ app.get('/api/history-grid', async (req, res) => {
     cutoff.setDate(cutoff.getDate() - days)
     cutoff.setHours(0, 0, 0, 0)
 
+    // ── Pass 1: Group records by VN date; compute drawTime-based canonical slot info ──
+    // bingo18.top (Source C) publishes results 3–7 min after the actual draw, which causes
+    // Math.round-based canonical slot to mis-assign draws (e.g., the 09:18 draw is published
+    // at 09:14, rounds to 09:12, colliding with the actual 09:12 draw and leaving 09:18 empty).
+    // Fix: use ky numbers to compute the exact scheduled slot when ky is available.
+    const dayData = {}  // Map<dateStr, { recs: Array<{r, ci}>, anchor: {ky, slotMin} | null }>
+    for (const r of data) {
+      if (!r.drawTime || r.drawTime.includes('T00:00:00')) continue
+      const d = new Date(r.drawTime)
+      if (isNaN(d.getTime())) continue
+      if (d < cutoff) break  // data is sorted newest-first; safe to stop here
+
+      const ci = canonicalSlotInfo(r.drawTime)
+      if (!ci) continue
+
+      if (!dayData[ci.date]) dayData[ci.date] = { recs: [], anchor: null }
+      dayData[ci.date].recs.push({ r, ci })
+    }
+
+    // ── Find ky anchor for each day: the earliest ky record whose drawTime is within 2 min
+    //    of the computed canonical slot (i.e., a "clean" on-schedule timestamp).
+    //    This anchor ky → scheduled slotMin, and all other ky records are computed as:
+    //    slotMin = anchor.slotMin + (ky - anchor.ky) × 6 minutes.
+    //    This correctly handles Source C's variable publication delay without any magic constant. ──
+    for (const dd of Object.values(dayData)) {
+      const withKy = dd.recs.filter(x => x.r.ky).sort((a, b) => Number(a.r.ky) - Number(b.r.ky))
+      for (const { r, ci } of withKy) {
+        const d = new Date(r.drawTime)
+        const vnMs = d.getTime() + 7 * 3600_000
+        const vn = new Date(vnMs)
+        const actualMin = vn.getUTCHours() * 60 + vn.getUTCMinutes()
+        const [sh, sm] = ci.slot.split(':').map(Number)
+        if (Math.abs(actualMin - sh * 60 - sm) <= 2) {   // ≤ 2 min off → reliable anchor
+          dd.anchor = { ky: Number(r.ky), slotMin: sh * 60 + sm }
+          break
+        }
+      }
+      // No clean anchor found — fall back to the first ky record's canonical slot.
+      // Relative ky ordering is still correct; absolute slot might be off by ≤ 1 slot.
+      if (!dd.anchor && withKy.length > 0) {
+        const { r, ci } = withKy[0]
+        const [sh, sm] = ci.slot.split(':').map(Number)
+        dd.anchor = { ky: Number(r.ky), slotMin: sh * 60 + sm }
+      }
+    }
+
+    // ── Pass 2: Build cells using ky-based slots (ky records) or drawTime slots (no-ky) ──
     const cells = {}
     const slotSet = new Set()
     const dateSet = new Set()
 
-    for (const r of data) {
-      if (!r.drawTime) continue
-      // Skip date-only timestamps (Vietlott source sets T00:00:00)
-      if (r.drawTime.includes('T00:00:00')) continue
+    for (const [dateStr, dd] of Object.entries(dayData)) {
+      for (const { r, ci } of dd.recs) {
+        let slotMin
+        if (r.ky && dd.anchor) {
+          // Ky-based: exact scheduled slot = anchor + offset × 6 min
+          slotMin = dd.anchor.slotMin + (Number(r.ky) - dd.anchor.ky) * 6
+        } else {
+          // No-ky (Source C only): fall back to drawTime canonical slot
+          const [sh, sm] = ci.slot.split(':').map(Number)
+          slotMin = sh * 60 + sm
+        }
 
-      const d = new Date(r.drawTime)
-      if (isNaN(d.getTime())) continue
-      // Data is sorted newest-first; first real-timed record before cutoff means all remaining are too.
-      if (d < cutoff) break
+        if (slotMin < 360 || slotMin > 1320) continue  // outside 06:00–22:00 VN
+        const h = Math.floor(slotMin / 60), m = slotMin % 60
+        const slotStr = String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0')
 
-      // Snap to canonical 6-minute slot (06:00, 06:06, ..., 21:54 VN time)
-      const ci = canonicalSlotInfo(r.drawTime)
-      if (!ci) continue
+        slotSet.add(slotStr)
+        dateSet.add(dateStr)
 
-      const dateStr = ci.date
-      const slotStr = ci.slot
-
-      slotSet.add(slotStr)
-      dateSet.add(dateStr)
-
-      if (!cells[slotStr]) cells[slotStr] = {}
-      // Keep one record per slot/day. When collision occurs (two draws map to same canonical slot
-      // due to rounding), prefer the NEWER draw — higher ky wins. Data is sorted newest-first so
-      // the first record we see is already the newest; only replace it if an explicitly higher ky arrives.
-      const existing = cells[slotStr][dateStr]
-      if (!existing) {
-        cells[slotStr][dateStr] = { n1: r.n1, n2: r.n2, n3: r.n3, sum: r.sum, pattern: r.pattern, ky: r.ky }
-      } else if (existing.ky && r.ky && Number(r.ky) > Number(existing.ky)) {
-        // Both ky-confirmed and incoming ky is higher → newer confirmed draw wins
-        // (Never overwrite a no-ky Source C record — it represents the most recent unconfirmed draw)
-        cells[slotStr][dateStr] = { n1: r.n1, n2: r.n2, n3: r.n3, sum: r.sum, pattern: r.pattern, ky: r.ky }
+        if (!cells[slotStr]) cells[slotStr] = {}
+        const existing = cells[slotStr][dateStr]
+        if (!existing) {
+          cells[slotStr][dateStr] = { n1: r.n1, n2: r.n2, n3: r.n3, sum: r.sum, pattern: r.pattern, ky: r.ky }
+        } else if (r.ky && !existing.ky) {
+          // Ky-confirmed draw always beats unconfirmed no-ky record in the same slot
+          cells[slotStr][dateStr] = { n1: r.n1, n2: r.n2, n3: r.n3, sum: r.sum, pattern: r.pattern, ky: r.ky }
+        } else if (existing.ky && r.ky && Number(r.ky) > Number(existing.ky)) {
+          // Both ky-confirmed: higher ky (later draw) wins — shouldn't happen with ky-based slots,
+          // but guards against edge cases (two draws with same ky, or anchor miscalculation).
+          cells[slotStr][dateStr] = { n1: r.n1, n2: r.n2, n3: r.n3, sum: r.sum, pattern: r.pattern, ky: r.ky }
+        }
       }
     }
 

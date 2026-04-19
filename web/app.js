@@ -2025,28 +2025,31 @@ const HoaForecastBlock = memo(function HoaForecastBlock() {
     }, h));
   }))), view === 'hourly' && hourly && /*#__PURE__*/React.createElement("div", {
     style: {
-      overflowX: 'auto'
+      overflowX: 'auto',
+      WebkitOverflowScrolling: 'touch'
     }
   }, /*#__PURE__*/React.createElement("table", {
     style: {
       width: '100%',
       borderCollapse: 'collapse',
-      fontSize: 12
+      fontSize: 12,
+      minWidth: isMobile ? 340 : 'unset'
     }
   }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
     style: {
       borderBottom: '1px solid rgba(255,255,255,0.08)'
     }
-  }, ['Giờ', 'Tổng kỳ', 'HOA xuất hiện', 'Tỷ lệ HOA', 'HOA phổ biến nhất', 'HOA chưa ra', 'Mức độ'].map(h => /*#__PURE__*/React.createElement("th", {
+  }, [['Giờ', false], ['Tổng kỳ', true], ['HOA xuất hiện', false], ['Tỷ lệ HOA', false], ['HOA phổ biến nhất', true], ['HOA chưa ra', false], ['Mức độ', false]].map(([h, hideOnMobile]) => /*#__PURE__*/React.createElement("th", {
     key: h,
     style: {
-      padding: isMobile ? '6px 4px' : '8px 12px',
+      padding: isMobile ? '6px 5px' : '8px 12px',
       textAlign: 'left',
       color: '#64748b',
       fontSize: isMobile ? 9 : 10,
       fontWeight: 700,
       textTransform: 'uppercase',
-      letterSpacing: '0.06em'
+      letterSpacing: '0.06em',
+      display: hideOnMobile && isMobile ? 'none' : ''
     }
   }, h)))), /*#__PURE__*/React.createElement("tbody", null, hourly.map(row => {
     const isCurrent = row.block === vnNowH;
@@ -2062,7 +2065,7 @@ const HoaForecastBlock = memo(function HoaForecastBlock() {
       }
     }, /*#__PURE__*/React.createElement("td", {
       style: {
-        padding: isMobile ? '6px 4px' : '8px 12px',
+        padding: isMobile ? '6px 5px' : '8px 12px',
         fontWeight: 700,
         color: isCurrent ? '#a5b4fc' : isHot ? '#fbbf24' : '#e2e8f0',
         whiteSpace: 'nowrap'
@@ -2080,25 +2083,26 @@ const HoaForecastBlock = memo(function HoaForecastBlock() {
       }
     }, "\uD83D\uDD25")), /*#__PURE__*/React.createElement("td", {
       style: {
-        padding: isMobile ? '6px 4px' : '8px 12px',
-        color: '#94a3b8'
+        padding: isMobile ? '6px 5px' : '8px 12px',
+        color: '#94a3b8',
+        display: isMobile ? 'none' : ''
       }
     }, row.totalDraws), /*#__PURE__*/React.createElement("td", {
       style: {
-        padding: isMobile ? '6px 4px' : '8px 12px',
+        padding: isMobile ? '6px 5px' : '8px 12px',
         fontWeight: 700,
         color: row.totalHoa > 0 ? '#fbbf24' : '#475569'
       }
     }, row.totalHoa, " l\u1EA7n"), /*#__PURE__*/React.createElement("td", {
       style: {
-        padding: isMobile ? '6px 4px' : '8px 12px',
-        minWidth: isMobile ? 60 : 100
+        padding: isMobile ? '6px 5px' : '8px 12px',
+        minWidth: isMobile ? 70 : 100
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: {
         display: 'flex',
         alignItems: 'center',
-        gap: 6
+        gap: 4
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: {
@@ -2107,7 +2111,7 @@ const HoaForecastBlock = memo(function HoaForecastBlock() {
         background: 'rgba(255,255,255,0.06)',
         borderRadius: 3,
         overflow: 'hidden',
-        maxWidth: isMobile ? 50 : 80
+        maxWidth: isMobile ? 40 : 80
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: {
@@ -2122,11 +2126,12 @@ const HoaForecastBlock = memo(function HoaForecastBlock() {
         fontSize: 11,
         color: hot >= 3 ? '#fbbf24' : '#94a3b8',
         fontWeight: 700,
-        minWidth: 34
+        minWidth: 30
       }
     }, hot, "%"))), /*#__PURE__*/React.createElement("td", {
       style: {
-        padding: isMobile ? '6px 4px' : '8px 12px'
+        padding: isMobile ? '6px 5px' : '8px 12px',
+        display: isMobile ? 'none' : ''
       }
     }, /*#__PURE__*/React.createElement("span", {
       style: {
@@ -2141,12 +2146,12 @@ const HoaForecastBlock = memo(function HoaForecastBlock() {
       }
     }, "(", row.topPatternCount, " l\u1EA7n)")), /*#__PURE__*/React.createElement("td", {
       style: {
-        padding: isMobile ? '6px 4px' : '8px 12px'
+        padding: isMobile ? '6px 5px' : '8px 12px'
       }
     }, row.missingPatterns && row.missingPatterns.length > 0 ? /*#__PURE__*/React.createElement("div", {
       style: {
         display: 'flex',
-        gap: 4,
+        gap: 3,
         flexWrap: 'wrap'
       }
     }, row.missingPatterns.map(p => /*#__PURE__*/React.createElement("span", {
@@ -2154,10 +2159,10 @@ const HoaForecastBlock = memo(function HoaForecastBlock() {
       style: {
         color: PATTERN_COLORS[p] || '#e2e8f0',
         fontWeight: 600,
-        fontSize: 11,
+        fontSize: isMobile ? 10 : 11,
         background: 'rgba(255,255,255,0.06)',
         borderRadius: 4,
-        padding: '1px 5px'
+        padding: '1px 4px'
       }
     }, p))) : /*#__PURE__*/React.createElement("span", {
       style: {
@@ -2166,7 +2171,7 @@ const HoaForecastBlock = memo(function HoaForecastBlock() {
       }
     }, "\u2713 \u0110\u1EE7")), /*#__PURE__*/React.createElement("td", {
       style: {
-        padding: isMobile ? '6px 4px' : '8px 12px'
+        padding: isMobile ? '6px 5px' : '8px 12px'
       }
     }, /*#__PURE__*/React.createElement("span", {
       style: {
@@ -2478,7 +2483,7 @@ function App() {
       const [pRaw, hRaw, sumRaw] = await Promise.all([fetch('/predict', {
         cache: 'no-cache',
         headers: predH
-      }), fetch('/history?limit=800', {
+      }), fetch('/history?limit=400', {
         headers: histH
       }),
       // no-store: browser never caches — always gets real server response, no stale ETag reuse
@@ -3169,7 +3174,70 @@ function App() {
     }
   }, /*#__PURE__*/React.createElement(Heatmap, {
     history: history
-  }))), /*#__PURE__*/React.createElement("footer", {
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxWidth: 960,
+      margin: '0 auto 28px',
+      padding: '0 16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: 'linear-gradient(135deg, rgba(99,102,241,0.08) 0%, rgba(251,191,36,0.05) 100%)',
+      border: '1px solid rgba(99,102,241,0.18)',
+      borderRadius: 16,
+      padding: '24px 28px',
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: 24,
+      alignItems: 'center',
+      justifyContent: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: '1 1 260px',
+      minWidth: 220
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      color: '#a5b4fc',
+      marginBottom: 10
+    }
+  }, "\uD83C\uDF89 Tr\xFAng r\u1ED3i? Chia l\u1ED9c t\xED \u0111i!"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: '#94a3b8',
+      lineHeight: 1.65
+    }
+  }, "N\u1EBFu tool \u0111\xE3 gi\xFAp b\u1EA1n ch\u1ECDn \u0111\xFAng s\u1ED1 \u2014 h\xE3y chia l\u1ED9c m\u1ED9t ch\xFAt \u0111\u1EC3 duy tr\xEC server v\xE0 c\u1EA3i ti\u1EBFn th\xEAm nh\xE9!", /*#__PURE__*/React.createElement("br", null), "M\u1ED7i \u0111\u1ED3ng donate nh\u1ECF l\xE0 \u0111\u1ED9ng l\u1EF1c l\u1EDBn \u0111\u1EC3 trang web lu\xF4n ch\u1EA1y \u1ED5n \u0111\u1ECBnh."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: '#64748b',
+      marginTop: 10
+    }
+  }, "Qu\xE9t m\xE3 QR b\u1EB1ng app MoMo / Banking \u2192 nh\u1EADp s\u1ED1 ti\u1EC1n \u2192 chuy\u1EC3n \uD83D\uDE4F")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("img", {
+    src: "/qr-donate.png",
+    alt: "QR donate MoMo",
+    style: {
+      width: 160,
+      height: 160,
+      borderRadius: 12,
+      border: '2px solid rgba(99,102,241,0.3)',
+      background: '#fff',
+      display: 'block',
+      margin: '0 auto 8px'
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: '#475569'
+    }
+  }, "C\u1EA3m \u01A1n b\u1EA1n r\u1EA5t nhi\u1EC1u \uD83D\uDC9C")))), /*#__PURE__*/React.createElement("footer", {
     style: {
       borderTop: '1px solid rgba(255,255,255,0.06)',
       padding: '28px 24px',

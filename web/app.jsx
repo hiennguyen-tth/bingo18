@@ -1004,12 +1004,13 @@ const HoaForecastBlock = memo(function HoaForecastBlock() {
 
       {/* Hourly Summary View — actual stats */}
       {view === 'hourly' && hourly && (
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+        <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, minWidth: isMobile ? 340 : 'unset' }}>
             <thead>
               <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-                {['Giờ', 'Tổng kỳ', 'HOA xuất hiện', 'Tỷ lệ HOA', 'HOA phổ biến nhất', 'HOA chưa ra', 'Mức độ'].map(h => (
-                  <th key={h} style={{ padding: isMobile ? '6px 4px' : '8px 12px', textAlign: 'left', color: '#64748b', fontSize: isMobile ? 9 : 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</th>
+                {/* On mobile: hide 'Tổng kỳ' and 'HOA phổ biến nhất' to keep table readable */}
+                {[['Giờ', false], ['Tổng kỳ', true], ['HOA xuất hiện', false], ['Tỷ lệ HOA', false], ['HOA phổ biến nhất', true], ['HOA chưa ra', false], ['Mức độ', false]].map(([h, hideOnMobile]) => (
+                  <th key={h} style={{ padding: isMobile ? '6px 5px' : '8px 12px', textAlign: 'left', color: '#64748b', fontSize: isMobile ? 9 : 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', display: (hideOnMobile && isMobile) ? 'none' : '' }}>{h}</th>
                 ))}
               </tr>
             </thead>
@@ -1025,34 +1026,36 @@ const HoaForecastBlock = memo(function HoaForecastBlock() {
                     borderBottom: '1px solid rgba(255,255,255,0.04)',
                     background: isCurrent ? 'rgba(99,102,241,0.10)' : isHot ? 'rgba(251,191,36,0.06)' : 'transparent',
                   }}>
-                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px', fontWeight: 700, color: isCurrent ? '#a5b4fc' : isHot ? '#fbbf24' : '#e2e8f0', whiteSpace: 'nowrap' }}>
+                    <td style={{ padding: isMobile ? '6px 5px' : '8px 12px', fontWeight: 700, color: isCurrent ? '#a5b4fc' : isHot ? '#fbbf24' : '#e2e8f0', whiteSpace: 'nowrap' }}>
                       {String(row.block).padStart(2, '0')}:00
                       {isCurrent && <span style={{ fontSize: 9, color: '#6366f1', marginLeft: 4 }}>◀</span>}
                       {isHot && !isCurrent && <span style={{ fontSize: 9, marginLeft: 4 }}>🔥</span>}
                     </td>
-                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px', color: '#94a3b8' }}>{row.totalDraws}</td>
-                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px', fontWeight: 700, color: row.totalHoa > 0 ? '#fbbf24' : '#475569' }}>
+                    {/* Tổng kỳ — hidden on mobile */}
+                    <td style={{ padding: isMobile ? '6px 5px' : '8px 12px', color: '#94a3b8', display: isMobile ? 'none' : '' }}>{row.totalDraws}</td>
+                    <td style={{ padding: isMobile ? '6px 5px' : '8px 12px', fontWeight: 700, color: row.totalHoa > 0 ? '#fbbf24' : '#475569' }}>
                       {row.totalHoa} lần
                     </td>
-                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px', minWidth: isMobile ? 60 : 100 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <div style={{ flex: 1, height: 6, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden', maxWidth: isMobile ? 50 : 80 }}>
+                    <td style={{ padding: isMobile ? '6px 5px' : '8px 12px', minWidth: isMobile ? 70 : 100 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                        <div style={{ flex: 1, height: 6, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden', maxWidth: isMobile ? 40 : 80 }}>
                           <div style={{ width: `${Math.min(hot * 12, 100)}%`, height: '100%', background: hot >= 3 ? '#fbbf24' : hot >= 2 ? '#818cf8' : '#334155', borderRadius: 3, transition: 'width 0.3s' }} />
                         </div>
-                        <span style={{ fontSize: 11, color: hot >= 3 ? '#fbbf24' : '#94a3b8', fontWeight: 700, minWidth: 34 }}>{hot}%</span>
+                        <span style={{ fontSize: 11, color: hot >= 3 ? '#fbbf24' : '#94a3b8', fontWeight: 700, minWidth: 30 }}>{hot}%</span>
                       </div>
                     </td>
-                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px' }}>
+                    {/* HOA phổ biến nhất — hidden on mobile */}
+                    <td style={{ padding: isMobile ? '6px 5px' : '8px 12px', display: isMobile ? 'none' : '' }}>
                       <span style={{ color: PATTERN_COLORS[row.topPattern] || '#e2e8f0', fontWeight: 700 }}>
                         {PATTERN_LABELS[row.topPattern] || row.topPattern}
                       </span>
                       <span style={{ fontSize: 9, color: '#64748b', marginLeft: 4 }}>({row.topPatternCount} lần)</span>
                     </td>
-                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px' }}>
+                    <td style={{ padding: isMobile ? '6px 5px' : '8px 12px' }}>
                       {row.missingPatterns && row.missingPatterns.length > 0 ? (
-                        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
                           {row.missingPatterns.map(p => (
-                            <span key={p} style={{ color: PATTERN_COLORS[p] || '#e2e8f0', fontWeight: 600, fontSize: 11, background: 'rgba(255,255,255,0.06)', borderRadius: 4, padding: '1px 5px' }}>
+                            <span key={p} style={{ color: PATTERN_COLORS[p] || '#e2e8f0', fontWeight: 600, fontSize: isMobile ? 10 : 11, background: 'rgba(255,255,255,0.06)', borderRadius: 4, padding: '1px 4px' }}>
                               {p}
                             </span>
                           ))}
@@ -1061,7 +1064,7 @@ const HoaForecastBlock = memo(function HoaForecastBlock() {
                         <span style={{ fontSize: 10, color: '#4ade80' }}>✓ Đủ</span>
                       )}
                     </td>
-                    <td style={{ padding: isMobile ? '6px 4px' : '8px 12px' }}>
+                    <td style={{ padding: isMobile ? '6px 5px' : '8px 12px' }}>
                       <span style={{ fontSize: 10, color: levelColor, fontWeight: 600 }}>{levelLabel}</span>
                     </td>
                   </tr>
@@ -1256,7 +1259,7 @@ function App() {
       const histH = histETagRef.current ? { 'If-None-Match': histETagRef.current } : {}
       const [pRaw, hRaw, sumRaw] = await Promise.all([
         fetch('/predict', { cache: 'no-cache', headers: predH }),
-        fetch('/history?limit=800', { headers: histH }),
+        fetch('/history?limit=400', { headers: histH }),
         // no-store: browser never caches — always gets real server response, no stale ETag reuse
         fetch('/predict-sum', { cache: 'no-store' }),
       ])
@@ -1708,6 +1711,24 @@ function App() {
           <Heatmap history={history} />
         </div>
 
+      </div>
+
+      {/* ── Donate ── */}
+      <div style={{ maxWidth: 960, margin: '0 auto 28px', padding: '0 16px' }}>
+        <div style={{ background: 'linear-gradient(135deg, rgba(99,102,241,0.08) 0%, rgba(251,191,36,0.05) 100%)', border: '1px solid rgba(99,102,241,0.18)', borderRadius: 16, padding: '24px 28px', display: 'flex', flexWrap: 'wrap', gap: 24, alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ flex: '1 1 260px', minWidth: 220 }}>
+            <div style={{ fontSize: 15, fontWeight: 700, color: '#a5b4fc', marginBottom: 10 }}>🎉 Trúng rồi? Chia lộc tí đi!</div>
+            <div style={{ fontSize: 13, color: '#94a3b8', lineHeight: 1.65 }}>
+              Nếu tool đã giúp bạn chọn đúng số — hãy chia lộc một chút để duy trì server và cải tiến thêm nhé!<br />
+              Mỗi đồng donate nhỏ là động lực lớn để trang web luôn chạy ổn định.
+            </div>
+            <div style={{ fontSize: 12, color: '#64748b', marginTop: 10 }}>Quét mã QR bằng app MoMo / Banking → nhập số tiền → chuyển 🙏</div>
+          </div>
+          <div style={{ textAlign: 'center' }}>
+            <img src="/qr-donate.png" alt="QR donate MoMo" style={{ width: 160, height: 160, borderRadius: 12, border: '2px solid rgba(99,102,241,0.3)', background: '#fff', display: 'block', margin: '0 auto 8px' }} />
+            <div style={{ fontSize: 11, color: '#475569' }}>Cảm ơn bạn rất nhiều 💜</div>
+          </div>
+        </div>
       </div>
 
       {/* ── Footer ── */}
