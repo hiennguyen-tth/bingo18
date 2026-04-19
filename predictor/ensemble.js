@@ -75,6 +75,22 @@ const WEIGHTS_FILE = path.join(__dirname, '../dataset/model.json')
 const GBM_FILE = path.join(__dirname, '../python/ml_output.json')
 const GBM_MAX_STALENESS = 2000  // records; invalidate GBM scores if dataset grew > this
 
+/**
+ * Chronological sort comparator (oldest → newest).
+ * Some records from bingo18.top have no `ky`. Number(undefined)=NaN makes JS sort
+ * unstable and corrupts gap/Markov calculations for those records.
+ * Fix: sort primarily by drawTime (ISO strings compare correctly lexicographically);
+ * use ky only as a tiebreaker when two records share the same timestamp.
+ * This mirrors the sort already used in predictRanked().
+ */
+function chronCmp(a, b) {
+  const ta = (a.drawTime || '').substring(0, 19)
+  const tb = (b.drawTime || '').substring(0, 19)
+  if (ta < tb) return -1
+  if (ta > tb) return 1
+  return Number(a.ky || 0) - Number(b.ky || 0)  // tiebreak by ky
+}
+
 // ── Learned weights (sigmoid ensemble) ────────────────────────────────────
 // Trained by: node scripts/train_weights.js
 // Falls back to fixed weights if file not found or parse error.
@@ -964,7 +980,7 @@ function predictRanked(data, opts = {}) {
 function predict(data) {
   if (!data) data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'))
   if (!data || data.length < 2) return {}
-  const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
+  const chron = [...data].sort(chronCmp)
   const now = new Date()
   const { results: all } = ensembleAll(chron, now)
   const out = {}
@@ -978,7 +994,7 @@ function predict(data) {
  */
 function getModelScores(data, now) {
   if (!data || data.length < 2) return {}
-  const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
+  const chron = [...data].sort(chronCmp)
   if (!now) now = new Date()
 
   const { scores: rawA } = modelA(chron)
@@ -1045,7 +1061,7 @@ const SUM_MAX_THEO = 27 / 216
 function predictSum(data, opts = {}) {
   const model = opts.model || 'full'  // ablation mode
   if (!data || data.length < 30) return { sums: [], mode: 'insufficient' }
-  const chron = [...data].sort((a, b) => Number(a.ky) - Number(b.ky))
+  const chron = [...data].sort(chronCmp)
   const N = chron.length
 
   // 1) z-score on sum gaps (same logic as Model A but on 16 sum buckets)

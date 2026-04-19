@@ -524,7 +524,9 @@ const AccuracyPanel = memo(function AccuracyPanel({
   loading
 }) {
   const [showReality, setShowReality] = React.useState(false);
-  if (loading) return /*#__PURE__*/React.createElement("div", {
+
+  // Only show loading spinner on initial load (no data yet). Background refreshes update silently.
+  if (loading && !stats) return /*#__PURE__*/React.createElement("div", {
     style: {
       color: '#475569',
       fontSize: 13,
@@ -2473,14 +2475,25 @@ function App() {
       const histH = histETagRef.current ? {
         'If-None-Match': histETagRef.current
       } : {};
-      const [pRaw, hRaw] = await Promise.all([fetch('/predict', {
+      const [pRaw, hRaw, sumRaw] = await Promise.all([fetch('/predict', {
         cache: 'no-cache',
         headers: predH
       }), fetch('/history?limit=800', {
         headers: histH
+      }),
+      // no-store: browser never caches — always gets real server response, no stale ETag reuse
+      fetch('/predict-sum', {
+        cache: 'no-store'
       })]);
 
-      // predict 304 + history 304 — truly nothing changed
+      // Sum prediction — process FIRST, unconditionally (invalidated on every new draw)
+      if (sumRaw.ok) {
+        try {
+          setSumPreds(await sumRaw.json());
+        } catch (_) {}
+      }
+
+      // predict 304 + history 304 — nothing else to update
       if (pRaw.status === 304 && hRaw.status === 304) return;
       if (pRaw.status !== 304 && !pRaw.ok) throw new Error(`API ${pRaw.status}`);
       const pRes = pRaw.status !== 304 ? await pRaw.json() : null;
@@ -2511,7 +2524,7 @@ function App() {
         setSumStats(pRes.sumStats || []);
         setTotal(pRes.total || 0);
         setUpdated(new Date().toLocaleTimeString('vi-VN'));
-        // Sum prediction — bundled in /predict, updates atomically
+        // Also update sum from bundled payload — covers initial load from disk cache
         if (pRes.sumPrediction) setSumPreds(pRes.sumPrediction);
       }
       if (hRes) {

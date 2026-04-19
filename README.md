@@ -99,6 +99,16 @@ Mỗi 60 giây:
 
 ---
 
+## v20 Changes (2026-04-18)
+
+### Sum Prediction — real-time update fix (v2)
+- **Root cause**: After v19 bundled `sumPrediction` inside `/predict`, sum only updated when `/predict` returned 200 (new data). If predict returned 304 (ETags matched), `setSumPreds` was never called — stale sum shown.
+- **Fix A — client**: Restore **separate unconditional `/predict-sum` fetch** in `load()` that runs in parallel with `/predict` and `/history`. Processed FIRST, before any ETag/304 early-return. Not gated by predict's 304 status. Both sources now feed `setSumPreds` (separate fetch wins since it runs first; bundled fallback covers initial load from disk cache).
+- **Fix B — server**: Change `/predict-sum` TTL from 5 min → **0 (infinite, invalidation-only)**. Same model as `/predict`: cache cleared by `apiCache.clear()` on each new draw → first post-draw request recomputes fresh. Between draws, stable cached value is returned.
+- **Fix C — prewarm**: `_prewarmCaches()` now also prewarms `predict-sum` alongside `predict` and `overdue`. Client fetches after a new draw always hit a warm cache with the latest draw's sum.
+
+---
+
 ## v19 Changes (2026-04-18)
 
 ### 🌸 HOA Forecast — Dự báo Hoa theo block giờ

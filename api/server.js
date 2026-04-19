@@ -384,6 +384,9 @@ async function _prewarmCaches() {
   if (_prewarmRunning) return
   _prewarmRunning = true
   const t0 = Date.now()
+  // Snapshot invalidate timestamp before heavy compute — so we can detect if a new draw
+  // arrived while we were computing and avoid overwriting a fresher cache.
+  const prewarmStartedAt = _lastInvalidateAt
   try {
     const data = await loadHistory()
     if (data.length < 2) return
@@ -391,16 +394,26 @@ async function _prewarmCaches() {
     const ts = Date.now()
     const predictPl = buildPredictPayload(data)
     const overduePl = buildOverduePayload(data)
+    // predictSum is O(N) — fast, include in prewarm so first request after new draw is instant
+    const sumPl = predict.predictSum(data)
+
+    // Guard: if a new draw arrived while we were computing, skip overwriting the cache.
+    // withCache() will compute fresh on the next client request instead.
+    if (_lastInvalidateAt !== prewarmStartedAt) {
+      console.log('[prewarm] skipped — new draw arrived during compute, cache stays empty for fresh compute')
+      return
+    }
 
     apiCache.set('predict', { data: predictPl, ts })
     apiCache.set('overdue', { data: overduePl, ts })
+    apiCache.set('predict-sum', { data: sumPl, ts })
 
     // Persist to disk in parallel (non-blocking)
     await Promise.all([
       fs.writeJSON(PREDICT_CACHE_FILE, { data: predictPl, ts }),
       fs.writeJSON(OVERDUE_CACHE_FILE, { data: overduePl, ts }),
     ])
-    console.log(`[prewarm] predict + overdue cached + persisted in ${Date.now() - t0}ms`)
+    console.log(`[prewarm] predict + overdue + predict-sum cached + persisted in ${Date.now() - t0}ms`)
   } catch (err) {
     console.error('[prewarm]', err.message)
   } finally {
@@ -619,7 +632,9 @@ app.get('/predict', withCache('predict', 5 * 60_000,
  *  Score is weighted by sqrt(P(sum) / P_max) so rare sums (sum=3) don't outscore
  *  common ones (sum=10) purely due to overdue status.
  *  Cached for 5 min alongside combo predictions. */
-app.get('/predict-sum', withCache('predict-sum', 5 * 60_000,
+// TTL=0: serve from cache indefinitely; only refreshed after invalidateCache() on new draw.
+// Same invalidation model as /predict — no time-expiry, only draw-triggered clear.
+app.get('/predict-sum', withCache('predict-sum', 0,
   async () => predict.predictSum(await loadHistory())
 ))
 
