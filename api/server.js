@@ -159,6 +159,8 @@ function invalidateCache() {
   _lastInvalidateAt = Date.now()  // prevent watcher from double-firing
   _historyCache = null            // force re-read of history on next loadHistory()
   _historyCacheMtime = 0
+  _hoaForecastCache = null        // force recompute on next /api/hoa-forecast request
+  _hoaForecastDate = ''
   apiCache.clear()
   // Debounce prewarm — waits 800ms so rapid consecutive invalidations only fire once.
   clearTimeout(_prewarmTimer)
@@ -680,8 +682,13 @@ app.get('/api/hoa-forecast', async (_req, res) => {
     }
 
     const data = await loadHistory()
-    // Last 30 days
-    const cutoff = new Date(Date.now() - 30 * 24 * 3600_000)
+    // Last 30 full calendar days (VN timezone) — cutoff = midnight VN 30 days ago
+    // vnNow is already shifted +7h above, so getUTCFullYear/Month/Date gives VN calendar date
+    const vnMidnightUTC = Date.UTC(
+      vnNow.getUTCFullYear(), vnNow.getUTCMonth(), vnNow.getUTCDate(),
+      -7, 0, 0, 0  // 00:00 VN (UTC+7) expressed as UTC = today's date at -7h UTC
+    )
+    const cutoff = new Date(vnMidnightUTC - 30 * 24 * 3600_000)
     const recent30 = data.filter(r => r.drawTime && new Date(r.drawTime) >= cutoff)
 
     if (recent30.length < 100) {
@@ -1396,6 +1403,46 @@ function startCrawlerLoop() {
   tick()
 }
 
+// ── Daily hoa-forecast refresh at 22:30 VN (30 min after bingo closes at 22:00) ──
+// Crawls final draws of the day then clears the hoa-forecast cache so the next
+// request recomputes statistics for today + 29 previous full calendar days.
+function scheduleHoaForecastDailyRefresh() {
+  const REFRESH_VN_HOUR = 22
+  const REFRESH_VN_MIN = 30
+
+  function msUntilNextRefresh() {
+    const vnNow = new Date(Date.now() + 7 * 3600_000)
+    const currentTotalMin = vnNow.getUTCHours() * 60 + vnNow.getUTCMinutes()
+    const targetTotalMin = REFRESH_VN_HOUR * 60 + REFRESH_VN_MIN
+    let diffMin = targetTotalMin - currentTotalMin
+    if (diffMin <= 0) diffMin += 24 * 60  // already past today → schedule tomorrow
+    const diffMs = diffMin * 60_000 - (vnNow.getUTCSeconds() * 1000 + vnNow.getUTCMilliseconds())
+    return Math.max(diffMs, 1000)
+  }
+
+  async function runRefresh() {
+    console.log('[hoa-forecast] 22:30 VN daily refresh — crawling final draws...')
+    try {
+      await crawlTick({ manual: true })
+    } catch (err) {
+      console.error('[hoa-forecast] crawl error during daily refresh:', err.message)
+    }
+    // Force recompute with today's complete data on next request
+    _hoaForecastCache = null
+    _hoaForecastDate = ''
+    console.log('[hoa-forecast] cache cleared — statistics will include today + 29 previous days')
+
+    // Schedule next day
+    const next = msUntilNextRefresh()
+    console.log(`[hoa-forecast] next refresh scheduled in ${Math.round(next / 60_000)} min`)
+    setTimeout(runRefresh, next)
+  }
+
+  const first = msUntilNextRefresh()
+  console.log(`[hoa-forecast] daily refresh scheduled in ${Math.round(first / 60_000)} min (22:30 VN)`)
+  setTimeout(runRefresh, first)
+}
+
 // ── Graceful shutdown ──────────────────────────────────────────────────────
 // Close all SSE connections cleanly before exit so clients reconnect quickly.
 function gracefulShutdown(signal) {
@@ -1414,6 +1461,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`Crawl interval: every ${CRAWL_INTERVAL_MS / 1000}s (sequential loop)`)
 
   startCrawlerLoop()
+  scheduleHoaForecastDailyRefresh()
 
   // Pre-warm after 2s: fills any missing disk caches and ensures freshness.
   setTimeout(() => _prewarmCaches(), 2_000)
